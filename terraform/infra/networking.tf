@@ -26,7 +26,8 @@ resource "aws_security_group_rule" "lambda_to_proxy" {
   security_group_id        = aws_security_group.lambda.id
 }
 
-# RDS Proxy: acepta conexiones desde Lambda, sale hacia RDS
+# RDS Proxy: acepta conexiones desde Lambda
+# El egress hacia RDS se define como aws_security_group_rule para romper el ciclo
 resource "aws_security_group" "rds_proxy" {
   name        = "${local.name_prefix}-sg-rds-proxy"
   description = "RDS Proxy: ingress desde Lambda, egress hacia RDS"
@@ -39,29 +40,36 @@ resource "aws_security_group" "rds_proxy" {
     protocol        = "tcp"
     security_groups = [aws_security_group.lambda.id]
   }
-
-  egress {
-    description     = "PostgreSQL hacia RDS"
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = [aws_security_group.rds.id]
-  }
 }
 
-# RDS: acepta conexiones solo desde RDS Proxy y Bastion
+# Regla separada para evitar dependencia circular entre sg-rds-proxy y sg-rds
+resource "aws_security_group_rule" "proxy_to_rds" {
+  type                     = "egress"
+  description              = "PostgreSQL hacia RDS"
+  from_port                = 5432
+  to_port                  = 5432
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.rds.id
+  security_group_id        = aws_security_group.rds_proxy.id
+}
+
+# RDS: acepta conexiones desde RDS Proxy y Bastion
+# El ingress desde rds_proxy se define como aws_security_group_rule para romper el ciclo
 resource "aws_security_group" "rds" {
   name        = "${local.name_prefix}-sg-rds"
   description = "PostgreSQL accesible solo desde RDS Proxy y Bastion"
   vpc_id      = module.vpc.vpc_id
+}
 
-  ingress {
-    description     = "PostgreSQL desde RDS Proxy"
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = [aws_security_group.rds_proxy.id]
-  }
+# Regla separada para evitar dependencia circular entre sg-rds y sg-rds-proxy
+resource "aws_security_group_rule" "rds_from_proxy" {
+  type                     = "ingress"
+  description              = "PostgreSQL desde RDS Proxy"
+  from_port                = 5432
+  to_port                  = 5432
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.rds_proxy.id
+  security_group_id        = aws_security_group.rds.id
 }
 
 # VPC endpoints: acepta HTTPS desde Lambda analytics
