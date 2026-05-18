@@ -1,0 +1,111 @@
+name: Terraform
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+  # Trigger manual para plan/apply (requiere secrets cargados)
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Acción a ejecutar'
+        required: true
+        default: 'plan'
+        type: choice
+        options: [plan, apply]
+
+env:
+  TF_VERSION: '1.10.0'
+  AWS_REGION: 'us-east-1'
+  WORKING_DIR: 'terraform/infra'
+
+jobs:
+  # ── Job 1: Validate (sin credenciales AWS, corre siempre) ──────────────────
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Create builds directory
+        run: mkdir -p builds
+
+      # -backend=false evita conectarse a S3 — solo valida sintaxis y providers
+      - name: Terraform Init (sin backend)
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+  # ── Job 2: Plan / Apply (solo en workflow_dispatch manual) ────────────────
+  deploy:
+    name: ${{ github.event.inputs.action == 'apply' && 'Apply' || 'Plan' }}
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    needs: validate
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Create builds directory
+        run: mkdir -p builds
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=jetsmart-terraform-state-${{ secrets.STATE_BUCKET_SUFFIX }}" \
+            -backend-config="key=infra/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Plan
+        env:
+          TF_VAR_anthropic_api_key:   ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
+          TF_VAR_rds_password:        ${{ secrets.TF_VAR_RDS_PASSWORD }}
+          TF_VAR_state_bucket_suffix: ${{ secrets.STATE_BUCKET_SUFFIX }}
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        if: github.event.inputs.action == 'apply'
+        env:
+          TF_VAR_anthropic_api_key:   ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
+          TF_VAR_rds_password:        ${{ secrets.TF_VAR_RDS_PASSWORD }}
+          TF_VAR_state_bucket_suffix: ${{ secrets.STATE_BUCKET_SUFFIX }}
+        run: terraform apply -auto-approve tfplan

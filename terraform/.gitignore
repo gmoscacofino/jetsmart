@@ -1,0 +1,29 @@
+# State files — NUNCA en el repo
+*.tfstate
+*.tfstate.backup
+*.tfstate.*.backup
+*.tfplan
+tfplan
+
+# Directorio de providers y módulos descargados (regenerado por terraform init)
+# NOTA: .terraform.lock.hcl NO se ignora — debe commitearse para reproducibilidad
+.terraform/
+
+# Variables con credenciales
+terraform.tfvars
+*.auto.tfvars
+
+# Dependencias de Lambda layers (generadas por scripts/build-layers.sh)
+**/layers/
+
+# Builds de Lambda (generados por archive_file)
+**/builds/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
