@@ -212,9 +212,17 @@ Ver el schema completo en [07 — Capa de datos](./07-data-layer.md).
 
 RDS no tiene un endpoint público accesible desde internet — solo es accesible desde dentro de la VPC. Por eso la Lambda `analytics-processor` debe correr dentro de la VPC con el security group correcto.
 
-### RDS y Lambda: por qué no hay RDS Proxy
+### RDS Proxy
 
-El patrón recomendado para Lambda + RDS es usar RDS Proxy para manejar el pool de conexiones (Lambda puede abrir cientos de conexiones simultáneas). En este TP, el volumen no justifica el costo adicional de RDS Proxy en Academy.
+Entre `analytics-processor` y RDS hay un **RDS Proxy** (`aws_db_proxy.main`). El proxy mantiene un pool de conexiones persistentes contra RDS — cada invocación de Lambda reutiliza una conexión existente en lugar de abrir una nueva. Esto es crítico porque Lambda puede tener decenas de instancias simultáneas: sin proxy, RDS recibiría decenas de conexiones nuevas por segundo y agotaría su límite de conexiones (`max_connections`).
+
+El proxy lee las credenciales de RDS directamente desde Secrets Manager y autentica a Lambda sin exponer la contraseña. La Lambda solo conoce el endpoint del proxy, no el de RDS.
+
+```
+Lambda analytics-processor
+    → RDS Proxy (pool de conexiones) → RDS PostgreSQL
+       (lee credenciales de Secrets Manager)
+```
 
 ---
 
@@ -294,5 +302,18 @@ Dos buckets con propósitos distintos:
 ### `jetsmart-assets`
 - Boarding passes generados por Lambda
 - Backups de DynamoDB
-- Privado — el acceso a boarding passes se da via pre-signed URLs temporales (15 min)
-- Versionado habilitado para los backups
+- **System prompt de Claude** (`config/system_prompt.txt`) — guardado en S3 para evitar el límite de 4 KB de variables de entorno de Lambda. La Lambda lo descarga en el cold start.
+- Privado — acceso a boarding passes via pre-signed URLs temporales (15 min)
+- Lifecycle: boarding passes expiran en 90 días; backups migran a STANDARD_IA a los 30 días
+- Encriptación AES-256 habilitada por defecto
+
+## Lambda Layers
+
+Dos layers compilados para Python 3.12 en Linux x86_64:
+
+| Layer | Contenido | Usada por |
+|---|---|---|
+| `jetsmart-prod-anthropic` | SDK `anthropic` + dependencias HTTP | `chat-handler` |
+| `jetsmart-prod-psycopg2` | Driver PostgreSQL `psycopg2-binary` | `analytics-processor` |
+
+Los layers se construyen localmente con `scripts/build-layers.sh` antes de correr `terraform apply`. El script usa `--platform manylinux2014_x86_64` para garantizar compatibilidad con el runtime de Lambda.

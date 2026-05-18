@@ -90,8 +90,8 @@ Si RDS falla, el mensaje vuelve a SQS para reintento. Después de 3 intentos va 
 | 4 | Route Tables | Red | Reglas de enrutamiento por subnet |
 | 5 | NAT Gateway | Red | Salida a internet desde subnets privadas (solo analytics Lambda) |
 | 6 | Security Groups | Red | Control de tráfico entre componentes |
-| 7 | VPC Endpoints (×2) | Red | DynamoDB (Gateway) + Secrets Manager (Interface) — acceso privado desde VPC |
-| 8 | EC2 Bastion | Red | Acceso a RDS via SSM (sin SSH, sin puerto 22) |
+| 7 | VPC Endpoints (×3) | Red | Secrets Manager + SQS + CloudWatch Logs (Interface) — acceso privado desde VPC sin NAT |
+| 8 | EC2 Bastion | Red | Acceso a RDS via SSM port-forwarding (sin SSH, sin puerto 22) |
 | 9 | S3 — frontend | Storage | Archivos estáticos del sitio web (HTML/CSS/JS) |
 | 10 | S3 — assets | Storage | Boarding passes generados |
 | 11 | Cognito User Pool | Auth | Registro y login de usuarios con Hosted UI |
@@ -108,7 +108,8 @@ Si RDS falla, el mensaje vuelve a SQS para reintento. Después de 3 intentos va 
 | 22 | Lambda — payment-release-flight | Cómputo | Compensación: libera los asientos bloqueados |
 | 23 | Lambda — boarding-pass | Cómputo | PostBookingActions: genera boarding pass en DynamoDB |
 | 24 | Lambda — notification | Cómputo | PostBookingActions + error path: notifica al usuario |
-| 25 | Lambda — analytics-processor | Cómputo | Consume SQS, escribe en RDS y DynamoDB (en VPC) |
+| 25 | Lambda — analytics-processor | Cómputo | Consume SQS, escribe en RDS via proxy (en VPC) |
+| 25b | RDS Proxy | Cómputo | Pool de conexiones entre analytics-processor y RDS; lee credenciales de Secrets Manager |
 | 26 | Lambda — auth-callback | Cómputo | Intercambia authorization code por tokens JWT |
 | 27 | Lambda — cognito-trigger | Cómputo | Post-registro: asigna grupo `users` al usuario nuevo |
 | 28 | Step Functions | Orquestación | State machine del patrón Saga (reserva y pago) |
@@ -120,10 +121,10 @@ Si RDS falla, el mensaje vuelve a SQS para reintento. Después de 3 intentos va 
 | 34 | DynamoDB | Base de datos | Single Table Design: sesiones, reservas, vuelos mock, analytics agregados |
 | 35 | RDS PostgreSQL | Base de datos | Log detallado de eventos para el dashboard admin |
 | 36 | Secrets Manager | Seguridad | API key Anthropic + credenciales RDS |
-| 37 | Lambda Layer — psycopg2 | Cómputo | Driver PostgreSQL compilado para Python 3.12 |
-| 38 | IAM — LabRole | Seguridad | Rol único para todas las Lambdas (restricción Academy) |
-| 39 | IAM Groups (4) | Seguridad | Permisos del equipo de trabajo |
-| 40 | CloudWatch (13 log groups) | Observabilidad | Logs de todas las Lambdas con retención de 30 días |
+| 37 | Lambda Layer — anthropic | Cómputo | SDK de Anthropic compilado para Python 3.12; usado por chat-handler |
+| 37b | Lambda Layer — psycopg2 | Cómputo | Driver PostgreSQL compilado para Python 3.12; usado por analytics-processor |
+| 38 | IAM — LabRole | Seguridad | Rol preexistente de AWS Academy — compartido por todas las Lambdas y el RDS Proxy |
+| 39 | CloudWatch (13 log groups) | Observabilidad | Logs de todas las Lambdas con retención de 30 días, creados con `for_each` |
 
 ---
 
@@ -168,10 +169,11 @@ INTERNET
               └─────────────────────────────────┘
 
 DENTRO DE LA VPC:
-  analytics-processor Lambda ←──→ RDS PostgreSQL (subnet privada datos)
-                            ←──→ DynamoDB (VPC Endpoint Gateway)
-                            ←──→ Secrets Manager (VPC Endpoint Interface)
-  EC2 Bastion ←──→ SSM (sin puerto 22) — acceso operativo a RDS
+  analytics-processor Lambda ←──→ RDS Proxy ←──→ RDS PostgreSQL (subnet privada datos)
+                            ←──→ SQS (VPC Interface Endpoint)
+                            ←──→ Secrets Manager (VPC Interface Endpoint)
+                            ←──→ CloudWatch Logs (VPC Interface Endpoint)
+  EC2 Bastion ←──→ SSM port-forwarding — acceso operativo a RDS (sin puerto 22)
 
 FUERA DE LA VPC (servicios managed — siempre accesibles):
   S3 · Cognito · API Gateway · Step Functions · SNS · SQS · DynamoDB · Secrets Manager · CloudWatch

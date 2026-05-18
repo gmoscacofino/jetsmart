@@ -111,15 +111,29 @@ La regla de diseño: **cada recurso solo acepta tráfico del componente que nece
 ### SG-Lambda (analytics-processor en VPC)
 ```
 Entrada:  (ninguna — Lambda no recibe conexiones entrantes)
-Salida:   puerto 5432 hacia SG-RDS (PostgreSQL)
-          puerto 443 hacia VPC Endpoints (DynamoDB, Secrets Manager)
-          (solo dentro del CIDR de la VPC)
+Salida:   puerto 5432 hacia SG-RDS-Proxy (PostgreSQL)
+          puerto 443 dentro del CIDR de la VPC (hacia VPC Endpoints)
 ```
+
+### SG-RDS-Proxy
+```
+Entrada:  puerto 5432 desde SG-Lambda únicamente
+Salida:   puerto 5432 hacia SG-RDS únicamente
+```
+
+El RDS Proxy está entre Lambda y RDS. Lambda no habla directamente con RDS — habla con el proxy, que mantiene el pool de conexiones.
 
 ### SG-RDS
 ```
-Entrada:  puerto 5432 (PostgreSQL) desde SG-Lambda únicamente
-Salida:   ninguna (la base de datos no inicia conexiones)
+Entrada:  puerto 5432 desde SG-RDS-Proxy
+          puerto 5432 desde SG-Bastion (acceso operativo)
+Salida:   ninguna
+```
+
+### SG-Bastion
+```
+Entrada:  ninguna (sin SSH, sin puerto 22)
+Salida:   todo outbound (necesita conectarse a SSM y a RDS)
 ```
 
 ### SG-VPC-Endpoints
@@ -134,19 +148,27 @@ Salida:   ninguna
 
 Los VPC Endpoints permiten que recursos dentro de la VPC se comuniquen con servicios de AWS sin que el tráfico salga a internet. Evitan pasar por el NAT Gateway, lo que reduce costos y mejora la seguridad.
 
-### DynamoDB Gateway Endpoint (gratuito)
-La Lambda analytics accede a DynamoDB sin pasar por internet. Se configura en la route table privada.
-
-```
-Lambda analytics → VPC Gateway Endpoint → DynamoDB
-                   (tráfico interno de AWS, sin internet)
-```
+Los tres son de tipo **Interface** (crean una ENI dentro de la subnet privada con `private_dns_enabled = true`):
 
 ### Secrets Manager Interface Endpoint
-La Lambda analytics accede a Secrets Manager sin pasar por internet. Crea una ENI (interfaz de red) dentro de la subnet privada.
+La Lambda analytics lee las credenciales de RDS desde Secrets Manager sin salir a internet.
 
 ```
-Lambda analytics → VPC Interface Endpoint (ENI en subnet privada) → Secrets Manager
+Lambda analytics-processor → VPC Interface Endpoint → Secrets Manager
+```
+
+### SQS Interface Endpoint
+La Lambda analytics consume mensajes de la cola `analytics-queue` desde dentro de la VPC, sin pasar por el NAT Gateway.
+
+```
+Lambda analytics-processor → VPC Interface Endpoint → SQS analytics-queue
+```
+
+### CloudWatch Logs Interface Endpoint
+La Lambda analytics escribe sus logs directamente en CloudWatch sin salir a internet.
+
+```
+Lambda analytics-processor → VPC Interface Endpoint → CloudWatch Logs
 ```
 
 ---
@@ -173,12 +195,13 @@ Lambda chat-handler (fuera de VPC)
 ### Analytics (dentro de la VPC)
 
 ```
-SQS analytics-queue
+SQS analytics-queue (VPC Interface Endpoint)
   │
   ↓ trigger
 Lambda analytics-processor (subnet privada — cómputo)
   │
-  ├──→ RDS PostgreSQL (subnet privada — datos, tráfico interno VPC)
-  ├──→ DynamoDB (VPC Gateway Endpoint — sin internet)
-  └──→ Secrets Manager (VPC Interface Endpoint — sin internet)
+  ├──→ RDS Proxy (subnet privada — cómputo) → RDS PostgreSQL (subnet privada — datos)
+  ├──→ SQS (VPC Interface Endpoint — sin internet)
+  ├──→ Secrets Manager (VPC Interface Endpoint — sin internet)
+  └──→ CloudWatch Logs (VPC Interface Endpoint — sin internet)
 ```
