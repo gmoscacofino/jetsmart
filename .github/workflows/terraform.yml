@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'terraform/**'
+      - 'scripts/build-layers.sh'
       - '.github/workflows/terraform.yml'
   pull_request:
     branches: [main]
@@ -26,7 +27,7 @@ env:
   WORKING_DIR: 'terraform/infra'
 
 jobs:
-  # ── Job 1: Validate (sin credenciales AWS, corre siempre) ──────────────────
+  # ── Job 1: Validate + Test (sin credenciales AWS, corre siempre) ───────────
   validate:
     name: Validate
     runs-on: ubuntu-latest
@@ -43,20 +44,31 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      - name: Create builds directory
-        run: mkdir -p builds
+      # ZIPs placeholder para que filebase64sha256() no falle en validate/test.
+      # No contienen código real — el deploy job construye los layers reales.
+      - name: Create placeholder layer ZIPs
+        run: |
+          mkdir -p builds
+          python3 -c "import zipfile; zipfile.ZipFile('builds/anthropic-layer.zip', 'w').close()"
+          python3 -c "import zipfile; zipfile.ZipFile('builds/psycopg2-layer.zip', 'w').close()"
 
-      # -backend=false evita conectarse a S3 — solo valida sintaxis y providers
+      # -backend=false evita conectarse a S3 — solo inicializa providers
       - name: Terraform Init (sin backend)
         run: terraform init -backend=false
 
       - name: Terraform Validate
         run: terraform validate
 
+      # Corre desde terraform/ para cubrir también terraform/backend/
       - name: Terraform Format Check
+        working-directory: terraform
         run: terraform fmt -check -recursive
 
-  # ── Job 2: Plan / Apply (solo en workflow_dispatch manual) ────────────────
+      # mock_provider "aws" en los .tftest.hcl evita necesitar credenciales reales
+      - name: Terraform Test
+        run: terraform test
+
+  # ── Job 2: Plan / Apply (solo en workflow_dispatch manual) ─────────────────
   deploy:
     name: ${{ github.event.inputs.action == 'apply' && 'Apply' || 'Plan' }}
     runs-on: ubuntu-latest
@@ -83,8 +95,10 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      - name: Create builds directory
-        run: mkdir -p builds
+      # Construye los Lambda Layers reales compilados para Linux x86_64
+      - name: Build Lambda Layers
+        working-directory: ${{ github.workspace }}
+        run: bash scripts/build-layers.sh
 
       - name: Terraform Init
         run: |

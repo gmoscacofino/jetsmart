@@ -1,9 +1,3 @@
-# ── IAM: LabRole (compartido por todas las Lambdas en AWS Academy) ────────────
-
-data "aws_iam_role" "lab_role" {
-  name = "LabRole"
-}
-
 # ── Lambda: Analytics Processor ───────────────────────────────────────────────
 #
 # Disparada por SQS cuando llegan mensajes del SNS events (chat).

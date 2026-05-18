@@ -430,8 +430,8 @@ El archivo `.github/workflows/terraform.yml` implementa dos jobs independientes:
 
 | Job | Cuándo corre | Credenciales AWS | Qué hace |
 |---|---|---|---|
-| `validate` | En cada `push` a `main` y en cada PR | No necesita | `init -backend=false`, `validate`, `fmt -check` |
-| `deploy` | Solo en `workflow_dispatch` manual | Sí (desde secrets) | `init` con backend S3, `plan`, `apply` (opcional) |
+| `validate` | En cada `push` a `main` y en cada PR | No necesita | Crea ZIPs placeholder, `init -backend=false`, `validate`, `fmt -check` (cubre `backend/` también), `terraform test` |
+| `deploy` | Solo en `workflow_dispatch` manual | Sí (desde secrets) | Construye layers reales, `init` con backend S3, `plan`, `apply` (opcional) |
 
 Esta separación es deliberada: **el validate puede correr siempre**, sin credenciales, garantizando que el código Terraform es sintácticamente válido. El deploy requiere credenciales de AWS Academy, que expiran con cada sesión, por lo que se ejecuta manualmente.
 
@@ -615,12 +615,26 @@ cd terraform/infra
 cp terraform.tfvars.example terraform.tfvars
 ```
 
-Editar `terraform.tfvars` y completar los valores sensibles:
+Editar `terraform.tfvars` completando los valores marcados:
 
 ```hcl
-anthropic_api_key   = "sk-ant-..."      # API key de Anthropic
-rds_password        = "..."             # Contraseña segura para RDS
-state_bucket_suffix = "grupo8-2026"     # El mismo sufijo del Paso 2
+aws_region   = "us-east-1"
+project_name = "jetsmart"
+environment  = "prod"
+
+vpc_cidr = "10.0.0.0/16"
+
+lambda_timeout = 30
+
+rds_instance_class    = "db.t3.micro"
+rds_allocated_storage = 20
+rds_db_name           = "jetsmart_analytics"
+rds_username          = "jetsmart_admin"
+rds_password          = "REEMPLAZAR_CON_PASSWORD_SEGURO"  # sensible
+
+anthropic_api_key = "sk-ant-REEMPLAZAR_CON_TU_API_KEY"   # sensible
+
+state_bucket_suffix = "REEMPLAZAR_CON_SUFFIX_UNICO"       # mismo que Paso 2
 ```
 
 > `terraform.tfvars` está en `.gitignore`. **Nunca commitear este archivo.**
@@ -646,7 +660,7 @@ terraform apply
 # Confirmar con: yes
 ```
 
-La creación tarda entre 10 y 15 minutos. RDS y RDS Proxy son los recursos más lentos.
+> Tiempo estimado: **15-20 minutos**. RDS tarda ~8 min, RDS Proxy otros ~5 min después de RDS. Es normal no ver output durante esos periodos — Terraform está esperando que AWS termine de crear los recursos.
 
 Al finalizar, `terraform apply` invoca automáticamente la Lambda de migración para crear el schema de RDS (`aws_lambda_invocation.rds_migrate`).
 

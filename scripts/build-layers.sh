@@ -1,27 +1,43 @@
 #!/usr/bin/env bash
-# Construye las dependencias del Lambda Layer localmente.
+# Construye los Lambda Layers y los empaqueta como ZIPs listos para Terraform.
 # Uso: ./scripts/build-layers.sh
-# Requiere: pip3, Python 3.12
+# Requiere: pip3, Python 3.12, zip
 #
-# El resultado se guarda en terraform/infra/layers/ (gitignoreado).
-# Terraform empaqueta ese directorio como un ZIP al hacer apply.
+# Genera dos ZIPs en terraform/infra/builds/:
+#   anthropic-layer.zip  — SDK de Anthropic (usado por chat-handler)
+#   psycopg2-layer.zip   — Driver PostgreSQL (usado por analytics-processor)
 set -euo pipefail
 
-LAYER_DIR="$(dirname "$0")/../terraform/infra/layers/anthropic/python"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+LAYERS_DIR="$ROOT/terraform/infra/layers"
+BUILDS_DIR="$ROOT/terraform/infra/builds"
 
-echo "Limpiando layer anterior..."
-rm -rf "$LAYER_DIR"
-mkdir -p "$LAYER_DIR"
+mkdir -p "$BUILDS_DIR"
 
-echo "Instalando dependencias para Linux x86_64..."
-pip3 install \
-  anthropic \
-  psycopg2-binary \
-  --target "$LAYER_DIR" \
-  --platform manylinux2014_x86_64 \
-  --python-version 3.12 \
-  --only-binary=:all: \
-  --quiet
+build_layer() {
+  local name="$1"
+  shift
+  local packages=("$@")
 
-echo "Layer construido en: $LAYER_DIR"
-echo "Tamaño: $(du -sh "$LAYER_DIR" | cut -f1)"
+  echo "==> Construyendo layer '$name'..."
+  rm -rf "$LAYERS_DIR/$name"
+  mkdir -p "$LAYERS_DIR/$name/python"
+
+  pip3 install "${packages[@]}" \
+    --target "$LAYERS_DIR/$name/python" \
+    --platform manylinux2014_x86_64 \
+    --python-version 3.12 \
+    --only-binary=:all: \
+    --quiet
+
+  echo "    Empaquetando ${name}-layer.zip..."
+  (cd "$LAYERS_DIR/$name" && zip -r "$BUILDS_DIR/${name}-layer.zip" python/ -q)
+  echo "    Listo: $(du -sh "$BUILDS_DIR/${name}-layer.zip" | cut -f1)"
+}
+
+build_layer "anthropic" "anthropic"
+build_layer "psycopg2"  "psycopg2-binary"
+
+echo ""
+echo "Layers disponibles en $BUILDS_DIR:"
+ls -lh "$BUILDS_DIR/"*-layer.zip
