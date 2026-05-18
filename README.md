@@ -57,109 +57,100 @@ aws sts get-caller-identity
 
 ## Instrucciones de ejecución
 
-### Paso 1 — Construir los Lambda Layers
+El flujo recomendado es via **GitHub Actions** — no requiere instalar Terraform ni AWS CLI localmente. Solo se necesitan credenciales de AWS Academy y acceso al repositorio.
 
-Los layers se compilan para Linux x86_64. Ejecutar **una sola vez por máquina**:
+### Paso 1 — Configurar secrets en GitHub
+
+Ir a **Settings → Secrets and variables → Actions** del repositorio y cargar:
+
+| Secret | Valor |
+|--------|-------|
+| `AWS_ACCESS_KEY_ID` | De AWS Academy → AWS Details → AWS CLI |
+| `AWS_SECRET_ACCESS_KEY` | Ídem |
+| `AWS_SESSION_TOKEN` | Ídem |
+| `STATE_BUCKET_SUFFIX` | Sufijo único para el bucket de estado (ej. `grupo8-2026`) |
+| `TF_VAR_RDS_PASSWORD` | Contraseña para la base de datos RDS |
+| `TF_VAR_ANTHROPIC_API_KEY` | Opcional — solo si `mock_mode = false` |
+
+### Paso 2 — Crear el backend (primera vez)
+
+Ir a **Actions → Terraform → Run workflow**, seleccionar **`backend`** y ejecutar.
+
+Crea el bucket S3 `jetsmart-terraform-state-<STATE_BUCKET_SUFFIX>` que almacena el state de Terraform. Solo se corre una vez por cuenta AWS.
+
+### Paso 3 — Planificar la infraestructura
+
+Ir a **Actions → Terraform → Run workflow**, seleccionar **`plan`** y ejecutar.
+
+Muestra todos los recursos que se van a crear sin modificar nada. Revisar el output antes de aplicar.
+
+### Paso 4 — Aplicar la infraestructura
+
+Ir a **Actions → Terraform → Run workflow**, seleccionar **`apply`** y ejecutar.
+
+> Tiempo estimado: **15–20 minutos**. RDS tarda ~8 min, RDS Proxy otros ~5 min después.
+
+Al finalizar, Terraform ejecuta automáticamente la Lambda de migración para crear el schema de RDS.
+
+### Paso 5 — Subir el frontend
+
+Una vez completado el apply, sincronizar el frontend con S3:
 
 ```bash
-chmod +x scripts/build-layers.sh
-./scripts/build-layers.sh
+aws s3 sync frontend/ s3://$(terraform -chdir=terraform/infra output -raw frontend_bucket_name)/
 ```
 
-Genera `terraform/infra/builds/anthropic-layer.zip` y `psycopg2-layer.zip` (ignorados por git).
-
-### Paso 2 — Crear el backend remoto (una sola vez)
-
-El state file nunca va en el repositorio. Crear el bucket S3 con locking nativo:
+O usar el script incluido:
 
 ```bash
-cd terraform/backend
-terraform init
-terraform apply -var="state_bucket_suffix=<tu-sufijo-unico>"
-# Ejemplo: terraform apply -var="state_bucket_suffix=grupo8-2026"
+./scripts/deploy-frontend.sh
 ```
 
-Anotar el output `state_bucket_name` para el siguiente paso.
-
-### Paso 3 — Crear el archivo de variables
+### Paso 6 — Verificar los outputs
 
 ```bash
 cd terraform/infra
-cp terraform.tfvars.example terraform.tfvars
+terraform output chatbot_api_url       # URL del backend
+terraform output frontend_url          # URL del frontend en S3
+terraform output cognito_hosted_ui_url # URL de login de Cognito
 ```
 
-Editar `terraform.tfvars` con los valores reales:
-
-```hcl
-aws_region   = "us-east-1"
-project_name = "jetsmart"
-environment  = "prod"
-
-vpc_cidr = "10.0.0.0/16"
-
-rds_instance_class    = "db.t3.micro"
-rds_allocated_storage = 20
-rds_db_name           = "jetsmart_analytics"
-rds_username          = "jetsmart_admin"
-rds_password          = "REEMPLAZAR_CON_PASSWORD_SEGURO"
-
-# mock_mode = true: chatbot responde con datos demo sin API key de Anthropic
-# mock_mode = false: requiere completar anthropic_api_key con una clave real
-mock_mode         = true
-anthropic_api_key = ""
-
-state_bucket_suffix = "REEMPLAZAR_CON_SUFFIX_DEL_PASO_2"
-```
-
-> `terraform.tfvars` está en `.gitignore`. **Nunca commitear este archivo.**
-
-### Paso 4 — Inicializar Terraform
+### Destruir la infraestructura
 
 ```bash
+cd terraform/infra && terraform destroy
+```
+
+---
+
+### Ejecución local (alternativa)
+
+Si se prefiere correr Terraform localmente en vez de GitHub Actions:
+
+**Prerrequisitos:** Terraform ≥ 1.10, AWS CLI v2, Python 3.12 + pip.
+
+```bash
+# 1. Construir Lambda Layers
+chmod +x scripts/build-layers.sh && ./scripts/build-layers.sh
+
+# 2. Crear backend (primera vez)
+cd terraform/backend
+terraform init
+terraform apply -var="state_bucket_suffix=<sufijo>"
+
+# 3. Crear variables
+cd terraform/infra
+cp terraform.tfvars.example terraform.tfvars
+# Editar terraform.tfvars con los valores reales
+
+# 4. Inicializar y aplicar
 terraform init \
-  -backend-config="bucket=jetsmart-terraform-state-<SUFFIX>" \
+  -backend-config="bucket=jetsmart-terraform-state-<sufijo>" \
   -backend-config="key=infra/terraform.tfstate" \
   -backend-config="region=us-east-1" \
   -backend-config="use_lockfile=true" \
   -backend-config="encrypt=true"
-```
-
-### Paso 5 — Planificar y aplicar
-
-```bash
-terraform plan
 terraform apply
-# Confirmar con: yes
-```
-
-> Tiempo estimado: **15–20 minutos**. RDS tarda ~8 min, RDS Proxy otros ~5 min. Es normal no ver output durante esos períodos.
-
-Al finalizar, Terraform ejecuta automáticamente la Lambda de migración para crear el schema de RDS.
-
-### Paso 6 — Verificar outputs
-
-```bash
-terraform output chatbot_api_url       # URL del backend → configurar en frontend/js/config.js
-terraform output frontend_url          # URL del frontend en S3
-terraform output cognito_hosted_ui_url # URL de login de Cognito
-terraform output auth_callback_url     # URL del callback OAuth2
-```
-
-### Paso 7 — Subir el frontend
-
-```bash
-./scripts/deploy-frontend.sh
-
-# O manual:
-aws s3 sync frontend/ s3://$(terraform output -raw frontend_bucket_name)/
-```
-
-### Paso 8 — Destruir la infraestructura
-
-> `aws_dynamodb_table` y `aws_db_instance` tienen `prevent_destroy = true`. Para destruir, comentar esas líneas en `database.tf` primero.
-
-```bash
-terraform destroy
 ```
 
 ## Verificación
@@ -180,12 +171,13 @@ aws stepfunctions list-executions \
 
 ## Pipeline de GitHub Actions
 
-El archivo `.github/workflows/terraform.yml` implementa dos jobs:
+El archivo `.github/workflows/terraform.yml` implementa tres jobs:
 
 | Job | Cuándo corre | Credenciales AWS | Qué hace |
 |-----|--------------|------------------|----------|
 | `validate` | En cada `push` y en cada **PR** | No necesita | `init -backend=false`, `validate`, `fmt -check`, `terraform test` |
-| `deploy` | Solo en `workflow_dispatch` manual | Sí (desde secrets) | `init` con backend S3, `plan`, `apply` (opcional) |
+| `backend` | `workflow_dispatch` → `backend` | Sí | Crea el bucket S3 de estado (una sola vez por cuenta) |
+| `deploy` | `workflow_dispatch` → `plan` o `apply` | Sí | `init` con backend S3, `plan`, `apply` |
 
 El job `validate` corre siempre sin credenciales, garantizando que el código es válido en cada PR.
 
@@ -204,13 +196,15 @@ Ir a **Settings → Secrets and variables → Actions → New repository secret*
 
 > Las credenciales de AWS Academy expiran al cerrar el lab. Actualizar los tres secrets `AWS_*` en cada nueva sesión antes de ejecutar un deploy.
 
-### Ejecutar deploy manualmente
+### Opciones del workflow_dispatch
 
-1. Ir a **Actions → Terraform → Run workflow**
-2. Seleccionar `plan` (para revisar) o `apply` (para crear infraestructura)
-3. Clic en **Run workflow**
+| Opción | Cuándo usarla |
+|--------|---------------|
+| `backend` | Primera vez — crea el bucket S3 de estado |
+| `plan` | Previsualiza los cambios sin aplicar nada |
+| `apply` | Despliega la infraestructura completa |
 
-El job `deploy` solo corre si `validate` pasó exitosamente.
+Ir a **Actions → Terraform → Run workflow**, elegir la opción y ejecutar. Cada job requiere que `validate` haya pasado primero.
 
 ## Terraform
 

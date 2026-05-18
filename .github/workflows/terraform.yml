@@ -11,7 +11,7 @@ on:
     branches: [main]
     paths:
       - 'terraform/**'
-  # Trigger manual para plan/apply (requiere secrets cargados)
+  # Trigger manual para backend/plan/apply (requiere secrets cargados)
   workflow_dispatch:
     inputs:
       action:
@@ -19,7 +19,7 @@ on:
         required: true
         default: 'plan'
         type: choice
-        options: [plan, apply]
+        options: [backend, plan, apply]
 
 env:
   TF_VERSION: '1.10.0'
@@ -68,11 +68,46 @@ jobs:
       - name: Terraform Test
         run: terraform test
 
-  # ── Job 2: Plan / Apply (solo en workflow_dispatch manual) ─────────────────
+  # ── Job 2: Backend (crea el bucket S3 para el state — solo la primera vez) ───
+  backend:
+    name: Create Backend
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'backend'
+    needs: validate
+    defaults:
+      run:
+        working-directory: terraform/backend
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Apply
+        env:
+          TF_VAR_state_bucket_suffix: ${{ secrets.STATE_BUCKET_SUFFIX }}
+        run: terraform apply -auto-approve
+
+  # ── Job 3: Plan / Apply (infraestructura completa) ─────────────────────────
   deploy:
     name: ${{ github.event.inputs.action == 'apply' && 'Apply' || 'Plan' }}
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action != 'backend'
     needs: validate
     defaults:
       run:
