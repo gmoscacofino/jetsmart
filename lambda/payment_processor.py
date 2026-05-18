@@ -15,6 +15,8 @@ import os, json, uuid, logging
 from decimal import Decimal
 from datetime import datetime, timezone
 
+from botocore.exceptions import ClientError
+
 import boto3
 
 log = logging.getLogger()
@@ -87,7 +89,7 @@ def reserve_booking_handler(event, context):
     flight_info    = event["flight_info"]
     reservation_r  = event["reservation"]
     pasajeros      = int(reservation_r.get("pasajeros", 1))
-    reservation_id = f"RES-{str(uuid.uuid4())[:8].upper()}"
+    reservation_id = f"RES-{event['payment_id'].replace('-', '')[:8].upper()}"
     # Use the chatbot-computed total (includes extras/seats/fees) if provided;
     # fall back to base price * passengers from the flight record.
     total = Decimal(str(reservation_r["total"])) if reservation_r.get("total") \
@@ -97,23 +99,32 @@ def reserve_booking_handler(event, context):
     email          = reservation_r.get("email_contacto", "")
     phone          = reservation_r.get("telefono", "")
 
-    table.put_item(Item={
-        "PK":              f"USER#{event['user_id']}",
-        "SK":              f"RESERVATION#{reservation_id}",
-        "reservation_id":  reservation_id,
-        "status":          "PENDIENTE",
-        "origin":          flight_info["origen"],
-        "destination":     flight_info["destino"],
-        "flight_number":   flight_info.get("vuelo_numero", ""),
-        "flight_date":     flight_info["fecha"],
-        "passenger_count": pasajeros,
-        "tarifa":          reservation_r.get("tarifa", ""),
-        "total":           total,
-        "email":           email,
-        "phone":           phone,
-        "passenger_name":  passenger_name,
-        "created_at":      datetime.now(timezone.utc).isoformat(),
-    })
+    try:
+        table.put_item(
+            Item={
+                "PK":              f"USER#{event['user_id']}",
+                "SK":              f"RESERVATION#{reservation_id}",
+                "reservation_id":  reservation_id,
+                "status":          "PENDIENTE",
+                "origin":          flight_info["origen"],
+                "destination":     flight_info["destino"],
+                "flight_number":   flight_info.get("vuelo_numero", ""),
+                "flight_date":     flight_info["fecha"],
+                "passenger_count": pasajeros,
+                "tarifa":          reservation_r.get("tarifa", ""),
+                "total":           total,
+                "email":           email,
+                "phone":           phone,
+                "passenger_name":  passenger_name,
+                "created_at":      datetime.now(timezone.utc).isoformat(),
+            },
+            ConditionExpression="attribute_not_exists(SK)",
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            log.info("ReserveBooking — reserva ya existe, idempotente: %s", reservation_id)
+            return {**event, "reservation_id": reservation_id}
+        raise
 
     # Auto-save passenger profile for future bookings (upsert: increment reservation count).
     if passenger_name:
@@ -154,7 +165,7 @@ def collect_payment_handler(event, context):
     # Use the chatbot-provided total (includes extras/seats/fees); fall back to base price.
     total = float(reservation["total"]) if reservation.get("total") \
         else flight_info["precio_por_pasajero"] * pasajeros
-    tx_id = f"TX-{str(uuid.uuid4())[:12].upper()}"
+    tx_id = f"TX-{event['payment_id'].replace('-', '')[:12].upper()}"
 
     log.info("Pago mock aprobado — total: $%.2f — tx: %s", total, tx_id)
 
@@ -250,13 +261,20 @@ def release_flight_handler(event, context):
     log.info("ReleaseFlight — ruta: %s — pasajeros: %d",
              flight_info.get("ruta"), pasajeros)
 
-    table.update_item(
-        Key={
-            "PK": f"FLIGHT#{flight_info['origen']}#{flight_info['destino']}",
-            "SK": f"DATE#{flight_info['fecha']}",
-        },
-        UpdateExpression="ADD asientos_disponibles :inc",
-        ExpressionAttributeValues={":inc": pasajeros},
-    )
+    try:
+        table.update_item(
+            Key={
+                "PK": f"FLIGHT#{flight_info['origen']}#{flight_info['destino']}",
+                "SK": f"DATE#{flight_info['fecha']}",
+            },
+            UpdateExpression="ADD asientos_disponibles :inc",
+            ConditionExpression="attribute_exists(PK)",
+            ExpressionAttributeValues={":inc": pasajeros},
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            log.warning("ReleaseFlight — vuelo no encontrado en DynamoDB: %s", flight_info.get("ruta"))
+            return {"released": False, "reason": "flight_not_found"}
+        raise
 
     return {"released": True, "ruta": flight_info.get("ruta")}

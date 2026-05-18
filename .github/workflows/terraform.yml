@@ -194,8 +194,22 @@ jobs:
         if: github.event.inputs.action == 'apply'
         run: |
           FUNCTION=$(terraform output -raw analytics_processor_function_name)
-          echo "Waiting 8 minutes for RDS Proxy to be fully ready..."
-          sleep 480
+          PROXY_NAME=$(terraform output -raw rds_proxy_name)
+          echo "Esperando a que RDS Proxy esté disponible..."
+          STATUS=""
+          for i in $(seq 1 24); do
+            STATUS=$(aws rds describe-db-proxies \
+              --db-proxy-name "$PROXY_NAME" \
+              --region ${{ env.AWS_REGION }} \
+              --query 'DBProxies[0].Status' \
+              --output text 2>/dev/null || echo "unknown")
+            echo "RDS Proxy status: $STATUS (intento $i/24)"
+            [ "$STATUS" = "available" ] && break
+            sleep 30
+          done
+          if [ "$STATUS" != "available" ]; then
+            echo "RDS Proxy no estuvo disponible después de 12 minutos" && exit 1
+          fi
           for attempt in 1 2 3; do
             echo "Migration attempt $attempt/3..."
             aws lambda invoke \

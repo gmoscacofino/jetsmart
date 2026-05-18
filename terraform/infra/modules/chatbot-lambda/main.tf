@@ -31,6 +31,8 @@ resource "aws_lambda_function" "chat_handler" {
       SYSTEM_PROMPT_ETAG   = var.system_prompt_etag
       STEP_FUNCTIONS_ARN   = var.step_functions_arn
       MOCK_MODE            = tostring(var.mock_mode)
+      FRONTEND_URL         = var.frontend_url
+      COGNITO_USER_POOL_ID = var.cognito_user_pool_id
     }
   }
 

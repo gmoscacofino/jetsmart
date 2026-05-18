@@ -18,7 +18,7 @@ resource "aws_dynamodb_table" "main" {
 
   # GSI1: consulta de vuelos por número (estado de vuelo)
   attribute {
-    name = "numero_vuelo"
+    name = "vuelo_numero"
     type = "S"
   }
 
@@ -29,7 +29,7 @@ resource "aws_dynamodb_table" "main" {
 
   global_secondary_index {
     name            = "FlightByNumber"
-    hash_key        = "numero_vuelo"
+    hash_key        = "vuelo_numero"
     range_key       = "fecha"
     projection_type = "INCLUDE"
     non_key_attributes = [

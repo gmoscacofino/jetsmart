@@ -60,6 +60,8 @@ module "chatbot_lambda" {
   layer_arns           = [aws_lambda_layer_version.anthropic.arn]
   mock_mode            = var.mock_mode
   environment          = var.environment
+  frontend_url         = "http://${aws_s3_bucket_website_configuration.frontend.website_endpoint}"
+  cognito_user_pool_id = module.auth.user_pool_id
 
   depends_on = [
     aws_dynamodb_table.main,
@@ -67,5 +69,6 @@ module "chatbot_lambda" {
     aws_sfn_state_machine.booking,
     aws_secretsmanager_secret_version.anthropic_key,
     aws_s3_object.system_prompt,
+    module.auth,
   ]
 }

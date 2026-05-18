@@ -59,3 +59,13 @@ variable "environment" {
   description = "Deployment environment (used as API Gateway stage name)"
   type        = string
 }
+
+variable "frontend_url" {
+  description = "Frontend URL — sent as Access-Control-Allow-Origin header"
+  type        = string
+}
+
+variable "cognito_user_pool_id" {
+  description = "Cognito User Pool ID for JWT issuer validation"
+  type        = string
+}

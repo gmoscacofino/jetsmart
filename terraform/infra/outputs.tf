@@ -74,3 +74,8 @@ output "analytics_processor_function_name" {
   description = "Nombre de la Lambda analytics-processor (para migración manual)"
   value       = aws_lambda_function.analytics_processor.function_name
 }
+
+output "rds_proxy_name" {
+  description = "Nombre del RDS Proxy (para polling de disponibilidad en el workflow)"
+  value       = aws_db_proxy.main.name
+}

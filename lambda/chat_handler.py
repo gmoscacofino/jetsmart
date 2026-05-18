@@ -1,5 +1,5 @@
 import os, json, uuid, time, logging, base64, re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date, timedelta
 
 import boto3
 import anthropic
@@ -15,6 +15,8 @@ SF_ARN               = os.environ.get("STEP_FUNCTIONS_ARN", "")
 SYSTEM_PROMPT_BUCKET = os.environ["SYSTEM_PROMPT_BUCKET"]
 SYSTEM_PROMPT_KEY    = os.environ["SYSTEM_PROMPT_KEY"]
 MOCK_MODE            = os.environ.get("MOCK_MODE", "false").lower() == "true"
+FRONTEND_URL         = os.environ.get("FRONTEND_URL", "*")
+COGNITO_POOL_ID      = os.environ.get("COGNITO_USER_POOL_ID", "")
 
 dynamodb = boto3.resource("dynamodb", region_name=REGION)
 table    = dynamodb.Table(TABLE_NAME)
@@ -65,6 +67,12 @@ def _parse_jwt(token: str) -> dict:
         raise ValueError("JWT inválido")
     if payload.get("exp", 0) < time.time():
         raise ValueError("Token expirado")
+    if COGNITO_POOL_ID:
+        expected_iss = f"https://cognito-idp.{REGION}.amazonaws.com/{COGNITO_POOL_ID}"
+        if payload.get("iss") != expected_iss:
+            raise ValueError("Token de emisor no reconocido")
+        if payload.get("token_use") not in ("id", "access"):
+            raise ValueError("Tipo de token inválido")
     return payload
 
 
@@ -173,7 +181,7 @@ def _emit_event(event_type: str, payload: dict, user_id: str):
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 CORS_HEADERS = {
-    "Access-Control-Allow-Origin":  "*",
+    "Access-Control-Allow-Origin":  FRONTEND_URL,
     "Access-Control-Allow-Headers": "Authorization,Content-Type",
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
 }
@@ -578,6 +586,12 @@ def _execute_tool(name: str, inputs: dict, user_id: str) -> str:
             return json.dumps({"ok": True, "ya_realizado": True, "mensaje": "Ya tenés check-in realizado para esta reserva."})
         if item.get("status") not in ("CONFIRMADA",):
             return json.dumps({"ok": False, "mensaje": f"No se puede hacer check-in: la reserva está en estado {item.get('status')}."})
+        flight_dt = date.fromisoformat(item["flight_date"])
+        today = date.today()
+        if flight_dt < today:
+            return json.dumps({"ok": False, "mensaje": "No podés hacer check-in para un vuelo que ya pasó."})
+        if flight_dt > today + timedelta(days=1):
+            return json.dumps({"ok": False, "mensaje": f"El check-in abre 24 horas antes del vuelo. Tu vuelo es el {item['flight_date']}."})
         table.update_item(
             Key={"PK": f"USER#{user_id}", "SK": f"RESERVATION#{reservation_id}"},
             UpdateExpression="SET #s = :status",
