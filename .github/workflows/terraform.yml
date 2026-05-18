@@ -19,7 +19,7 @@ on:
         required: true
         default: 'plan'
         type: choice
-        options: [backend, plan, apply]
+        options: [backend, plan, apply, destroy]
 
 env:
   TF_VERSION: '1.10.0'
@@ -119,7 +119,7 @@ jobs:
   deploy:
     name: ${{ github.event.inputs.action == 'apply' && 'Apply' || 'Plan' }}
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action != 'backend'
+    if: github.event_name == 'workflow_dispatch' && (github.event.inputs.action == 'plan' || github.event.inputs.action == 'apply')
     needs: validate
     defaults:
       run:
@@ -178,3 +178,62 @@ jobs:
         run: |
           BUCKET=$(terraform output -raw frontend_bucket_name)
           aws s3 sync ${{ github.workspace }}/frontend/ s3://$BUCKET/ --delete
+
+      - name: Show Outputs
+        if: github.event.inputs.action == 'apply'
+        run: |
+          echo "## URLs del deploy" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          terraform output >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  # ── Job 4: Destroy (destruye toda la infraestructura) ─────────────────────
+  destroy:
+    name: Destroy
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    needs: validate
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # Para destroy solo se necesitan los ZIPs — no hace falta compilar los layers reales
+      - name: Create placeholder layer ZIPs
+        run: |
+          mkdir -p builds
+          python3 -c "import zipfile; zipfile.ZipFile('builds/anthropic-layer.zip', 'w').close()"
+          python3 -c "import zipfile; zipfile.ZipFile('builds/psycopg2-layer.zip', 'w').close()"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=jetsmart-terraform-state-${{ secrets.STATE_BUCKET_SUFFIX }}" \
+            -backend-config="key=infra/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Destroy
+        env:
+          TF_VAR_anthropic_api_key:   ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
+          TF_VAR_rds_password:        ${{ secrets.TF_VAR_RDS_PASSWORD }}
+          TF_VAR_state_bucket_suffix: ${{ secrets.STATE_BUCKET_SUFFIX }}
+          TF_VAR_mock_mode:           ${{ secrets.TF_VAR_ANTHROPIC_API_KEY != '' && 'false' || 'true' }}
+        run: terraform destroy -auto-approve

@@ -107,9 +107,9 @@ Ir a **Actions → Terraform → Run workflow**, seleccionar **`apply`** y ejecu
 
 Al finalizar, Terraform ejecuta automáticamente la Lambda de migración para crear el schema de RDS y sube el frontend al bucket S3.
 
-### Paso 5 — Verificar los outputs
+### Paso 5 — Ver las URLs
 
-Al terminar el apply, la pestaña **Summary** del workflow muestra los outputs de Terraform incluyendo las URLs:
+Al terminar el apply, hacer clic en el job **Apply** y luego en la pestaña **Summary**. El workflow imprime automáticamente los outputs de Terraform:
 
 ```
 chatbot_api_url        = "https://..."
@@ -119,9 +119,7 @@ cognito_hosted_ui_url  = "https://..."
 
 ### Destruir la infraestructura
 
-```bash
-cd terraform/infra && terraform destroy
-```
+Ir a **Actions → Terraform → Run workflow**, seleccionar **`destroy`** y ejecutar. Destruye todos los recursos de la infraestructura.
 
 ---
 
@@ -179,7 +177,8 @@ El archivo `.github/workflows/terraform.yml` implementa tres jobs:
 |-----|--------------|------------------|----------|
 | `validate` | En cada `push` y en cada **PR** | No necesita | `init -backend=false`, `validate`, `fmt -check`, `terraform test` |
 | `backend` | `workflow_dispatch` → `backend` | Sí | Crea el bucket S3 de estado (una sola vez por cuenta) |
-| `deploy` | `workflow_dispatch` → `plan` o `apply` | Sí | `init` con backend S3, `plan`, `apply`, sync frontend → S3 |
+| `deploy` | `workflow_dispatch` → `plan` o `apply` | Sí | `init` con backend S3, `plan`, `apply`, sync frontend → S3, imprime URLs en Summary |
+| `destroy` | `workflow_dispatch` → `destroy` | Sí | `init` con backend S3, `destroy -auto-approve` |
 
 El job `validate` corre siempre sin credenciales, garantizando que el código es válido en cada PR.
 
@@ -205,6 +204,7 @@ Ir a **Settings → Secrets and variables → Actions → New repository secret*
 | `backend` | Primera vez — crea el bucket S3 de estado |
 | `plan` | Previsualiza los cambios sin aplicar nada |
 | `apply` | Despliega la infraestructura completa |
+| `destroy` | Destruye todos los recursos de AWS |
 
 Ir a **Actions → Terraform → Run workflow**, elegir la opción y ejecutar. Cada job requiere que `validate` haya pasado primero.
 
