@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>JetSmart — Asistente Virtual</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;800&family=DM+Sans:wght@300;400;500&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/marked@9.1.6/marked.min.js"></script>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <svg style="display:none" aria-hidden="true">
+    <symbol id="icon-jet" viewBox="0 0 48 48" fill="none">
+      <path d="M8 32 L24 8 L40 32 L28 26 L24 36 L20 26 Z" fill="#FF6600"/>
+    </symbol>
+  </svg>
+
+  <!-- ── LOADING SCREEN ──────────────────────────────────────────── -->
+  <div id="screen-loading" class="screen active">
+    <div class="loading-inner">
+      <div class="flip-board" aria-label="Cargando">
+        <span class="flip-char" style="--i:0">J</span>
+        <span class="flip-char" style="--i:1">E</span>
+        <span class="flip-char" style="--i:2">T</span>
+        <span class="flip-char" style="--i:3">S</span>
+        <span class="flip-char" style="--i:4">M</span>
+        <span class="flip-char" style="--i:5">A</span>
+        <span class="flip-char" style="--i:6">R</span>
+        <span class="flip-char" style="--i:7">T</span>
+      </div>
+      <p class="loading-sub">Preparando tu experiencia de vuelo</p>
+    </div>
+  </div>
+
+  <!-- ── LOGIN SCREEN ───────────────────────────────────────────── -->
+  <div id="screen-login" class="screen">
+    <div class="login-bg">
+      <div class="runway"></div>
+      <div class="runway-lights">
+        <span></span><span></span><span></span><span></span><span></span>
+        <span></span><span></span><span></span><span></span><span></span>
+      </div>
+    </div>
+    <div class="login-card">
+      <div class="login-logo">
+        <svg width="48" height="48"><use href="#icon-jet"/></svg>
+        <span>JetSmart</span>
+      </div>
+      <h1 class="login-title">Tu asistente<br/><em>de vuelo</em></h1>
+      <p class="login-desc">Reservá vuelos, hacé check-in y consultá tu viaje — todo en una conversación.</p>
+      <button id="btn-login" class="btn-primary" onclick="Auth.login()">
+        <span>Iniciar sesión</span>
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M5 12h14M12 5l7 7-7 7"/>
+        </svg>
+      </button>
+      <p class="login-register">
+        ¿No tenés cuenta?
+        <a href="#" onclick="Auth.register(); return false;">Registrate gratis</a>
+      </p>
+    </div>
+  </div>
+
+  <!-- ── CHAT SCREEN ────────────────────────────────────────────── -->
+  <div id="screen-chat" class="screen">
+
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-logo">
+        <svg width="28" height="28"><use href="#icon-jet"/></svg>
+        <span>JetSmart</span>
+      </div>
+
+      <nav class="sidebar-nav">
+        <button class="nav-item active" data-panel="chat">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          Asistente
+        </button>
+        <button class="nav-item" data-panel="reservations">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+          Mis reservas
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="user-chip">
+          <div class="user-avatar" id="user-avatar-chat">U</div>
+          <div class="user-info">
+            <span class="user-name" id="user-name-chat">Usuario</span>
+            <span class="user-tag">Pasajero</span>
+          </div>
+        </div>
+        <button class="btn-logout" onclick="Auth.logout()" title="Cerrar sesión">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+            <polyline points="16 17 21 12 16 7"/>
+            <line x1="21" y1="12" x2="9" y2="12"/>
+          </svg>
+        </button>
+      </div>
+    </aside>
+
+    <!-- Main chat area -->
+    <main class="chat-main">
+      <header class="chat-header">
+        <div class="chat-header-info">
+          <div class="status-dot"></div>
+          <span>Asistente JetSmart</span>
+          <span class="status-text">En línea</span>
+        </div>
+        <div class="flight-ticker" id="flight-ticker">
+          <span>BUE → MZA · JA123 · A TIEMPO</span>
+          <span>BUE → COR · JA456 · A TIEMPO</span>
+          <span>BUE → BRC · JA789 · DEMORADO 15min</span>
+        </div>
+      </header>
+
+      <div class="messages-container" id="messages-container">
+        <!-- Welcome message -->
+        <div class="message message-assistant">
+          <div class="message-avatar">
+            <svg width="16" height="16"><use href="#icon-jet"/></svg>
+          </div>
+          <div class="message-bubble">
+            <p>¡Buen día! Soy el asistente virtual de <strong>JetSmart</strong>. ✈️</p>
+            <p>Puedo ayudarte a:</p>
+            <div class="quick-actions">
+              <button class="quick-btn" onclick="Chat.sendQuick('Quiero reservar un vuelo')">✈️ Reservar vuelo</button>
+              <button class="quick-btn" onclick="Chat.sendQuick('Quiero hacer check-in')">📋 Check-in</button>
+              <button class="quick-btn" onclick="Chat.sendQuick('¿Cuál es el estado de mi vuelo?')">🔍 Estado de vuelo</button>
+              <button class="quick-btn" onclick="Chat.sendQuick('Quiero gestionar mi reserva')">📝 Gestionar reserva</button>
+            </div>
+          </div>
+          <span class="message-time">Ahora</span>
+        </div>
+      </div>
+
+      <div class="chat-input-area">
+        <div class="typing-indicator" id="typing-indicator" style="display:none;">
+          <span></span><span></span><span></span>
+        </div>
+        <form class="input-form" id="input-form" onsubmit="Chat.send(event)">
+          <input
+            type="text"
+            id="chat-input"
+            class="chat-input"
+            placeholder="Escribí tu consulta..."
+            autocomplete="off"
+            maxlength="500"
+          />
+          <button type="submit" class="btn-send" id="btn-send">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="22" y1="2" x2="11" y2="13"/>
+              <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+            </svg>
+          </button>
+        </form>
+      </div>
+    </main>
+
+    <!-- Reservations panel — hidden by default, toggled by nav -->
+    <div id="panel-reservations" class="panel-reservations"></div>
+
+  </div>
+
+  <script src="js/config.js"></script>
+  <script src="js/auth.js"></script>
+  <script src="js/chat.js"></script>
+  <script>
+    // Bootstrap — runs on page load
+    document.addEventListener('DOMContentLoaded', () => App.init());
+
+    const App = {
+      init() {
+        // Check if callback with token
+        const hash = window.location.hash;
+        if (hash.includes('token=') || hash.includes('id_token=')) {
+          Auth.handleCallback(hash);
+          return;
+        }
+        const token = Auth.getToken();
+        if (!token) {
+          App.show('login');
+          return;
+        }
+        const payload = Auth.parseJWT(token);
+        if (!payload) { Auth.logout(); return; }
+        App.showChat(payload);
+      },
+
+      show(name) {
+        document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+        const el = document.getElementById('screen-' + name);
+        if (el) { el.classList.add('active'); }
+        // hide loading
+        document.getElementById('screen-loading').classList.remove('active');
+      },
+
+      showChat(payload) {
+        const name = payload.name || payload.email || 'Usuario';
+        document.getElementById('user-name-chat').textContent = name.split(' ')[0];
+        document.getElementById('user-avatar-chat').textContent = name[0].toUpperCase();
+        Chat.init();
+        App.show('chat');
+      }
+    };
+  </script>
+</body>
+</html>

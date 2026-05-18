@@ -1,0 +1,72 @@
+const Auth = (() => {
+  const TOKEN_KEY = 'jetsmart_id_token';
+
+  function buildCognitoUrl(path, responseType) {
+    const params = new URLSearchParams({
+      response_type: responseType,
+      client_id:     CONFIG.clientId,
+      redirect_uri:  CONFIG.callbackUrl,
+      scope:         'openid email profile',
+    });
+    return `https://${CONFIG.cognitoDomain}/${path}?${params}`;
+  }
+
+  return {
+    login() {
+      window.location.href = buildCognitoUrl('oauth2/authorize', 'code');
+    },
+
+    register() {
+      window.location.href = buildCognitoUrl('signup', 'code');
+    },
+
+    logout() {
+      localStorage.removeItem(TOKEN_KEY);
+      window.location.href = CONFIG.frontendUrl;
+    },
+
+    // Called from App.init() when URL hash contains tokens
+    // Tokens arrive here after the Lambda auth_callback redirects back with #token=...
+    handleCallback(hash) {
+      // Cognito requires HTTPS for the redirect URI, but the API is HTTP-only (no ACM in Academy).
+      // If we're on the HTTPS S3 REST endpoint, move immediately to the HTTP website endpoint
+      // so the browser allows calls to the HTTP ALB (mixed-content block is avoided).
+      // The token travels in the URL hash, which is never sent to any server.
+      if (window.location.protocol === 'https:' && window.location.hostname.endsWith('amazonaws.com')) {
+        window.location.replace(CONFIG.frontendUrl + hash);
+        return;
+      }
+
+      const params = new URLSearchParams(hash.replace(/^#/, ''));
+      const token = params.get('id_token') || params.get('token');
+      if (token) {
+        localStorage.setItem(TOKEN_KEY, token);
+      }
+      // Clean the hash from the URL so tokens don't stay visible
+      history.replaceState(null, '', window.location.pathname);
+      // Re-init now that token is saved
+      App.init();
+    },
+
+    getToken() {
+      const token = localStorage.getItem(TOKEN_KEY);
+      if (!token) return null;
+      const payload = this.parseJWT(token);
+      if (payload && payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
+        localStorage.removeItem(TOKEN_KEY);
+        return null;
+      }
+      return token;
+    },
+
+    parseJWT(token) {
+      try {
+        const base64 = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+        const json = atob(base64);
+        return JSON.parse(json);
+      } catch {
+        return null;
+      }
+    },
+  };
+})();
