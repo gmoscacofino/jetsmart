@@ -55,9 +55,6 @@ resource "aws_dynamodb_table" "main" {
     enabled = true
   }
 
-  lifecycle {
-    prevent_destroy = true
-  }
 }
 
 # ── RDS PostgreSQL — Analytics ────────────────────────────────────────────────
@@ -92,14 +89,8 @@ resource "aws_db_instance" "rds" {
   # No Multi-AZ en Academy para reducir costo
   multi_az = false
 
-  # Protección contra borrado accidental
-  deletion_protection       = true
-  skip_final_snapshot       = false
-  final_snapshot_identifier = "${local.name_prefix}-rds-final-snapshot"
-
-  lifecycle {
-    prevent_destroy = true
-  }
+  deletion_protection = false
+  skip_final_snapshot = true
 }
 
 # ── RDS Proxy ─────────────────────────────────────────────────────────────────
