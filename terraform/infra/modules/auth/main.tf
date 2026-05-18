@@ -50,7 +50,7 @@ resource "aws_cognito_user_pool_client" "frontend" {
   allowed_oauth_scopes                 = ["email", "openid", "profile"]
 
   callback_urls = ["https://${aws_api_gateway_rest_api.auth.id}.execute-api.${var.aws_region}.amazonaws.com/${var.environment}/callback"]
-  logout_urls   = [var.frontend_url]
+  logout_urls   = ["https://${aws_api_gateway_rest_api.auth.id}.execute-api.${var.aws_region}.amazonaws.com/${var.environment}/logout"]
 
   supported_identity_providers = ["COGNITO"]
 
@@ -132,7 +132,7 @@ resource "aws_lambda_permission" "cognito_trigger" {
   source_arn    = aws_cognito_user_pool.main.arn
 }
 
-# ── API Gateway: Callback endpoint ───────────────────────────────────────────
+# ── API Gateway: Callback + Logout endpoints ─────────────────────────────────
 
 resource "aws_api_gateway_rest_api" "auth" {
   name        = "${var.name_prefix}-auth-api"
@@ -161,10 +161,35 @@ resource "aws_api_gateway_integration" "callback" {
   uri                     = aws_lambda_function.auth_callback.invoke_arn
 }
 
+resource "aws_api_gateway_resource" "logout" {
+  rest_api_id = aws_api_gateway_rest_api.auth.id
+  parent_id   = aws_api_gateway_rest_api.auth.root_resource_id
+  path_part   = "logout"
+}
+
+resource "aws_api_gateway_method" "logout_get" {
+  rest_api_id   = aws_api_gateway_rest_api.auth.id
+  resource_id   = aws_api_gateway_resource.logout.id
+  http_method   = "GET"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "logout" {
+  rest_api_id             = aws_api_gateway_rest_api.auth.id
+  resource_id             = aws_api_gateway_resource.logout.id
+  http_method             = aws_api_gateway_method.logout_get.http_method
+  integration_http_method = "POST"
+  type                    = "AWS_PROXY"
+  uri                     = aws_lambda_function.auth_callback.invoke_arn
+}
+
 resource "aws_api_gateway_deployment" "main" {
   rest_api_id = aws_api_gateway_rest_api.auth.id
 
-  depends_on = [aws_api_gateway_integration.callback]
+  depends_on = [
+    aws_api_gateway_integration.callback,
+    aws_api_gateway_integration.logout,
+  ]
 
   lifecycle {
     create_before_destroy = true

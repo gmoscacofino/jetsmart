@@ -18,6 +18,11 @@ FRONTEND_URL   = os.environ["FRONTEND_URL"]     # S3 website URL
 
 
 def handler(event, context):
+    path = event.get("path", "")
+
+    if path.endswith("/logout"):
+        return _redirect(FRONTEND_URL)
+
     qs     = event.get("queryStringParameters") or {}
     code   = qs.get("code")
     error  = qs.get("error")
