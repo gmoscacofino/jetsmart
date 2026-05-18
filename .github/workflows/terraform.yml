@@ -172,3 +172,9 @@ jobs:
           TF_VAR_state_bucket_suffix: ${{ secrets.STATE_BUCKET_SUFFIX }}
           TF_VAR_mock_mode:           ${{ secrets.TF_VAR_ANTHROPIC_API_KEY != '' && 'false' || 'true' }}
         run: terraform apply -auto-approve tfplan
+
+      - name: Deploy Frontend to S3
+        if: github.event.inputs.action == 'apply'
+        run: |
+          BUCKET=$(terraform output -raw frontend_bucket_name)
+          aws s3 sync ${{ github.workspace }}/frontend/ s3://$BUCKET/ --delete

@@ -105,29 +105,16 @@ Ir a **Actions → Terraform → Run workflow**, seleccionar **`apply`** y ejecu
 
 > Tiempo estimado: **15–20 minutos**. RDS tarda ~8 min, RDS Proxy otros ~5 min después.
 
-Al finalizar, Terraform ejecuta automáticamente la Lambda de migración para crear el schema de RDS.
+Al finalizar, Terraform ejecuta automáticamente la Lambda de migración para crear el schema de RDS y sube el frontend al bucket S3.
 
-### Paso 5 — Subir el frontend
+### Paso 5 — Verificar los outputs
 
-Una vez completado el apply, sincronizar el frontend con S3:
+Al terminar el apply, la pestaña **Summary** del workflow muestra los outputs de Terraform incluyendo las URLs:
 
-```bash
-aws s3 sync frontend/ s3://$(terraform -chdir=terraform/infra output -raw frontend_bucket_name)/
 ```
-
-O usar el script incluido:
-
-```bash
-./scripts/deploy-frontend.sh
-```
-
-### Paso 6 — Verificar los outputs
-
-```bash
-cd terraform/infra
-terraform output chatbot_api_url       # URL del backend
-terraform output frontend_url          # URL del frontend en S3
-terraform output cognito_hosted_ui_url # URL de login de Cognito
+chatbot_api_url        = "https://..."
+frontend_url           = "http://..."
+cognito_hosted_ui_url  = "https://..."
 ```
 
 ### Destruir la infraestructura
@@ -192,7 +179,7 @@ El archivo `.github/workflows/terraform.yml` implementa tres jobs:
 |-----|--------------|------------------|----------|
 | `validate` | En cada `push` y en cada **PR** | No necesita | `init -backend=false`, `validate`, `fmt -check`, `terraform test` |
 | `backend` | `workflow_dispatch` → `backend` | Sí | Crea el bucket S3 de estado (una sola vez por cuenta) |
-| `deploy` | `workflow_dispatch` → `plan` o `apply` | Sí | `init` con backend S3, `plan`, `apply` |
+| `deploy` | `workflow_dispatch` → `plan` o `apply` | Sí | `init` con backend S3, `plan`, `apply`, sync frontend → S3 |
 
 El job `validate` corre siempre sin credenciales, garantizando que el código es válido en cada PR.
 

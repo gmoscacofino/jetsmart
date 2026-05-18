@@ -13,6 +13,11 @@ output "frontend_url" {
   value       = "http://${aws_s3_bucket_website_configuration.frontend.website_endpoint}"
 }
 
+output "frontend_bucket_name" {
+  description = "Nombre del bucket S3 del frontend"
+  value       = aws_s3_bucket.frontend.bucket
+}
+
 output "cognito_user_pool_id" {
   description = "Cognito User Pool ID"
   value       = module.auth.user_pool_id
