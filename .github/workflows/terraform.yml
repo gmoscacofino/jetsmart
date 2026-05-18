@@ -210,12 +210,15 @@ jobs:
           if [ "$STATUS" != "available" ]; then
             echo "RDS Proxy no estuvo disponible después de 12 minutos" && exit 1
           fi
+          echo "Esperando 90s para que RDS Proxy establezca conexiones hacia RDS..."
+          sleep 90
           for attempt in 1 2 3; do
             echo "Migration attempt $attempt/3..."
             aws lambda invoke \
               --function-name "$FUNCTION" \
               --payload '{"migrate": true}' \
               --cli-binary-format raw-in-base64-out \
+              --cli-read-timeout 300 \
               --region ${{ env.AWS_REGION }} \
               response.json
             cat response.json
@@ -223,8 +226,8 @@ jobs:
               echo "Migration successful"
               exit 0
             fi
-            echo "Retrying in 60s..."
-            sleep 60
+            echo "Retrying in 30s..."
+            sleep 30
           done
           echo "Migration failed after 3 attempts" && exit 1
 
