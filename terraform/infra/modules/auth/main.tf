@@ -62,8 +62,10 @@ resource "aws_cognito_user_pool_client" "frontend" {
 
 # ── Cognito: Hosted UI domain ─────────────────────────────────────────────────
 
+data "aws_caller_identity" "current" {}
+
 resource "aws_cognito_user_pool_domain" "main" {
-  domain       = var.name_prefix
+  domain       = "${var.name_prefix}-${data.aws_caller_identity.current.account_id}"
   user_pool_id = aws_cognito_user_pool.main.id
 }
 

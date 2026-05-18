@@ -133,33 +133,3 @@ resource "aws_db_proxy_target" "main" {
   db_instance_identifier = aws_db_instance.rds.identifier
 }
 
-# ── RDS Schema Migration ───────────────────────────────────────────────────────
-#
-# Invoca analytics_processor con {"migrate": true} después de cada deploy.
-# El handler usa CREATE TABLE IF NOT EXISTS — es idempotente y seguro re-ejecutar.
-
-# RDS Proxy puede tardar varios minutos en aceptar conexiones después de que
-# Terraform lo reporta como creado. Esperamos 5 minutos antes de intentar la migración.
-resource "time_sleep" "wait_for_rds_proxy" {
-  depends_on      = [aws_db_proxy_target.main]
-  create_duration = "5m"
-}
-
-resource "aws_lambda_invocation" "rds_migrate" {
-  function_name = aws_lambda_function.analytics_processor.function_name
-
-  triggers = {
-    # Re-corre si cambia el código de la Lambda o el RDS instance ID
-    source_hash = data.archive_file.analytics_processor.output_base64sha256
-    rds_id      = aws_db_instance.rds.id
-  }
-
-  input = jsonencode({ migrate = true })
-
-  depends_on = [
-    aws_lambda_function.analytics_processor,
-    aws_db_instance.rds,
-    aws_secretsmanager_secret_version.rds_credentials,
-    time_sleep.wait_for_rds_proxy,
-  ]
-}

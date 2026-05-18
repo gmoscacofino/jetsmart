@@ -41,7 +41,6 @@ mock_provider "aws" {
 }
 
 mock_provider "archive" {}
-mock_provider "time" {}
 
 run "cidrsubnet_genera_dos_subnets_de_computo" {
   command = plan

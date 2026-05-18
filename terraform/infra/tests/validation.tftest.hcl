@@ -41,7 +41,6 @@ mock_provider "aws" {
 }
 
 mock_provider "archive" {}
-mock_provider "time" {}
 
 # Verifica que un valor de environment inválido es rechazado por la validación
 run "rechaza_environment_invalido" {

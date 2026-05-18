@@ -69,3 +69,8 @@ output "sqs_booking_failed_dlq_url" {
   description = "URL de la DLQ de reservas fallidas"
   value       = aws_sqs_queue.booking_failed_dlq.url
 }
+
+output "analytics_processor_function_name" {
+  description = "Nombre de la Lambda analytics-processor (para migración manual)"
+  value       = aws_lambda_function.analytics_processor.function_name
+}

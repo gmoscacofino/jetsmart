@@ -179,6 +179,29 @@ jobs:
           BUCKET=$(terraform output -raw frontend_bucket_name)
           aws s3 sync ${{ github.workspace }}/frontend/ s3://$BUCKET/ --delete
 
+      - name: Run RDS Migration
+        if: github.event.inputs.action == 'apply'
+        run: |
+          FUNCTION=$(terraform output -raw analytics_processor_function_name)
+          echo "Waiting 8 minutes for RDS Proxy to be fully ready..."
+          sleep 480
+          for attempt in 1 2 3; do
+            echo "Migration attempt $attempt/3..."
+            aws lambda invoke \
+              --function-name "$FUNCTION" \
+              --payload '{"migrate": true}' \
+              --region ${{ env.AWS_REGION }} \
+              response.json
+            cat response.json
+            if grep -q '"migrated"' response.json; then
+              echo "Migration successful"
+              exit 0
+            fi
+            echo "Retrying in 60s..."
+            sleep 60
+          done
+          echo "Migration failed after 3 attempts" && exit 1
+
       - name: Show Outputs
         if: github.event.inputs.action == 'apply'
         run: |
