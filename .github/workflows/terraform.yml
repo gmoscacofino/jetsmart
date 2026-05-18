@@ -235,9 +235,12 @@ jobs:
         if: github.event.inputs.action == 'apply'
         run: |
           echo "## URLs del deploy" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          terraform output >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "| Recurso | URL |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontend | $(terraform output -raw frontend_url) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Chatbot API | $(terraform output -raw chatbot_api_url) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cognito Hosted UI | $(terraform output -raw cognito_hosted_ui_url) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Auth Callback | $(terraform output -raw auth_callback_url) |" >> $GITHUB_STEP_SUMMARY
 
   # ── Job 4: Destroy (destruye toda la infraestructura) ─────────────────────
   destroy:
