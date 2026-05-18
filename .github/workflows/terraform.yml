@@ -173,6 +173,17 @@ jobs:
           TF_VAR_mock_mode:           ${{ secrets.TF_VAR_ANTHROPIC_API_KEY != '' && 'false' || 'true' }}
         run: terraform apply -auto-approve tfplan
 
+      - name: Inject Terraform outputs into config.js
+        if: github.event.inputs.action == 'apply'
+        run: |
+          CONFIG="${{ github.workspace }}/frontend/js/config.js"
+          sed -i "s|REEMPLAZAR_CON_terraform_output_cognito_user_pool_id|$(terraform output -raw cognito_user_pool_id)|g"     "$CONFIG"
+          sed -i "s|REEMPLAZAR_CON_terraform_output_cognito_client_id|$(terraform output -raw cognito_client_id)|g"           "$CONFIG"
+          sed -i "s|REEMPLAZAR_CON_terraform_output_cognito_hosted_ui_url|$(terraform output -raw cognito_hosted_ui_url)|g"   "$CONFIG"
+          sed -i "s|REEMPLAZAR_CON_terraform_output_auth_callback_url|$(terraform output -raw auth_callback_url)|g"           "$CONFIG"
+          sed -i "s|REEMPLAZAR_CON_terraform_output_frontend_url|$(terraform output -raw frontend_url)|g"                     "$CONFIG"
+          sed -i "s|REEMPLAZAR_CON_terraform_output_chatbot_api_url|$(terraform output -raw chatbot_api_url)|g"               "$CONFIG"
+
       - name: Deploy Frontend to S3
         if: github.event.inputs.action == 'apply'
         run: |
