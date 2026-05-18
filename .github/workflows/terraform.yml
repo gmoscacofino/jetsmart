@@ -20,6 +20,12 @@ on:
         default: 'plan'
         type: choice
         options: [backend, plan, apply]
+      mock_mode:
+        description: 'Chatbot en modo demo (sin API key de Anthropic)'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
 
 env:
   TF_VERSION: '1.10.0'
@@ -149,6 +155,7 @@ jobs:
           TF_VAR_anthropic_api_key:   ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
           TF_VAR_rds_password:        ${{ secrets.TF_VAR_RDS_PASSWORD }}
           TF_VAR_state_bucket_suffix: ${{ secrets.STATE_BUCKET_SUFFIX }}
+          TF_VAR_mock_mode:           ${{ github.event.inputs.mock_mode }}
         run: terraform plan -out=tfplan
 
       - name: Terraform Apply
@@ -157,4 +164,5 @@ jobs:
           TF_VAR_anthropic_api_key:   ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
           TF_VAR_rds_password:        ${{ secrets.TF_VAR_RDS_PASSWORD }}
           TF_VAR_state_bucket_suffix: ${{ secrets.STATE_BUCKET_SUFFIX }}
+          TF_VAR_mock_mode:           ${{ github.event.inputs.mock_mode }}
         run: terraform apply -auto-approve tfplan
