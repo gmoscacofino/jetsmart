@@ -26,9 +26,9 @@ resource "aws_lambda_function" "analytics_processor" {
 
   environment {
     variables = {
-      AWS_REGION_VAR      = var.aws_region
-      RDS_SECRET_ARN      = aws_secretsmanager_secret.rds_credentials.arn
-      RDS_PROXY_ENDPOINT  = aws_db_proxy.main.endpoint
+      AWS_REGION_VAR     = var.aws_region
+      RDS_SECRET_ARN     = aws_secretsmanager_secret.rds_credentials.arn
+      RDS_PROXY_ENDPOINT = aws_db_proxy.main.endpoint
     }
   }
 

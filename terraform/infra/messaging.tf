@@ -19,7 +19,7 @@ resource "aws_sns_topic" "notifications" {
 resource "aws_sqs_queue" "analytics" {
   name                       = "${local.name_prefix}-analytics"
   message_retention_seconds  = 86400
-  visibility_timeout_seconds = 360  # 6× Lambda timeout (60s) per AWS recommendation
+  visibility_timeout_seconds = 360 # 6× Lambda timeout (60s) per AWS recommendation
   receive_wait_time_seconds  = 20
 
   redrive_policy = jsonencode({
@@ -40,7 +40,7 @@ resource "aws_sqs_queue" "analytics_dlq" {
 
 resource "aws_sqs_queue" "booking_failed_dlq" {
   name                      = "${local.name_prefix}-booking-failed-dlq"
-  message_retention_seconds = 1209600  # 14 días para investigar errores
+  message_retention_seconds = 1209600 # 14 días para investigar errores
 }
 
 # ── Suscripción: eventos del chat → cola analytics ────────────────────────────

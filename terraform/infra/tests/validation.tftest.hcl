@@ -11,9 +11,9 @@ mock_provider "aws" {
   }
   mock_data "aws_iam_role" {
     defaults = {
-      arn        = "arn:aws:iam::123456789012:role/LabRole"
-      name       = "LabRole"
-      unique_id  = "AROA000000000000000000"
+      arn       = "arn:aws:iam::123456789012:role/LabRole"
+      name      = "LabRole"
+      unique_id = "AROA000000000000000000"
     }
   }
   mock_data "aws_iam_instance_profile" {
@@ -24,10 +24,10 @@ mock_provider "aws" {
   }
   mock_data "aws_ami" {
     defaults = {
-      id           = "ami-0abcdef1234567890"
-      name         = "al2023-ami-2023.0.0-x86_64"
-      owner_id     = "137112412989"
-      root_device_type = "ebs"
+      id                  = "ami-0abcdef1234567890"
+      name                = "al2023-ami-2023.0.0-x86_64"
+      owner_id            = "137112412989"
+      root_device_type    = "ebs"
       virtualization_type = "hvm"
     }
   }

@@ -29,7 +29,7 @@ resource "aws_sfn_state_machine" "booking" {
         Resource = aws_lambda_function.payment["reserve-flight"].arn
         Next     = "ReserveBooking"
         Retry = [{
-          ErrorEquals  = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"]
+          ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"]
           IntervalSeconds = 2
           MaxAttempts     = 3
           BackoffRate     = 2
@@ -46,7 +46,7 @@ resource "aws_sfn_state_machine" "booking" {
         Resource = aws_lambda_function.payment["reserve-booking"].arn
         Next     = "CollectPayment"
         Retry = [{
-          ErrorEquals  = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"]
+          ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"]
           IntervalSeconds = 2
           MaxAttempts     = 3
           BackoffRate     = 2
@@ -63,7 +63,7 @@ resource "aws_sfn_state_machine" "booking" {
         Resource = aws_lambda_function.payment["collect"].arn
         Next     = "ConfirmBooking"
         Retry = [{
-          ErrorEquals  = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"]
+          ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"]
           IntervalSeconds = 2
           MaxAttempts     = 3
           BackoffRate     = 2
@@ -80,7 +80,7 @@ resource "aws_sfn_state_machine" "booking" {
         Resource = aws_lambda_function.payment["confirm"].arn
         Next     = "PostBookingActions"
         Retry = [{
-          ErrorEquals  = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"]
+          ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"]
           IntervalSeconds = 2
           MaxAttempts     = 3
           BackoffRate     = 2

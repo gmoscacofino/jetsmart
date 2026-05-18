@@ -47,16 +47,16 @@ module "auth" {
 module "chatbot_lambda" {
   source = "./modules/chatbot-lambda"
 
-  name_prefix           = local.name_prefix
-  aws_region            = var.aws_region
-  dynamodb_table_name   = aws_dynamodb_table.main.name
-  sns_topic_arn         = aws_sns_topic.events.arn
-  anthropic_secret_arn  = aws_secretsmanager_secret.anthropic_key.arn
-  system_prompt_bucket  = aws_s3_bucket.assets.id
-  system_prompt_key     = aws_s3_object.system_prompt.key
-  system_prompt_etag    = aws_s3_object.system_prompt.etag
-  step_functions_arn    = aws_sfn_state_machine.booking.arn
-  layer_arns         = [aws_lambda_layer_version.anthropic.arn]
+  name_prefix          = local.name_prefix
+  aws_region           = var.aws_region
+  dynamodb_table_name  = aws_dynamodb_table.main.name
+  sns_topic_arn        = aws_sns_topic.events.arn
+  anthropic_secret_arn = aws_secretsmanager_secret.anthropic_key.arn
+  system_prompt_bucket = aws_s3_bucket.assets.id
+  system_prompt_key    = aws_s3_object.system_prompt.key
+  system_prompt_etag   = aws_s3_object.system_prompt.etag
+  step_functions_arn   = aws_sfn_state_machine.booking.arn
+  layer_arns           = [aws_lambda_layer_version.anthropic.arn]
 
   depends_on = [
     aws_dynamodb_table.main,

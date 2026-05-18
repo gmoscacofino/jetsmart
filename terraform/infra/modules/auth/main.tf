@@ -43,7 +43,7 @@ resource "aws_cognito_user_pool_client" "frontend" {
   name         = "${var.name_prefix}-frontend-client"
   user_pool_id = aws_cognito_user_pool.main.id
 
-  generate_secret = false   # cliente público (SPA en S3)
+  generate_secret = false # cliente público (SPA en S3)
 
   allowed_oauth_flows                  = ["code"]
   allowed_oauth_flows_user_pool_client = true

@@ -22,14 +22,14 @@ resource "aws_lambda_function" "chat_handler" {
 
   environment {
     variables = {
-      AWS_REGION_VAR             = var.aws_region
-      DYNAMODB_TABLE_NAME        = var.dynamodb_table_name
-      SNS_TOPIC_ARN              = var.sns_topic_arn
-      ANTHROPIC_SECRET_ARN       = var.anthropic_secret_arn
-      SYSTEM_PROMPT_BUCKET       = var.system_prompt_bucket
-      SYSTEM_PROMPT_KEY          = var.system_prompt_key
-      SYSTEM_PROMPT_ETAG         = var.system_prompt_etag
-      STEP_FUNCTIONS_ARN         = var.step_functions_arn
+      AWS_REGION_VAR       = var.aws_region
+      DYNAMODB_TABLE_NAME  = var.dynamodb_table_name
+      SNS_TOPIC_ARN        = var.sns_topic_arn
+      ANTHROPIC_SECRET_ARN = var.anthropic_secret_arn
+      SYSTEM_PROMPT_BUCKET = var.system_prompt_bucket
+      SYSTEM_PROMPT_KEY    = var.system_prompt_key
+      SYSTEM_PROMPT_ETAG   = var.system_prompt_etag
+      STEP_FUNCTIONS_ARN   = var.step_functions_arn
     }
   }
 
@@ -67,7 +67,7 @@ resource "aws_api_gateway_integration" "proxy" {
   integration_http_method = "POST"
   type                    = "AWS_PROXY"
   uri                     = aws_lambda_function.chat_handler.invoke_arn
-  timeout_milliseconds    = 29000  # API GW max; Lambda timeout de 60s cubre cold starts
+  timeout_milliseconds    = 29000 # API GW max; Lambda timeout de 60s cubre cold starts
 }
 
 # ANY / (root) — necesario para que /health funcione

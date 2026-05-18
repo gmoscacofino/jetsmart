@@ -93,8 +93,8 @@ resource "aws_db_instance" "rds" {
   multi_az = false
 
   # Protección contra borrado accidental
-  deletion_protection = true
-  skip_final_snapshot = false
+  deletion_protection       = true
+  skip_final_snapshot       = false
   final_snapshot_identifier = "${local.name_prefix}-rds-final-snapshot"
 
   lifecycle {
