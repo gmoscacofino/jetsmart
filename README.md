@@ -99,15 +99,51 @@ Ir a **Actions → Terraform → Run workflow**, seleccionar **`apply`** y ejecu
 
 Al finalizar, Terraform ejecuta automáticamente la Lambda de migración para crear el schema de RDS y sube el frontend al bucket S3.
 
-### Paso 5 — Ver las URLs
+### Paso 5 — Ver los outputs del deploy
 
-Al terminar el apply, hacer clic en el job **Apply** y luego en la pestaña **Summary**. El workflow imprime automáticamente los outputs de Terraform:
+Al terminar el apply, hacer clic en el job **Apply** y luego en la pestaña **Summary**. El workflow imprime automáticamente todos los outputs de Terraform. El resultado esperado es el siguiente (los valores varían según la cuenta AWS):
 
 ```
-chatbot_api_url        = "https://..."
-frontend_url           = "http://..."
-cognito_hosted_ui_url  = "https://..."
+analytics_processor_function_name = "jetsmart-prod-analytics-processor"
+auth_callback_url                 = "https://<api-id>.execute-api.us-east-1.amazonaws.com/prod/callback"
+bastion_instance_id               = "i-0..."
+chatbot_api_url                   = "https://<api-id>.execute-api.us-east-1.amazonaws.com/prod"
+cognito_client_id                 = "<client-id>"
+cognito_hosted_ui_url             = "https://jetsmart-prod-<account-id>.auth.us-east-1.amazoncognito.com"
+cognito_user_pool_id              = "us-east-1_..."
+dynamodb_table_name               = "jetsmart-prod-main"
+frontend_bucket_name              = "jetsmart-prod-<account-id>-frontend"
+frontend_url                      = "http://jetsmart-prod-<account-id>-frontend.s3-website-us-east-1.amazonaws.com"
+rds_endpoint                      = <sensitive>
+rds_proxy_endpoint                = <sensitive>
+rds_proxy_name                    = "jetsmart-prod-rds-proxy"
+sns_events_arn                    = "arn:aws:sns:us-east-1:<account-id>:jetsmart-prod-events"
+sqs_analytics_url                 = "https://sqs.us-east-1.amazonaws.com/<account-id>/jetsmart-prod-analytics"
+sqs_booking_failed_dlq_url        = "https://sqs.us-east-1.amazonaws.com/<account-id>/jetsmart-prod-booking-failed-dlq"
+step_functions_arn                = "arn:aws:states:us-east-1:<account-id>:stateMachine:jetsmart-prod-booking-workflow"
 ```
+
+#### Qué es cada output y cómo verificarlo
+
+| Output | Qué es | Comportamiento esperado |
+|--------|--------|------------------------|
+| `frontend_url` | URL del sitio web estático en S3 | Abrirla en el browser muestra la app con el botón "Iniciar sesión" |
+| `cognito_hosted_ui_url` | Base URL de Cognito Hosted UI | No es accesible directamente — el frontend construye la URL completa con `client_id` y `redirect_uri` |
+| `auth_callback_url` | Endpoint Lambda que recibe el `code` de Cognito tras el login | GET sin parámetros → 302 al frontend con `#error=missing_code` |
+| `chatbot_api_url` | API Gateway del chatbot | GET sin token → `401 Unauthorized`; con JWT válido → respuesta del chatbot |
+| `analytics_processor_function_name` | Nombre de la Lambda que escribe en RDS | Usada internamente por el workflow para ejecutar la migración del schema |
+| `bastion_instance_id` | ID de la instancia EC2 bastion | Usada para abrir el túnel SSM hacia RDS (ver sección de acceso al bastion) |
+| `cognito_user_pool_id` | ID del User Pool de Cognito | Referencia para validar tokens JWT en el chat handler |
+| `cognito_client_id` | Client ID de la app Cognito | Inyectado en `config.js` — el frontend lo usa para iniciar el flujo OAuth |
+| `dynamodb_table_name` | Tabla única de DynamoDB (single-table design) | Contiene vuelos, reservas, pasajeros y reclamos |
+| `frontend_bucket_name` | Nombre del bucket S3 del frontend | El workflow sube los archivos HTML/CSS/JS a este bucket en cada deploy |
+| `rds_endpoint` | Endpoint directo de la instancia RDS | Sensible — no se expone en logs; acceder solo via RDS Proxy |
+| `rds_proxy_endpoint` | Endpoint del RDS Proxy | Sensible — usado por la Lambda analytics y el túnel SSM del bastion |
+| `rds_proxy_name` | Nombre del RDS Proxy | Usado por el workflow para esperar a que el proxy esté disponible antes de migrar |
+| `sns_events_arn` | ARN del topic SNS de eventos | El chat handler publica aquí cada interacción; SNS reenvía a SQS analytics |
+| `sqs_analytics_url` | Cola SQS que recibe eventos de SNS | La Lambda analytics consume de esta cola para escribir en RDS |
+| `sqs_booking_failed_dlq_url` | Dead-letter queue para reservas fallidas | Si Step Functions falla en todos los reintentos, el mensaje queda aquí |
+| `step_functions_arn` | ARN del state machine de reservas | Ejecutado por el chat handler al confirmar una reserva; implementa el patrón Saga |
 
 ### Destruir la infraestructura
 
