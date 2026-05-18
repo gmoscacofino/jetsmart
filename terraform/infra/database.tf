@@ -138,6 +138,13 @@ resource "aws_db_proxy_target" "main" {
 # Invoca analytics_processor con {"migrate": true} después de cada deploy.
 # El handler usa CREATE TABLE IF NOT EXISTS — es idempotente y seguro re-ejecutar.
 
+# RDS Proxy puede tardar varios minutos en aceptar conexiones después de que
+# Terraform lo reporta como creado. Esperamos 5 minutos antes de intentar la migración.
+resource "time_sleep" "wait_for_rds_proxy" {
+  depends_on      = [aws_db_proxy_target.main]
+  create_duration = "5m"
+}
+
 resource "aws_lambda_invocation" "rds_migrate" {
   function_name = aws_lambda_function.analytics_processor.function_name
 
@@ -153,5 +160,6 @@ resource "aws_lambda_invocation" "rds_migrate" {
     aws_lambda_function.analytics_processor,
     aws_db_instance.rds,
     aws_secretsmanager_secret_version.rds_credentials,
+    time_sleep.wait_for_rds_proxy,
   ]
 }

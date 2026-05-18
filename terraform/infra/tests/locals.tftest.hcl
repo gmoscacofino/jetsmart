@@ -31,9 +31,17 @@ mock_provider "aws" {
       virtualization_type = "hvm"
     }
   }
+  mock_data "aws_caller_identity" {
+    defaults = {
+      account_id = "123456789012"
+      arn        = "arn:aws:iam::123456789012:user/test"
+      user_id    = "AKIAIOSFODNN7EXAMPLE"
+    }
+  }
 }
 
 mock_provider "archive" {}
+mock_provider "time" {}
 
 run "cidrsubnet_genera_dos_subnets_de_computo" {
   command = plan
