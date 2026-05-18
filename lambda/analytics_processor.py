@@ -5,7 +5,7 @@ Triggered by SQS (batch_size=10). Each message is an event published to the
 SNS events topic by chat_handler or payment_processor. Unwraps the SNS envelope
 and writes the raw event log to RDS PostgreSQL via RDS Proxy.
 """
-import os, json, logging
+import os, json, logging, time
 from datetime import datetime, timezone
 
 import boto3
@@ -66,13 +66,24 @@ CREATE INDEX IF NOT EXISTS idx_eventos_timestamp ON eventos_chat (timestamp);
 
 def handler(event, context):
     if event.get("migrate"):
-        conn = _get_rds_conn()
-        conn.rollback()
-        with conn.cursor() as cur:
-            cur.execute(SCHEMA)
-        conn.commit()
-        log.info("Schema migration complete")
-        return {"migrated": True}
+        # RDS Proxy puede tardar unos minutos en estar disponible tras el deploy.
+        # Reintentamos hasta 5 veces con 15s entre intentos (75s total < timeout 120s).
+        global _rds_conn
+        for attempt in range(1, 6):
+            try:
+                conn = _get_rds_conn()
+                conn.rollback()
+                with conn.cursor() as cur:
+                    cur.execute(SCHEMA)
+                conn.commit()
+                log.info("Schema migration complete (attempt %d)", attempt)
+                return {"migrated": True}
+            except Exception as e:
+                _rds_conn = None
+                if attempt == 5:
+                    raise
+                log.warning("Migration attempt %d/5 failed: %s — retrying in 15s", attempt, e)
+                time.sleep(15)
 
     records = event.get("Records", [])
     log.info("Processing %d SQS records", len(records))

@@ -16,7 +16,7 @@ resource "aws_lambda_function" "analytics_processor" {
   runtime          = "python3.12"
   handler          = "analytics_processor.handler"
   role             = data.aws_iam_role.lab_role.arn
-  timeout          = 60
+  timeout          = 120
   layers           = [aws_lambda_layer_version.psycopg2.arn]
 
   vpc_config {
