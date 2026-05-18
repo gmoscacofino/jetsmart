@@ -81,7 +81,7 @@ Copiar solo lo que está **después del `=`** de cada línea.
 | `AWS_ACCESS_KEY_ID` | valor de `aws_access_key_id` |
 | `AWS_SECRET_ACCESS_KEY` | valor de `aws_secret_access_key` |
 | `AWS_SESSION_TOKEN` | valor de `aws_session_token` |
-| `STATE_BUCKET_SUFFIX` | sufijo único para el bucket de estado (ej. `grupo8-2026`) |
+| `STATE_BUCKET_SUFFIX` | sufijo único para el bucket de estado — solo minúsculas, números y guiones (ej. `grupo8-2026`) |
 | `TF_VAR_RDS_PASSWORD` | contraseña para la base de datos RDS |
 | `TF_VAR_ANTHROPIC_API_KEY` | opcional — solo si `mock_mode = false` |
 
