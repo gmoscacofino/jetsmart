@@ -8,7 +8,7 @@ const Auth = (() => {
       redirect_uri:  CONFIG.callbackUrl,
       scope:         'openid email profile',
     });
-    return `https://${CONFIG.cognitoDomain}/${path}?${params}`;
+    return `${CONFIG.cognitoDomain}/${path}?${params}`;
   }
 
   return {
