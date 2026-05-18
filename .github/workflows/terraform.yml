@@ -215,6 +215,7 @@ jobs:
             aws lambda invoke \
               --function-name "$FUNCTION" \
               --payload '{"migrate": true}' \
+              --cli-binary-format raw-in-base64-out \
               --region ${{ env.AWS_REGION }} \
               response.json
             cat response.json
