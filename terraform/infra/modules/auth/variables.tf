@@ -12,3 +12,8 @@ variable "frontend_url" {
   description = "S3 frontend URL used as Cognito callback and logout URL"
   type        = string
 }
+
+variable "environment" {
+  description = "Deployment environment (used as API Gateway stage name)"
+  type        = string
+}

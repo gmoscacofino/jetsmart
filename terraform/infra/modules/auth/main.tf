@@ -49,7 +49,7 @@ resource "aws_cognito_user_pool_client" "frontend" {
   allowed_oauth_flows_user_pool_client = true
   allowed_oauth_scopes                 = ["email", "openid", "profile"]
 
-  callback_urls = ["${var.frontend_url}/callback", "https://${aws_api_gateway_rest_api.auth.id}.execute-api.${var.aws_region}.amazonaws.com/prod/callback"]
+  callback_urls = ["${var.frontend_url}/callback", "https://${aws_api_gateway_rest_api.auth.id}.execute-api.${var.aws_region}.amazonaws.com/${var.environment}/callback"]
   logout_urls   = [var.frontend_url]
 
   supported_identity_providers = ["COGNITO"]
@@ -95,7 +95,7 @@ resource "aws_lambda_function" "auth_callback" {
     variables = {
       CLIENT_ID      = aws_cognito_user_pool_client.frontend.id
       COGNITO_DOMAIN = "${aws_cognito_user_pool_domain.main.domain}.auth.${var.aws_region}.amazoncognito.com"
-      CALLBACK_URL   = "https://${aws_api_gateway_rest_api.auth.id}.execute-api.${var.aws_region}.amazonaws.com/prod/callback"
+      CALLBACK_URL   = "https://${aws_api_gateway_rest_api.auth.id}.execute-api.${var.aws_region}.amazonaws.com/${var.environment}/callback"
       FRONTEND_URL   = "${var.frontend_url}/index.html"
     }
   }
@@ -174,7 +174,7 @@ resource "aws_api_gateway_deployment" "main" {
 resource "aws_api_gateway_stage" "prod" {
   rest_api_id   = aws_api_gateway_rest_api.auth.id
   deployment_id = aws_api_gateway_deployment.main.id
-  stage_name    = "prod"
+  stage_name    = var.environment
 }
 
 resource "aws_lambda_permission" "api_gateway_callback" {

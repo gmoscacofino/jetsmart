@@ -54,3 +54,8 @@ variable "mock_mode" {
   type        = bool
   default     = true
 }
+
+variable "environment" {
+  description = "Deployment environment (used as API Gateway stage name)"
+  type        = string
+}

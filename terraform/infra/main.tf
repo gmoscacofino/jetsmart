@@ -37,9 +37,10 @@ module "auth" {
 
   name_prefix  = local.name_prefix
   aws_region   = var.aws_region
-  frontend_url = "https://${aws_s3_bucket.frontend.bucket_regional_domain_name}"
+  environment  = var.environment
+  frontend_url = "http://${aws_s3_bucket_website_configuration.frontend.website_endpoint}"
 
-  depends_on = [aws_s3_bucket.frontend]
+  depends_on = [aws_s3_bucket_website_configuration.frontend]
 }
 
 # ── Módulo custom: Chatbot Lambda ─────────────────────────────────────────────
@@ -58,6 +59,7 @@ module "chatbot_lambda" {
   step_functions_arn   = aws_sfn_state_machine.booking.arn
   layer_arns           = [aws_lambda_layer_version.anthropic.arn]
   mock_mode            = var.mock_mode
+  environment          = var.environment
 
   depends_on = [
     aws_dynamodb_table.main,
