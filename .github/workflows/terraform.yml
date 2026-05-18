@@ -104,6 +104,18 @@ jobs:
       - name: Terraform Init
         run: terraform init
 
+      # Si el bucket ya existe (run anterior falló a mitad), importarlo al state
+      # para que Terraform no intente recrearlo. || true ignora el error si no existe aún.
+      - name: Import existing resources (idempotente)
+        env:
+          TF_VAR_state_bucket_suffix: ${{ secrets.STATE_BUCKET_SUFFIX }}
+        run: |
+          BUCKET="jetsmart-terraform-state-${{ secrets.STATE_BUCKET_SUFFIX }}"
+          terraform import aws_s3_bucket.terraform_state                                    "$BUCKET" || true
+          terraform import aws_s3_bucket_versioning.terraform_state                         "$BUCKET" || true
+          terraform import aws_s3_bucket_server_side_encryption_configuration.terraform_state "$BUCKET" || true
+          terraform import aws_s3_bucket_public_access_block.terraform_state                "$BUCKET" || true
+
       - name: Terraform Apply
         env:
           TF_VAR_state_bucket_suffix: ${{ secrets.STATE_BUCKET_SUFFIX }}
