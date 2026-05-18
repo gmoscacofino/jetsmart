@@ -164,6 +164,24 @@ jobs:
           TF_VAR_mock_mode:           ${{ secrets.TF_VAR_ANTHROPIC_API_KEY != '' && 'false' || 'true' }}
         run: terraform plan -out=tfplan
 
+      - name: Cleanup secrets pendientes de eliminación
+        if: github.event.inputs.action == 'apply'
+        run: |
+          for SECRET in "jetsmart-prod/anthropic-api-key" "jetsmart-prod/rds-credentials"; do
+            DELETED=$(aws secretsmanager describe-secret \
+              --secret-id "$SECRET" --region ${{ env.AWS_REGION }} \
+              --query 'DeletedDate' --output text 2>/dev/null)
+            if [ -n "$DELETED" ] && [ "$DELETED" != "None" ]; then
+              echo "Force-deleting pending secret: $SECRET"
+              aws secretsmanager delete-secret \
+                --secret-id "$SECRET" \
+                --force-delete-without-recovery \
+                --region ${{ env.AWS_REGION }} 2>/dev/null && echo "Deleted" || true
+            else
+              echo "Secret $SECRET no está pendiente de eliminación (ok)"
+            fi
+          done
+
       - name: Cleanup reglas SG inline residuales
         if: github.event.inputs.action == 'apply'
         run: |

@@ -1,8 +1,9 @@
 # ── Anthropic API Key ─────────────────────────────────────────────────────────
 
 resource "aws_secretsmanager_secret" "anthropic_key" {
-  name        = "${local.name_prefix}/anthropic-api-key"
-  description = "Anthropic Claude API key for the JetSmart chatbot backend"
+  name                    = "${local.name_prefix}/anthropic-api-key"
+  description             = "Anthropic Claude API key for the JetSmart chatbot backend"
+  recovery_window_in_days = 0
 }
 
 resource "aws_secretsmanager_secret_version" "anthropic_key" {
@@ -13,8 +14,9 @@ resource "aws_secretsmanager_secret_version" "anthropic_key" {
 # ── RDS Credentials ───────────────────────────────────────────────────────────
 
 resource "aws_secretsmanager_secret" "rds_credentials" {
-  name        = "${local.name_prefix}/rds-credentials"
-  description = "PostgreSQL credentials for the JetSmart analytics database"
+  name                    = "${local.name_prefix}/rds-credentials"
+  description             = "PostgreSQL credentials for the JetSmart analytics database"
+  recovery_window_in_days = 0
 }
 
 resource "aws_secretsmanager_secret_version" "rds_credentials" {
