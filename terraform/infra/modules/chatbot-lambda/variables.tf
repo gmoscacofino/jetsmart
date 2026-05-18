@@ -1,0 +1,50 @@
+variable "name_prefix" {
+  description = "Prefix for resource names"
+  type        = string
+}
+
+variable "aws_region" {
+  description = "AWS region"
+  type        = string
+}
+
+variable "dynamodb_table_name" {
+  description = "DynamoDB main table name"
+  type        = string
+}
+
+variable "sns_topic_arn" {
+  description = "SNS topic ARN for analytics events"
+  type        = string
+}
+
+variable "anthropic_secret_arn" {
+  description = "Secrets Manager ARN containing the Anthropic API key"
+  type        = string
+}
+
+variable "system_prompt_bucket" {
+  description = "S3 bucket que contiene el system prompt"
+  type        = string
+}
+
+variable "system_prompt_key" {
+  description = "S3 key del archivo con el system prompt"
+  type        = string
+}
+
+variable "system_prompt_etag" {
+  description = "MD5 del system prompt — fuerza un redeploy de Lambda cuando el prompt cambia"
+  type        = string
+}
+
+variable "step_functions_arn" {
+  description = "ARN del state machine de Step Functions — chat handler arranca una ejecución para iniciar el flujo de pago"
+  type        = string
+}
+
+variable "layer_arns" {
+  description = "Lista de ARNs de Lambda Layers a attachar al chat handler"
+  type        = list(string)
+  default     = []
+}
