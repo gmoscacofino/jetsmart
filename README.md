@@ -12,8 +12,8 @@ INTERNET
    ├── Browser → S3 jetsmart-frontend (HTML/CSS/JS — static website hosting)
    ├── Browser → Cognito Hosted UI (login / registro)
    ├── Browser → API Gateway /callback → Lambda auth-callback → redirige con #token=...
-   └── Browser → API Gateway /api/* → Lambda chat-handler
-                                            │
+   └── Browser → API Gateway /api/* → Lambda chat-handler ⟷ Anthropic API (HTTPS, internet)
+                                            │               (claude-haiku-4-5, bucle tool use)
                       ┌─────────────────────┴──────────────────────────────┐
                       │ tool: create_reservation                            │ evento: chat_message
                       ↓                                                     ↓
@@ -54,7 +54,7 @@ FUERA DE LA VPC (servicios managed):
   S3 · Cognito · API Gateway · Step Functions · SNS · SQS · Secrets Manager · CloudWatch
 
 INTERNET EXTERNO:
-  Anthropic API (claude-haiku-4-5) — llamada directa desde chat-handler Lambda
+  chat-handler ⟷ Anthropic API — sin VPC, sin NAT; llamada directa HTTPS por cada mensaje
 ```
 
 ---

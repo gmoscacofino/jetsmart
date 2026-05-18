@@ -136,8 +136,8 @@ INTERNET
    ├── Browser → S3 jetsmart-frontend (HTML/CSS/JS — static website hosting)
    ├── Browser → Cognito Hosted UI (login / registro)
    ├── Browser → API Gateway /callback → Lambda auth-callback → redirige con #token=...
-   └── Browser → API Gateway /api/* → Lambda chat-handler
-                                             │
+   └── Browser → API Gateway /api/* → Lambda chat-handler ⟺ Anthropic API (HTTPS, internet)
+                                             │               (claude-haiku-4-5, bucle tool use)
                        ┌─────────────────────┴──────────────────────────────┐
                        │ tool: create_reservation                            │ evento: chat_message
                        ↓                                                     ↓
