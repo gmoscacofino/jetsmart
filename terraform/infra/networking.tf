@@ -5,17 +5,18 @@ resource "aws_security_group" "lambda" {
   name        = "${local.name_prefix}-sg-lambda"
   description = "Analytics Lambda en VPC: salida a RDS Proxy y VPC endpoints"
   vpc_id      = module.vpc.vpc_id
-
-  egress {
-    description = "HTTPS a VPC endpoints (Secrets Manager, SQS, CloudWatch)"
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
-  }
 }
 
-# Regla separada para evitar dependencia circular entre sg-lambda y sg-rds-proxy
+resource "aws_security_group_rule" "lambda_to_vpc_endpoints" {
+  type              = "egress"
+  description       = "HTTPS a VPC endpoints (Secrets Manager, SQS, CloudWatch)"
+  from_port         = 443
+  to_port           = 443
+  protocol          = "tcp"
+  cidr_blocks       = [var.vpc_cidr]
+  security_group_id = aws_security_group.lambda.id
+}
+
 resource "aws_security_group_rule" "lambda_to_proxy" {
   type                     = "egress"
   description              = "PostgreSQL a RDS Proxy"
@@ -26,20 +27,20 @@ resource "aws_security_group_rule" "lambda_to_proxy" {
   security_group_id        = aws_security_group.lambda.id
 }
 
-# RDS Proxy: acepta conexiones desde Lambda
-# El egress hacia RDS se define como aws_security_group_rule para romper el ciclo
 resource "aws_security_group" "rds_proxy" {
   name        = "${local.name_prefix}-sg-rds-proxy"
   description = "RDS Proxy: ingress desde Lambda, egress hacia RDS"
   vpc_id      = module.vpc.vpc_id
+}
 
-  ingress {
-    description     = "PostgreSQL desde Lambda analytics"
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = [aws_security_group.lambda.id]
-  }
+resource "aws_security_group_rule" "proxy_from_lambda" {
+  type                     = "ingress"
+  description              = "PostgreSQL desde Lambda analytics"
+  from_port                = 5432
+  to_port                  = 5432
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.lambda.id
+  security_group_id        = aws_security_group.rds_proxy.id
 }
 
 # Regla separada para evitar dependencia circular entre sg-rds-proxy y sg-rds
