@@ -123,7 +123,7 @@ resource "aws_db_proxy_default_target_group" "main" {
 
   connection_pool_config {
     max_connections_percent   = 100
-    connection_borrow_timeout = 120
+    connection_borrow_timeout = 15
   }
 }
 
