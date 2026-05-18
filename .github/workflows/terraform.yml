@@ -164,6 +164,26 @@ jobs:
           TF_VAR_mock_mode:           ${{ secrets.TF_VAR_ANTHROPIC_API_KEY != '' && 'false' || 'true' }}
         run: terraform plan -out=tfplan
 
+      - name: Cleanup reglas SG inline residuales
+        if: github.event.inputs.action == 'apply'
+        run: |
+          LAMBDA_SG=$(terraform state show aws_security_group.lambda 2>/dev/null \
+            | awk '/^\s+id\s+=/ {gsub(/"/, "", $3); print $3}')
+          PROXY_SG=$(terraform state show aws_security_group.rds_proxy 2>/dev/null \
+            | awk '/^\s+id\s+=/ {gsub(/"/, "", $3); print $3}')
+          [ -z "$LAMBDA_SG" ] && echo "SGs no en state aún, skipping" && exit 0
+          echo "Lambda SG: $LAMBDA_SG | Proxy SG: $PROXY_SG"
+          aws ec2 revoke-security-group-egress \
+            --group-id "$LAMBDA_SG" \
+            --ip-permissions '[{"IpProtocol":"tcp","FromPort":443,"ToPort":443,"IpRanges":[{"CidrIp":"10.0.0.0/16"}]}]' \
+            --region ${{ env.AWS_REGION }} 2>/dev/null \
+            && echo "Removed egress 443 (era inline)" || echo "Egress 443 no presente (ok)"
+          aws ec2 revoke-security-group-ingress \
+            --group-id "$PROXY_SG" \
+            --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":5432,\"ToPort\":5432,\"UserIdGroupPairs\":[{\"GroupId\":\"$LAMBDA_SG\"}]}]" \
+            --region ${{ env.AWS_REGION }} 2>/dev/null \
+            && echo "Removed ingress 5432 (era inline)" || echo "Ingress 5432 no presente (ok)"
+
       - name: Terraform Apply
         if: github.event.inputs.action == 'apply'
         env:
