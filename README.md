@@ -47,14 +47,6 @@ Verificar credenciales activas:
 aws sts get-caller-identity
 ```
 
-### Herramientas
-
-| Herramienta | Versión mínima | Uso |
-|-------------|----------------|-----|
-| [Terraform](https://developer.hashicorp.com/terraform/downloads) | ≥ 1.10 | Infraestructura (`use_lockfile` requiere esta versión) |
-| [AWS CLI](https://aws.amazon.com/cli/) | v2 | Credenciales y deploy del frontend |
-| [Python](https://www.python.org/downloads/) + pip | 3.12 | Construir los Lambda Layers |
-
 ## Instrucciones de ejecución
 
 El flujo recomendado es via **GitHub Actions** — no requiere instalar Terraform ni AWS CLI localmente. Solo se necesitan credenciales de AWS Academy y acceso al repositorio.
@@ -121,52 +113,105 @@ cognito_hosted_ui_url  = "https://..."
 
 Ir a **Actions → Terraform → Run workflow**, seleccionar **`destroy`** y ejecutar. Destruye todos los recursos de la infraestructura.
 
----
-
-### Ejecución local (alternativa)
-
-Si se prefiere correr Terraform localmente en vez de GitHub Actions:
-
-**Prerrequisitos:** Terraform ≥ 1.10, AWS CLI v2, Python 3.12 + pip.
-
-```bash
-# 1. Construir Lambda Layers
-chmod +x scripts/build-layers.sh && ./scripts/build-layers.sh
-
-# 2. Crear backend (primera vez)
-cd terraform/backend
-terraform init
-terraform apply -var="state_bucket_suffix=<sufijo>"
-
-# 3. Crear variables
-cd terraform/infra
-cp terraform.tfvars.example terraform.tfvars
-# Editar terraform.tfvars con los valores reales
-
-# 4. Inicializar y aplicar
-terraform init \
-  -backend-config="bucket=jetsmart-terraform-state-<sufijo>" \
-  -backend-config="key=infra/terraform.tfstate" \
-  -backend-config="region=us-east-1" \
-  -backend-config="use_lockfile=true" \
-  -backend-config="encrypt=true"
-terraform apply
-```
-
 ## Verificación
 
-Tras el deploy, acceder a `terraform output frontend_url` en el browser:
+Tras el deploy, abrir la URL de `frontend_url` que aparece en el Summary del job Apply.
 
-1. **Login** → Cognito Hosted UI → crear cuenta
-2. **Chat** → escribir "quiero volar a Santiago" → el chatbot responde (modo demo o Claude real según `mock_mode`)
-3. **Reservas** → el flujo de compra pasa por Step Functions → el estado aparece en "Mis reservas"
-4. **Check-in** → disponible 24 hs antes del vuelo
+### Paso previo — Crear cuenta
 
-Para verificar el estado de Step Functions:
+1. Abrir la URL del frontend en el browser.
+2. Hacer clic en **Iniciar sesión** → redirige a la Hosted UI de Cognito.
+3. Crear una cuenta nueva con email y contraseña (mínimo 8 caracteres, una mayúscula y un número).
+4. Confirmar el email con el código que llega por correo.
+5. Después de confirmar, el browser vuelve automáticamente al frontend con la sesión activa.
+
+---
+
+### Modo demo (sin API key de Anthropic)
+
+Cuando `TF_VAR_ANTHROPIC_API_KEY` no está configurado en los secrets, el chatbot corre en **modo demo**. No consulta DynamoDB ni ejecuta Step Functions — devuelve respuestas predefinidas según palabras clave en el mensaje.
+
+Flujo de prueba completo en modo demo:
+
+| Paso | Mensaje de ejemplo | Respuesta esperada |
+|------|-------------------|-------------------|
+| 1 | `quiero volar a Santiago` | Muestra vuelo demo FO 1234 AEP→SCL con precio y asientos |
+| 2 | `reservar` | Confirma reserva con código **RES-DEMO0001** |
+| 3 | `mis reservas` | Lista la reserva demo con estado CONFIRMADA |
+| 4 | `check-in` | Realiza check-in de RES-DEMO0001 |
+| 5 | `boarding pass` | Muestra tarjeta de embarque con asiento 14A, puerta 12 |
+| 6 | `tengo un reclamo, perdí el equipaje` | Registra reclamo con código CLM-DEMO001 |
+
+> Cualquier mensaje que no contenga las palabras clave anteriores (vuelo, reservar, check-in, boarding, reserva, reclamo) devuelve el mensaje de bienvenida con el menú de opciones.
+
+---
+
+### Con API key de Anthropic
+
+Cuando `TF_VAR_ANTHROPIC_API_KEY` está configurado, el chatbot usa **Claude Haiku** con acceso real a los datos en DynamoDB. Las respuestas son libres en lenguaje natural y el flujo de compra ejecuta Step Functions.
+
+Flujo de prueba recomendado:
+
+1. **Buscar vuelos** → `"¿Qué vuelos hay de Buenos Aires a Mendoza?"`
+   - Claude llama a `list_flight_dates` y luego `search_flights` y devuelve disponibilidad real.
+2. **Reservar** → completar datos del pasajero cuando el chatbot los pida, confirmar con `"sí, confirmar"`.
+   - Se inicia una ejecución de Step Functions. El estado pasa por PENDIENTE → CONFIRMADA en segundos.
+3. **Consultar reserva** → `"¿Cuál es el estado de mi reserva?"` → Claude llama a `list_user_reservations`.
+4. **Check-in** → disponible únicamente las 24 horas previas al vuelo.
+5. **Reclamos** → `"Quiero reportar un problema con mi vuelo"` → Claude registra el reclamo en DynamoDB.
+
+Para verificar las ejecuciones de Step Functions:
 ```bash
 aws stepfunctions list-executions \
-  --state-machine-arn $(terraform output -raw step_functions_arn) \
+  --state-machine-arn $(terraform -chdir=terraform/infra output -raw step_functions_arn) \
   --region us-east-1
+```
+
+---
+
+### Acceso al bastion y consultas a RDS
+
+El bastion es una instancia EC2 en la subnet pública accesible **solo via SSM** (sin SSH ni puerto 22 abierto). Se usa para conectarse a la base de datos de analytics desde la máquina local.
+
+**Requisitos locales:** AWS CLI v2 + [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html).
+
+**1. Obtener los valores necesarios:**
+```bash
+cd terraform/infra
+BASTION_ID=$(terraform output -raw bastion_instance_id)
+RDS_PROXY=$(terraform output -raw rds_proxy_endpoint)
+```
+
+**2. Abrir el túnel SSM (deja la terminal abierta):**
+```bash
+aws ssm start-session \
+  --target "$BASTION_ID" \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters "{\"host\":[\"$RDS_PROXY\"],\"portNumber\":[\"5432\"],\"localPortNumber\":[\"5433\"]}" \
+  --region us-east-1
+```
+
+**3. Conectar psql en otra terminal:**
+```bash
+psql -h localhost -p 5433 -U jetsmart_admin -d jetsmart_analytics
+# Ingresar la contraseña configurada en TF_VAR_RDS_PASSWORD
+```
+
+**Consultas de ejemplo:**
+```sql
+-- Ver tablas creadas por la migración
+\dt
+
+-- Eventos de analytics registrados
+SELECT event_type, user_id, created_at FROM analytics_events ORDER BY created_at DESC LIMIT 20;
+
+-- Reservas completadas
+SELECT * FROM bookings WHERE status = 'CONFIRMADA' ORDER BY created_at DESC;
+
+-- Búsquedas de vuelos por ruta
+SELECT ruta, COUNT(*) AS busquedas FROM analytics_events
+WHERE event_type = 'busqueda_vuelo'
+GROUP BY ruta ORDER BY busquedas DESC;
 ```
 
 ## Pipeline de GitHub Actions
@@ -196,17 +241,6 @@ Ir a **Settings → Secrets and variables → Actions → New repository secret*
 | `TF_VAR_ANTHROPIC_API_KEY` | Opcional | Requerida solo si `mock_mode = false` |
 
 > Las credenciales de AWS Academy expiran al cerrar el lab. Actualizar los tres secrets `AWS_*` en cada nueva sesión antes de ejecutar un deploy.
-
-### Opciones del workflow_dispatch
-
-| Opción | Cuándo usarla |
-|--------|---------------|
-| `backend` | Primera vez — crea el bucket S3 de estado |
-| `plan` | Previsualiza los cambios sin aplicar nada |
-| `apply` | Despliega la infraestructura completa |
-| `destroy` | Destruye todos los recursos de AWS |
-
-Ir a **Actions → Terraform → Run workflow**, elegir la opción y ejecutar. Cada job requiere que `validate` haya pasado primero.
 
 ## Terraform
 
