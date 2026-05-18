@@ -48,3 +48,9 @@ variable "layer_arns" {
   type        = list(string)
   default     = []
 }
+
+variable "mock_mode" {
+  description = "Cuando es true el chatbot devuelve respuestas demo sin llamar a Anthropic API"
+  type        = bool
+  default     = true
+}

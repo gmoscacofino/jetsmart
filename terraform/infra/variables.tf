@@ -73,9 +73,16 @@ variable "rds_password" {
 # ── Secrets ───────────────────────────────────────────────────────────────────
 
 variable "anthropic_api_key" {
-  description = "Anthropic API key for Claude — never commit this value"
+  description = "Anthropic API key for Claude. Opcional cuando mock_mode = true."
   type        = string
+  default     = ""
   sensitive   = true
+}
+
+variable "mock_mode" {
+  description = "Cuando es true el chatbot devuelve respuestas demo sin llamar a Anthropic API. No requiere anthropic_api_key."
+  type        = bool
+  default     = true
 }
 
 # ── Chatbot ───────────────────────────────────────────────────────────────────

@@ -30,6 +30,7 @@ resource "aws_lambda_function" "chat_handler" {
       SYSTEM_PROMPT_KEY    = var.system_prompt_key
       SYSTEM_PROMPT_ETAG   = var.system_prompt_etag
       STEP_FUNCTIONS_ARN   = var.step_functions_arn
+      MOCK_MODE            = tostring(var.mock_mode)
     }
   }
 
