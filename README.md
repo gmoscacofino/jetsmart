@@ -42,31 +42,14 @@ FUERA DE LA VPC (managed):
 | Rol **LabRole** | Pre-existente en AWS Academy (`data.aws_iam_role.lab_role` en Terraform) |
 | AWS CLI v2 | Credenciales en `~/.aws/credentials` o variables de entorno |
 
-Verificar credenciales activas:
-```bash
-aws sts get-caller-identity
-```
 
 ## Instrucciones de ejecución
 
-El flujo recomendado es via **GitHub Actions** — no requiere instalar Terraform ni AWS CLI localmente. Solo se necesitan credenciales de AWS Academy y acceso al repositorio.
+El flujo es via **GitHub Actions** — no requiere instalar Terraform ni AWS CLI localmente. Solo se necesitan credenciales de AWS Academy y acceso al repositorio.
 
 ### Paso 1 — Configurar secrets en GitHub
 
 Ir a **Settings → Secrets and variables → Actions → New repository secret**.
-
-En cada secret: el **nombre** va en el campo *Name* y el **valor** va en el campo *Secret* — solo el valor, sin el nombre ni el `=`.
-
-Las credenciales AWS se obtienen desde el Learner Lab → **AWS Details → AWS CLI → Show**. El bloque tiene este formato:
-
-```
-[default]
-aws_access_key_id=ASIA...
-aws_secret_access_key=xxxx...
-aws_session_token=xxxx...muy largo...
-```
-
-Copiar solo lo que está **después del `=`** de cada línea.
 
 | Name | Secret |
 |------|--------|
@@ -77,13 +60,11 @@ Copiar solo lo que está **después del `=`** de cada línea.
 | `TF_VAR_RDS_PASSWORD` | contraseña para la base de datos RDS |
 | `TF_VAR_ANTHROPIC_API_KEY` | opcional — solo si `mock_mode = false` |
 
-> Las credenciales de AWS Academy expiran al cerrar el lab. Actualizar los tres secrets `AWS_*` cada vez que se inicie una nueva sesión antes de correr un deploy.
-
 ### Paso 2 — Crear el backend (primera vez)
 
 Ir a **Actions → Terraform → Run workflow**, seleccionar **`backend`** y ejecutar.
 
-Crea el bucket S3 `jetsmart-terraform-state-<STATE_BUCKET_SUFFIX>` que almacena el state de Terraform. Solo se corre una vez por cuenta AWS.
+Crea el bucket S3 `jetsmart-terraform-state-<STATE_BUCKET_SUFFIX>` que almacena el state de Terraform.
 
 ### Paso 3 — Planificar la infraestructura
 
@@ -95,7 +76,7 @@ Muestra todos los recursos que se van a crear sin modificar nada. Revisar el out
 
 Ir a **Actions → Terraform → Run workflow**, seleccionar **`apply`** y ejecutar.
 
-> Tiempo estimado: **15–20 minutos**. RDS tarda ~8 min, RDS Proxy otros ~5 min después.
+> Tiempo estimado: **15–20 minutos**.
 
 Al finalizar, Terraform ejecuta automáticamente la Lambda de migración para crear el schema de RDS y sube el frontend al bucket S3.
 
@@ -130,7 +111,7 @@ Tras el deploy, abrir la URL de `frontend_url` que aparece en el Summary del job
 
 ### Modo demo (sin API key de Anthropic)
 
-Cuando `TF_VAR_ANTHROPIC_API_KEY` no está configurado en los secrets, el chatbot corre en **modo demo**. No consulta DynamoDB ni ejecuta Step Functions — devuelve respuestas predefinidas según palabras clave en el mensaje.
+Cuando `TF_VAR_ANTHROPIC_API_KEY` no está configurado en los secrets, el chatbot corre en **modo demo**. No consulta DynamoDB ni ejecuta Step Functions, devuelve respuestas predefinidas según palabras clave en el mensaje.
 
 Flujo de prueba completo en modo demo:
 
@@ -227,21 +208,6 @@ El archivo `.github/workflows/terraform.yml` implementa tres jobs:
 | `destroy` | `workflow_dispatch` → `destroy` | Sí | `init` con backend S3, `destroy -auto-approve` |
 
 El job `validate` corre siempre sin credenciales, garantizando que el código es válido en cada PR.
-
-### Secrets del repositorio
-
-Ir a **Settings → Secrets and variables → Actions → New repository secret**:
-
-| Secret | Obligatorio | Descripción |
-|--------|-------------|-------------|
-| `AWS_ACCESS_KEY_ID` | Para deploy | Credencial de AWS Academy (se renueva por sesión) |
-| `AWS_SECRET_ACCESS_KEY` | Para deploy | Credencial de AWS Academy |
-| `AWS_SESSION_TOKEN` | Para deploy | Token de sesión de AWS Academy |
-| `STATE_BUCKET_SUFFIX` | Para deploy | Sufijo del bucket de estado (ej. `grupo8-2026`) |
-| `TF_VAR_RDS_PASSWORD` | Para deploy | Contraseña de RDS |
-| `TF_VAR_ANTHROPIC_API_KEY` | Opcional | Requerida solo si `mock_mode = false` |
-
-> Las credenciales de AWS Academy expiran al cerrar el lab. Actualizar los tres secrets `AWS_*` en cada nueva sesión antes de ejecutar un deploy.
 
 ## Terraform
 
