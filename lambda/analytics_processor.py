@@ -5,12 +5,19 @@ Triggered by SQS (batch_size=10). Each message is an event published to the
 SNS events topic by chat_handler or payment_processor. Unwraps the SNS envelope
 and writes the raw event log to RDS PostgreSQL via RDS Proxy.
 """
-import os, json, logging, time
+import os, json, logging, time, socket
 from datetime import datetime, timezone
 
 import boto3
 import psycopg2
 from psycopg2.extras import execute_values
+
+# Garantiza que los intentos de conexión TCP respeten el timeout aunque el SG
+# descarte paquetes silenciosamente (sin RST). psycopg2 connect_timeout solo
+# funciona de forma confiable cuando el host envía RST; con drop silencioso el
+# OS espera su propio timeout (~2-3 min). Este setdefaulttimeout actúa a nivel
+# de socket y corta la espera en 30s en cualquier caso.
+socket.setdefaulttimeout(30)
 
 log = logging.getLogger()
 log.setLevel(logging.INFO)

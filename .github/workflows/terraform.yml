@@ -156,14 +156,10 @@ jobs:
             -backend-config="use_lockfile=true" \
             -backend-config="encrypt=true"
 
-      - name: Terraform Plan
-        env:
-          TF_VAR_anthropic_api_key:   ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
-          TF_VAR_rds_password:        ${{ secrets.TF_VAR_RDS_PASSWORD }}
-          TF_VAR_state_bucket_suffix: ${{ secrets.STATE_BUCKET_SUFFIX }}
-
-        run: terraform plan -out=tfplan
-
+      # Los cleanup corren ANTES del plan para que Terraform detecte cualquier
+      # drift generado por la limpieza e incluya la corrección en el mismo plan.
+      # Si corrieran después del plan, las reglas borradas quedarían eliminadas
+      # porque el apply ejecutaría un plan ya desactualizado.
       - name: Cleanup secrets pendientes de eliminación
         if: github.event.inputs.action == 'apply'
         run: |
@@ -201,6 +197,14 @@ jobs:
             --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":5432,\"ToPort\":5432,\"UserIdGroupPairs\":[{\"GroupId\":\"$LAMBDA_SG\"}]}]" \
             --region ${{ env.AWS_REGION }} 2>/dev/null \
             && echo "Removed ingress 5432 (era inline)" || echo "Ingress 5432 no presente (ok)"
+
+      - name: Terraform Plan
+        env:
+          TF_VAR_anthropic_api_key:   ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
+          TF_VAR_rds_password:        ${{ secrets.TF_VAR_RDS_PASSWORD }}
+          TF_VAR_state_bucket_suffix: ${{ secrets.STATE_BUCKET_SUFFIX }}
+
+        run: terraform plan -out=tfplan
 
       - name: Terraform Apply
         if: github.event.inputs.action == 'apply'
