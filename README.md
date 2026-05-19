@@ -34,7 +34,7 @@ Ir a **Settings → Secrets and variables → Actions → New repository secret*
 | `AWS_ACCESS_KEY_ID` | valor de `aws_access_key_id` |
 | `AWS_SECRET_ACCESS_KEY` | valor de `aws_secret_access_key` |
 | `AWS_SESSION_TOKEN` | valor de `aws_session_token` |
-| `STATE_BUCKET_SUFFIX` | sufijo único para el bucket de estado — solo minúsculas, números y guiones (ej. `grupo8-2026`). Los nombres de bucket S3 son globales: si el job `backend` falla con `BucketAlreadyExists`, cambiar este sufijo por uno diferente (ej. `grupo8-2026b`) |
+| `STATE_BUCKET_SUFFIX` | sufijo único para el bucket de estado, solo minúsculas, números y guiones (ej. `grupo8-2026`). Los nombres de bucket S3 son globales: si el job `backend` falla con `BucketAlreadyExists`, cambiar este sufijo por uno diferente (ej. `grupo8-2026b`) |
 | `TF_VAR_RDS_PASSWORD` | contraseña para la base de datos RDS |
 | `TF_VAR_ANTHROPIC_API_KEY` | Cargar la API key de Anthropic que fue entregada al docente por separado. |
 
@@ -231,7 +231,7 @@ El job `validate` corre siempre sin credenciales, garantizando que el código es
 
 | Función | Archivo | Uso |
 |---------|---------|-----|
-| `cidrsubnet()` | `locals.tf` | Calcula los CIDRs de las 6 subnets a partir del CIDR de la VPC |
+| `cidrsubnet()` | `locals.tf` | Calcula los CIDRs de las 5 subnets a partir del CIDR de la VPC |
 | `slice()` | `locals.tf`, `lambda.tf`, `database.tf` | Selecciona subnets por índice (cómputo vs datos) |
 | `concat()` | `main.tf` | Une CIDRs de subnets de cómputo y datos para el módulo VPC |
 | `jsonencode()` | `messaging.tf`, `secrets.tf`, `step_functions.tf`, `storage.tf` | Genera JSON para políticas, secretos y la definición del state machine |
