@@ -45,7 +45,7 @@ FUERA DE LA VPC (managed):
 
 ## Instrucciones de ejecución
 
-El flujo es via **GitHub Actions** — no requiere instalar Terraform ni AWS CLI localmente. Solo se necesitan credenciales de AWS Academy y acceso al repositorio.
+El flujo es via **GitHub Actions**, no requiere instalar Terraform ni AWS CLI localmente. Solo se necesitan credenciales de AWS Academy y acceso al repositorio.
 
 ### Paso 1 — Configurar secrets en GitHub
 
