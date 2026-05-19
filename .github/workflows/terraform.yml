@@ -170,7 +170,7 @@ jobs:
           for SECRET in "jetsmart-prod/anthropic-api-key" "jetsmart-prod/rds-credentials"; do
             DELETED=$(aws secretsmanager describe-secret \
               --secret-id "$SECRET" --region ${{ env.AWS_REGION }} \
-              --query 'DeletedDate' --output text 2>/dev/null)
+              --query 'DeletedDate' --output text 2>/dev/null) || true
             if [ -n "$DELETED" ] && [ "$DELETED" != "None" ]; then
               echo "Force-deleting pending secret: $SECRET"
               aws secretsmanager delete-secret \
