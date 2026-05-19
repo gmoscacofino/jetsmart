@@ -34,6 +34,8 @@ FUERA DE LA VPC (managed):
 ## Diagrama
 <img src="docs/Jetsmart - Diagrama.png" alt="Diagrama de Arquitectura" width="110%">
 
+> Tocar sobre la imagen del diagrama para apliarla y visualizarla mejor
+
 ## Requerimientos
 
 ### Cuenta y credenciales AWS
