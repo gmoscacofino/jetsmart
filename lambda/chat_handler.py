@@ -411,6 +411,10 @@ TOOLS = [
                     "type": "string",
                     "description": "Nombre completo del pasajero principal (nombre + apellido)",
                 },
+                "vuelo_numero": {
+                    "type": "string",
+                    "description": "Número de vuelo elegido (ej: JA203). Obligatorio si hay más de una frecuencia disponible en la fecha.",
+                },
             },
             "required": ["origen", "destino", "fecha", "pasajeros", "tarifa", "total", "email_contacto"],
         },
@@ -447,16 +451,18 @@ def _execute_tool(name: str, inputs: dict, user_id: str) -> str:
                 "mensaje":    f"No hay vuelos disponibles de {origen} a {destino}.",
             })
 
-        fechas = [
-            {
-                "fecha":               i["SK"].replace("DATE#", ""),
-                "vuelo":               i.get("vuelo_numero"),
-                "precio_desde":        float(i.get("precio", 0)),
-                "asientos_disponibles": int(i.get("asientos_disponibles", 0)),
-            }
-            for i in items
-            if int(i.get("asientos_disponibles", 0)) > 0
-        ]
+        # SK format: DATE#2026-05-20#FLIGHT#JA203
+        fechas = []
+        for i in items:
+            if int(i.get("asientos_disponibles", 0)) > 0:
+                sk_parts = i["SK"].split("#")
+                fechas.append({
+                    "fecha":                sk_parts[1],
+                    "vuelo":                i.get("vuelo_numero"),
+                    "hora_salida":          i.get("hora_salida"),
+                    "precio_desde":         float(i.get("precio", 0)),
+                    "asientos_disponibles": int(i.get("asientos_disponibles", 0)),
+                })
 
         return json.dumps({
             "origen":  origen,
@@ -472,48 +478,64 @@ def _execute_tool(name: str, inputs: dict, user_id: str) -> str:
 
         log.info("search_flights: %s→%s %s (%d pax)", origen, destino, fecha, pasajeros)
 
-        resp = table.get_item(
-            Key={"PK": f"FLIGHT#{origen}#{destino}", "SK": f"DATE#{fecha}"}
+        # Query en lugar de get_item: puede haber más de un vuelo por ruta/fecha
+        # (ej: JA201 07:30 y JA203 17:00). SK format: DATE#fecha#FLIGHT#vuelo
+        resp = table.query(
+            KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
+            ExpressionAttributeValues={
+                ":pk":     f"FLIGHT#{origen}#{destino}",
+                ":prefix": f"DATE#{fecha}#",
+            },
+            ScanIndexForward=True,
         )
-        item = resp.get("Item")
+        found = resp.get("Items", [])
 
-        if not item:
+        if not found:
             return json.dumps({
                 "disponible": False,
                 "mensaje":    f"No hay vuelos de {origen} a {destino} el {fecha}.",
             })
 
-        asientos = int(item.get("asientos_disponibles", 0))
-        if asientos < pasajeros:
+        vuelos = []
+        for item in found:
+            asientos = int(item.get("asientos_disponibles", 0))
+            if asientos >= pasajeros:
+                vuelos.append({
+                    "vuelo":                item["vuelo_numero"],
+                    "hora_salida":          item.get("hora_salida"),
+                    "hora_llegada":         item.get("hora_llegada"),
+                    "duracion":             item.get("duracion"),
+                    "precio_por_pasajero":  float(item["precio"]),
+                    "precio_total":         float(item["precio"]) * pasajeros,
+                    "asientos_disponibles": asientos,
+                    "aerolinea":            item.get("aerolinea", "JetSmart"),
+                })
+
+        if not vuelos:
+            total = sum(int(i.get("asientos_disponibles", 0)) for i in found)
             return json.dumps({
                 "disponible": False,
-                "mensaje":    (
-                    f"Vuelo {item['vuelo_numero']} encontrado pero sin asientos suficientes "
-                    f"(disponibles: {asientos}, solicitados: {pasajeros})."
+                "mensaje": (
+                    f"Hay vuelo(s) de {origen} a {destino} el {fecha} pero sin asientos "
+                    f"suficientes para {pasajeros} pasajero(s) (máx. disponible: {total})."
                 ),
             })
 
         _emit_event("busqueda_vuelo", {
-            "origen":   origen,
-            "destino":  destino,
-            "fecha":    fecha,
+            "origen":    origen,
+            "destino":   destino,
+            "fecha":     fecha,
             "pasajeros": pasajeros,
-            "ruta":     f"{origen}-{destino}",
+            "ruta":      f"{origen}-{destino}",
         }, user_id)
 
         return json.dumps({
-            "disponible":          True,
-            "vuelo":               item["vuelo_numero"],
-            "origen":              origen,
-            "destino":             destino,
-            "fecha":               fecha,
-            "hora_salida":         item.get("hora_salida"),
-            "hora_llegada":        item.get("hora_llegada"),
-            "duracion":            item.get("duracion"),
-            "precio_por_pasajero": float(item["precio"]),
-            "precio_total":        float(item["precio"]) * pasajeros,
-            "asientos_disponibles": asientos,
-            "aerolinea":           item.get("aerolinea", "JetSmart"),
+            "disponible": True,
+            "origen":     origen,
+            "destino":    destino,
+            "fecha":      fecha,
+            "pasajeros":  pasajeros,
+            "vuelos":     vuelos,
         })
 
     if name == "get_reservation":
@@ -710,6 +732,7 @@ def _execute_tool(name: str, inputs: dict, user_id: str) -> str:
             "email_contacto":   inputs.get("email_contacto", ""),
             "telefono":         inputs.get("telefono", ""),
             "nombre_pasajero":  inputs.get("nombre_pasajero", ""),
+            "vuelo_numero":     inputs.get("vuelo_numero", ""),
         }
 
         log.info("create_reservation: %s→%s %s user=%s",

@@ -5,8 +5,11 @@ Uso: python3 scripts/seed_flights.py <TABLE_NAME>
 
 Genera vuelos los próximos 75 días (lunes, miércoles y viernes)
 para las rutas que opera JetSmart en Sudamérica.
+
+SK format: DATE#YYYY-MM-DD#FLIGHT#JAXX
+Permite múltiples vuelos por ruta/fecha sin sobreescribirse.
 """
-import sys
+import sys, random
 from datetime import date, timedelta
 from decimal import Decimal
 
@@ -20,7 +23,7 @@ TABLE_NAME = sys.argv[1]
 dynamodb   = boto3.resource("dynamodb", region_name="us-east-1")
 table      = dynamodb.Table(TABLE_NAME)
 
-# (origen, destino, vuelo, hora_salida, hora_llegada, duracion_min, precio_usd)
+# (origen, destino, vuelo, hora_salida, hora_llegada, duracion_min, precio_base_usd)
 RUTAS = [
     ("AEP", "SCL", "JA401",  "08:15", "10:30", 135,  89.0),
     ("SCL", "AEP", "JA402",  "11:30", "13:45", 135,  89.0),
@@ -44,6 +47,7 @@ RUTAS = [
     ("IGR", "AEP", "JA302",  "09:30", "11:15", 105,  69.0),
 ]
 
+
 def fechas_proximos_dias(dias=75):
     hoy = date.today()
     return [
@@ -52,37 +56,99 @@ def fechas_proximos_dias(dias=75):
         if (hoy + timedelta(days=i)).weekday() in (0, 2, 4)  # lun, mié, vie
     ]
 
+
 def duracion_str(minutos):
     return f"{minutos // 60}h {minutos % 60:02d}m"
+
+
+def _capacidad(precio_base: float) -> int:
+    if precio_base < 60:
+        return 120
+    if precio_base < 100:
+        return 100
+    return 80
+
+
+def _asientos(vuelo: str, fecha: str, capacidad: int) -> int:
+    """
+    Asientos disponibles variables por fecha.
+    Vuelos próximos tienen menos disponibilidad (ya vendidos); lejanos más.
+    Determinístico: mismo vuelo+fecha → mismo resultado.
+    """
+    days_out = (date.fromisoformat(fecha) - date.today()).days
+    rng = random.Random(hash(f"{vuelo}|{fecha}"))
+    if days_out <= 3:
+        lo, hi = 0.03, 0.20   # casi lleno
+    elif days_out <= 7:
+        lo, hi = 0.12, 0.40
+    elif days_out <= 14:
+        lo, hi = 0.25, 0.60
+    elif days_out <= 30:
+        lo, hi = 0.40, 0.80
+    else:
+        lo, hi = 0.55, 1.00   # muchos lugares aún
+    return max(1, round(rng.uniform(lo, hi) * capacidad))
+
+
+def _precio(precio_base: float, vuelo: str, fecha: str) -> float:
+    """
+    Precio dinámico por vuelo+fecha:
+    - Demanda por proximidad (revenue management básico)
+    - Recargo de viernes
+    - Ruido pequeño determinístico para evitar precios idénticos
+    """
+    d = date.fromisoformat(fecha)
+    days_out = (d - date.today()).days
+
+    if days_out <= 3:
+        demand = 1.50
+    elif days_out <= 7:
+        demand = 1.30
+    elif days_out <= 14:
+        demand = 1.13
+    elif days_out <= 30:
+        demand = 1.03
+    else:
+        demand = 0.92   # tarifas early-bird
+
+    dow_factor = 1.18 if d.weekday() == 4 else 1.00  # viernes +18 %
+
+    rng = random.Random(hash(f"p|{vuelo}|{fecha}"))
+    noise = rng.uniform(0.96, 1.04)
+
+    return round(precio_base * demand * dow_factor * noise, 2)
+
 
 FECHAS = fechas_proximos_dias()
 
 items = []
 for origen, destino, vuelo, hora_salida, hora_llegada, duracion_min, precio_base in RUTAS:
+    capacidad = _capacidad(precio_base)
+    gate_num  = (abs(hash(vuelo)) % 20) + 1
+
     for fecha in FECHAS:
-        d = date.fromisoformat(fecha)
-        # viernes ~15% más caro
-        precio   = round(precio_base * (1.15 if d.weekday() == 4 else 1.0), 2)
-        asientos = 120 if precio_base < 60 else (100 if precio_base < 100 else 80)
-        gate_num  = (abs(hash(vuelo)) % 20) + 1
+        precio   = _precio(precio_base, vuelo, fecha)
+        asientos = _asientos(vuelo, fecha, capacidad)
 
         items.append({
-            "PK":                  f"FLIGHT#{origen}#{destino}",
-            "SK":                  f"DATE#{fecha}",
-            "vuelo_numero":        vuelo,
-            "fecha":               fecha,
-            "origen":              origen,
-            "destino":             destino,
-            "hora_salida":         hora_salida,
-            "hora_llegada":        hora_llegada,
-            "duracion":            duracion_str(duracion_min),
-            "precio":              Decimal(str(precio)),
+            "PK":                   f"FLIGHT#{origen}#{destino}",
+            # SK incluye el número de vuelo → evita sobreescritura cuando hay
+            # dos frecuencias (ej: JA201 mañana y JA203 tarde) en la misma ruta/fecha
+            "SK":                   f"DATE#{fecha}#FLIGHT#{vuelo}",
+            "vuelo_numero":         vuelo,
+            "fecha":                fecha,
+            "origen":               origen,
+            "destino":              destino,
+            "hora_salida":          hora_salida,
+            "hora_llegada":         hora_llegada,
+            "duracion":             duracion_str(duracion_min),
+            "precio":               Decimal(str(precio)),
             "asientos_disponibles": asientos,
-            "aerolinea":           "JetSmart",
-            "estado_vuelo":        "EN_HORARIO",
-            "horario_salida_real": hora_salida,
-            "puerta":              f"{gate_num:02d}",
-            "demora_minutos":      0,
+            "aerolinea":            "JetSmart",
+            "estado_vuelo":         "EN_HORARIO",
+            "horario_salida_real":  hora_salida,
+            "puerta":               f"{gate_num:02d}",
+            "demora_minutos":       0,
         })
 
 print(f"Cargando {len(items)} vuelos en {TABLE_NAME}...")
