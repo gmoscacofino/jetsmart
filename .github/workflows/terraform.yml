@@ -228,6 +228,13 @@ jobs:
           BUCKET=$(terraform output -raw frontend_bucket_name)
           aws s3 sync ${{ github.workspace }}/frontend/ s3://$BUCKET/ --delete
 
+      - name: Seed vuelos en DynamoDB
+        if: github.event.inputs.action == 'apply'
+        run: |
+          TABLE=$(terraform output -raw dynamodb_table_name)
+          pip install boto3 -q
+          python3 ${{ github.workspace }}/scripts/seed_flights.py "$TABLE"
+
       - name: Run RDS Migration
         if: github.event.inputs.action == 'apply'
         run: |
