@@ -124,7 +124,7 @@ Flujo de prueba recomendado:
 
 El bastion es una instancia EC2 en la subnet pública accesible **solo via SSM** (sin SSH ni puerto 22 abierto). Se usa para conectarse a la base de datos de analytics desde la máquina local.
 
-**Requisitos locales:** AWS CLI v2 + [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html).
+**Requisitos locales:** AWS CLI v2 + [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) + psql instalado
 
 **1. Obtener los valores necesarios:**
 ```bash
