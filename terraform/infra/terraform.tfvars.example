@@ -18,13 +18,8 @@ rds_db_name           = "jetsmart_analytics"
 rds_username          = "jetsmart_admin"
 rds_password          = "REEMPLAZAR_CON_PASSWORD_SEGURO"
 
-# Modo demo: el chatbot responde con datos simulados sin llamar a Anthropic API.
-# Cambiar a false y completar anthropic_api_key para usar Claude real.
-mock_mode = true
-
-# Anthropic API key — requerida solo cuando mock_mode = false
-# Obtener en: console.anthropic.com
-anthropic_api_key = ""
+# Anthropic API key — obtener en console.anthropic.com
+anthropic_api_key = "REEMPLAZAR_CON_API_KEY"
 
 # Backend — debe coincidir con el suffix usado al correr 00-backend
 state_bucket_suffix = "REEMPLAZAR_CON_SUFFIX_UNICO"

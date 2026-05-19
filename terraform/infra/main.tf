@@ -58,7 +58,6 @@ module "chatbot_lambda" {
   system_prompt_etag   = aws_s3_object.system_prompt.etag
   step_functions_arn   = aws_sfn_state_machine.booking.arn
   layer_arns           = [aws_lambda_layer_version.anthropic.arn]
-  mock_mode            = var.mock_mode
   environment          = var.environment
   frontend_url         = "http://${aws_s3_bucket_website_configuration.frontend.website_endpoint}"
   cognito_user_pool_id = module.auth.user_pool_id

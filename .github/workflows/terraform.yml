@@ -161,7 +161,7 @@ jobs:
           TF_VAR_anthropic_api_key:   ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
           TF_VAR_rds_password:        ${{ secrets.TF_VAR_RDS_PASSWORD }}
           TF_VAR_state_bucket_suffix: ${{ secrets.STATE_BUCKET_SUFFIX }}
-          TF_VAR_mock_mode:           ${{ secrets.TF_VAR_ANTHROPIC_API_KEY != '' && 'false' || 'true' }}
+
         run: terraform plan -out=tfplan
 
       - name: Cleanup secrets pendientes de eliminación
@@ -208,7 +208,7 @@ jobs:
           TF_VAR_anthropic_api_key:   ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
           TF_VAR_rds_password:        ${{ secrets.TF_VAR_RDS_PASSWORD }}
           TF_VAR_state_bucket_suffix: ${{ secrets.STATE_BUCKET_SUFFIX }}
-          TF_VAR_mock_mode:           ${{ secrets.TF_VAR_ANTHROPIC_API_KEY != '' && 'false' || 'true' }}
+
         run: terraform apply -auto-approve tfplan
 
       - name: Inject Terraform outputs into config.js
@@ -360,5 +360,5 @@ jobs:
           TF_VAR_anthropic_api_key:   ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
           TF_VAR_rds_password:        ${{ secrets.TF_VAR_RDS_PASSWORD }}
           TF_VAR_state_bucket_suffix: ${{ secrets.STATE_BUCKET_SUFFIX }}
-          TF_VAR_mock_mode:           ${{ secrets.TF_VAR_ANTHROPIC_API_KEY != '' && 'false' || 'true' }}
+
         run: terraform destroy -auto-approve

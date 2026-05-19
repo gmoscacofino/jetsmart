@@ -49,11 +49,6 @@ variable "layer_arns" {
   default     = []
 }
 
-variable "mock_mode" {
-  description = "Cuando es true el chatbot devuelve respuestas demo sin llamar a Anthropic API"
-  type        = bool
-  default     = true
-}
 
 variable "environment" {
   description = "Deployment environment (used as API Gateway stage name)"

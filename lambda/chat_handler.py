@@ -14,7 +14,6 @@ SECRET_ARN           = os.environ["ANTHROPIC_SECRET_ARN"]
 SF_ARN               = os.environ.get("STEP_FUNCTIONS_ARN", "")
 SYSTEM_PROMPT_BUCKET = os.environ["SYSTEM_PROMPT_BUCKET"]
 SYSTEM_PROMPT_KEY    = os.environ["SYSTEM_PROMPT_KEY"]
-MOCK_MODE            = os.environ.get("MOCK_MODE", "false").lower() == "true"
 FRONTEND_URL         = os.environ.get("FRONTEND_URL", "*")
 COGNITO_POOL_ID      = os.environ.get("COGNITO_USER_POOL_ID", "")
 
@@ -40,8 +39,8 @@ def _load_system_prompt() -> str:
     obj = s3.get_object(Bucket=SYSTEM_PROMPT_BUCKET, Key=SYSTEM_PROMPT_KEY)
     return obj["Body"].read().decode("utf-8")
 
-_anthropic_client  = None if MOCK_MODE else _init_anthropic()
-_raw_system_prompt = ""   if MOCK_MODE else _load_system_prompt()
+_anthropic_client  = _init_anthropic()
+_raw_system_prompt = _load_system_prompt()
 
 _system_prompt_cache: dict = {}
 
@@ -739,76 +738,6 @@ def _execute_tool(name: str, inputs: dict, user_id: str) -> str:
     return json.dumps({"error": f"Tool desconocida: {name}"})
 
 
-# ── Mock mode ─────────────────────────────────────────────────────────────────
-# Devuelve respuestas predefinidas sin llamar a Anthropic API.
-# Activo cuando MOCK_MODE=true — permite probar el flujo completo sin API key.
-
-def _mock_chat_response(message: str) -> tuple:
-    msg = message.lower()
-    if any(w in msg for w in ["vuelo", "volar", "buscar", "quiero ir", "viajar", "destino"]):
-        return (
-            "Encontré vuelos disponibles ✈️\n\n"
-            "**FO 1234** — Buenos Aires (AEP) → Santiago (SCL)\n"
-            "📅 15 de junio de 2026 | 08:30 → 10:45 hs\n"
-            "💰 $89 USD por pasajero | 14 asientos disponibles\n\n"
-            "¿Querés reservar este vuelo?",
-            ["Sí, reservar", "Ver otras fechas", "Cambiar destino"],
-        )
-    if any(w in msg for w in ["reservar", "confirmar", "comprar", "sí", "si"]):
-        return (
-            "¡Reserva confirmada! 🎉\n\n"
-            "📋 Código: **RES-DEMO0001**\n"
-            "✈️ FO 1234 — AEP → SCL\n"
-            "📅 15 de junio de 2026 | 08:30 hs\n"
-            "💳 Total: $89 USD\n\n"
-            "Podés hacer check-in a partir de 24 hs antes del vuelo.",
-            ["Hacer check-in", "Ver mis reservas", "Volver al inicio"],
-        )
-    if any(w in msg for w in ["check-in", "checkin", "check in"]):
-        return (
-            "Check-in realizado exitosamente ✅\n\n"
-            "**RES-DEMO0001** | FO 1234 — AEP → SCL | 15 jun 2026\n\n"
-            "Ya podés obtener tu boarding pass.",
-            ["Obtener boarding pass", "Ver mis reservas"],
-        )
-    if any(w in msg for w in ["boarding", "tarjeta", "embarque", "pass"]):
-        return (
-            "🎫 **Boarding Pass**\n\n"
-            "Pasajero: DEMO USER\n"
-            "Vuelo: FO 1234 — AEP → SCL\n"
-            "📅 15 jun 2026 | Salida 08:30\n"
-            "Asiento: **14A** | Grupo B | Puerta 12\n"
-            "Embarque: 45 min antes de la salida",
-            ["Volver al inicio"],
-        )
-    if any(w in msg for w in ["reserva", "mis reservas"]):
-        return (
-            "📋 **Tus reservas:**\n\n"
-            "1. **RES-DEMO0001** — FO 1234 AEP→SCL\n"
-            "   📅 15 jun 2026 | Estado: CONFIRMADA\n\n"
-            "¿Qué querés hacer?",
-            ["Hacer check-in", "Ver boarding pass"],
-        )
-    if any(w in msg for w in ["reclamo", "problema", "queja", "perdido", "dañado", "cancelado"]):
-        return (
-            "Tu reclamo fue registrado 📝\n\n"
-            "Código: **CLM-DEMO001**\n"
-            "Te contactaremos en 48-72 horas hábiles.",
-            ["Volver al inicio"],
-        )
-    return (
-        "¡Hola! Soy el asistente virtual de JetSmart ✈️ *(modo demo)*\n\n"
-        "Puedo ayudarte con:\n"
-        "• Buscar y reservar vuelos\n"
-        "• Consultar tus reservas\n"
-        "• Hacer check-in\n"
-        "• Obtener tu boarding pass\n"
-        "• Gestionar reclamos\n\n"
-        "¿Con qué te ayudo?",
-        ["Buscar vuelos", "Mis reservas", "Hacer check-in"],
-    )
-
-
 # ── Route handlers ────────────────────────────────────────────────────────────
 
 def _handle_chat(event: dict, user: dict) -> dict:
@@ -827,11 +756,6 @@ def _handle_chat(event: dict, user: dict) -> dict:
     _upsert_user_profile(user)
     history = _get_history(session_id, user_id)
     _save_message(session_id, user_id, "user", message)
-
-    if MOCK_MODE:
-        assistant_text, options = _mock_chat_response(message)
-        _save_message(session_id, user_id, "assistant", assistant_text)
-        return _response(200, {"response": assistant_text, "session_id": session_id, "options": options})
 
     messages = history + [{"role": "user", "content": message}]
 
