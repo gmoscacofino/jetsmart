@@ -22,6 +22,7 @@ RDS_PROXY_ENDPOINT = os.environ["RDS_PROXY_ENDPOINT"]
 sm = boto3.client("secretsmanager", region_name=REGION)
 
 _rds_conn = None
+_schema_ready = False
 
 
 def _get_rds_conn():
@@ -84,6 +85,19 @@ def handler(event, context):
                     raise
                 log.warning("Migration attempt %d/5 failed: %s — retrying in 15s", attempt, e)
                 time.sleep(15)
+
+    global _schema_ready
+    if not _schema_ready:
+        try:
+            conn = _get_rds_conn()
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute(SCHEMA)
+            conn.commit()
+            _schema_ready = True
+            log.info("Schema ensured on cold start")
+        except Exception as e:
+            log.warning("Schema check failed (will retry on next invocation): %s", e)
 
     records = event.get("Records", [])
     log.info("Processing %d SQS records", len(records))

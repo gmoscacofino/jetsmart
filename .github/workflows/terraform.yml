@@ -230,6 +230,7 @@ jobs:
 
       - name: Run RDS Migration
         if: github.event.inputs.action == 'apply'
+        continue-on-error: true
         run: |
           FUNCTION=$(terraform output -raw analytics_processor_function_name)
           PROXY_NAME=$(terraform output -raw rds_proxy_name)
