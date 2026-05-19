@@ -339,6 +339,15 @@ jobs:
             -backend-config="use_lockfile=true" \
             -backend-config="encrypt=true"
 
+      - name: Vaciar buckets S3 antes de destruir
+        run: |
+          for BUCKET in \
+            "jetsmart-prod-$(aws sts get-caller-identity --query Account --output text)-frontend" \
+            "jetsmart-prod-$(aws sts get-caller-identity --query Account --output text)-assets"; do
+            echo "Vaciando s3://$BUCKET ..."
+            aws s3 rm "s3://$BUCKET" --recursive --region ${{ env.AWS_REGION }} 2>/dev/null || true
+          done
+
       - name: Terraform Destroy
         env:
           TF_VAR_anthropic_api_key:   ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
