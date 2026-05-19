@@ -5,32 +5,6 @@
 
 JetSmart Chatbot es un asistente conversacional desplegado en AWS con Terraform que replica la experiencia de compra de JetSmart. El usuario puede reservar vuelos, hacer check-in y gestionar reservas en lenguaje natural. La IA es opcional: por defecto el sistema corre en **modo demo** con respuestas predefinidas, sin necesitar una API key de Anthropic.
 
-## Arquitectura
-
-```
-INTERNET
-   │
-   ├── Browser → S3 frontend (HTML/CSS/JS)
-   ├── Browser → Cognito Hosted UI (login)
-   ├── Browser → API Gateway /callback → Lambda auth-callback
-   └── Browser → API Gateway /api/* → Lambda chat-handler ⟷ Anthropic API (opcional)
-                                            │
-                      ┌─────────────────────┴──────────────────────┐
-                      │ tool: create_reservation                    │ SNS events
-                      ↓                                             ↓
-             Step Functions — Saga                          SQS analytics
-             ReserveFlight → ReserveBooking                         │
-             → CollectPayment → ConfirmBooking              Lambda analytics-processor
-             (con compensaciones: RefundPayment,                    │
-              CancelBooking, ReleaseFlight)                  RDS Proxy → RDS PostgreSQL
-
-DENTRO DE LA VPC:
-  analytics-processor ←→ RDS Proxy ←→ RDS PostgreSQL
-  EC2 Bastion ←→ SSM (acceso operativo a RDS sin SSH)
-
-FUERA DE LA VPC (managed):
-  S3 · Cognito · API Gateway · Step Functions · SNS · SQS · Secrets Manager · CloudWatch
-```
 ## Diagrama
 <img src="docs/Jetsmart - Diagrama (1).png" alt="Diagrama de Arquitectura" width="110%">
 
