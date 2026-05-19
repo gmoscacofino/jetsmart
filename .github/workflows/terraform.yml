@@ -230,29 +230,44 @@ jobs:
 
       - name: Run RDS Migration
         if: github.event.inputs.action == 'apply'
-        continue-on-error: true
         run: |
           FUNCTION=$(terraform output -raw analytics_processor_function_name)
           PROXY_NAME=$(terraform output -raw rds_proxy_name)
-          echo "Esperando a que RDS Proxy esté disponible..."
-          STATUS=""
+
+          # Phase 1: esperar a que el proxy exista y esté en estado "available"
+          echo "Esperando a que RDS Proxy esté en estado available..."
           for i in $(seq 1 24); do
             STATUS=$(aws rds describe-db-proxies \
               --db-proxy-name "$PROXY_NAME" \
               --region ${{ env.AWS_REGION }} \
               --query 'DBProxies[0].Status' \
               --output text 2>/dev/null || echo "unknown")
-            echo "RDS Proxy status: $STATUS (intento $i/24)"
+            echo "Proxy status: $STATUS (intento $i/24)"
             [ "$STATUS" = "available" ] && break
             sleep 30
           done
-          if [ "$STATUS" != "available" ]; then
-            echo "RDS Proxy no estuvo disponible después de 12 minutos" && exit 1
-          fi
-          echo "Esperando 90s para que RDS Proxy establezca conexiones hacia RDS..."
-          sleep 90
-          for attempt in 1 2 3; do
-            echo "Migration attempt $attempt/3..."
+          [ "$STATUS" != "available" ] && echo "Proxy no disponible tras 12 min" && exit 1
+
+          # Phase 2: esperar a que el proxy tenga conexión real hacia RDS
+          # describe-db-proxy-targets reporta TargetHealth.State=AVAILABLE solo cuando
+          # el proxy estableció al menos una conexión backend hacia la instancia RDS.
+          echo "Esperando a que RDS Proxy establezca conexión hacia RDS (target health)..."
+          for i in $(seq 1 20); do
+            TARGET_STATE=$(aws rds describe-db-proxy-targets \
+              --db-proxy-name "$PROXY_NAME" \
+              --region ${{ env.AWS_REGION }} \
+              --query 'Targets[0].TargetHealth.State' \
+              --output text 2>/dev/null || echo "unknown")
+            echo "Target health: $TARGET_STATE (intento $i/20)"
+            [ "$TARGET_STATE" = "AVAILABLE" ] && break
+            sleep 30
+          done
+          [ "$TARGET_STATE" != "AVAILABLE" ] && echo "Target health no AVAILABLE tras 10 min" && exit 1
+
+          # Phase 3: invocar migración con backoff exponencial (20s, 40s, 80s, 120s, 120s)
+          DELAY=20
+          for attempt in 1 2 3 4 5; do
+            echo "Migration attempt $attempt/5..."
             aws lambda invoke \
               --function-name "$FUNCTION" \
               --payload '{"migrate": true}' \
@@ -262,13 +277,13 @@ jobs:
               response.json
             cat response.json
             if grep -q '"migrated"' response.json; then
-              echo "Migration successful"
+              echo "Migration successful on attempt $attempt"
               exit 0
             fi
-            echo "Retrying in 30s..."
-            sleep 30
+            [ $attempt -lt 5 ] && echo "Retrying in ${DELAY}s..." && sleep $DELAY
+            DELAY=$(( DELAY * 2 > 120 ? 120 : DELAY * 2 ))
           done
-          echo "Migration failed after 3 attempts" && exit 1
+          echo "Migration failed after 5 attempts" && exit 1
 
       - name: Show Outputs
         if: github.event.inputs.action == 'apply'

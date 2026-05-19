@@ -23,3 +23,24 @@ resource "aws_cloudwatch_log_group" "this" {
   name              = each.value
   retention_in_days = 30
 }
+
+# ── CloudWatch Alarms ──────────────────────────────────────────────────────────
+
+resource "aws_cloudwatch_metric_alarm" "analytics_processor_errors" {
+  alarm_name          = "${local.name_prefix}-analytics-processor-errors"
+  alarm_description   = "Analytics processor Lambda errors — posible fallo de migración RDS o escritura SQS"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    FunctionName = aws_lambda_function.analytics_processor.function_name
+  }
+
+  alarm_actions = [aws_sns_topic.notifications.arn]
+}
