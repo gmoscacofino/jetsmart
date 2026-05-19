@@ -6,7 +6,7 @@
 JetSmart Chatbot es un asistente conversacional desplegado en AWS con Terraform que replica la experiencia de compra de JetSmart. El usuario puede reservar vuelos, hacer check-in y gestionar reservas en lenguaje natural. La IA es opcional: por defecto el sistema corre en **modo demo** con respuestas predefinidas, sin necesitar una API key de Anthropic.
 
 ## Diagrama
-<img src="docs/Jetsmart - Diagrama (1).png" alt="Diagrama de Arquitectura" width="110%">
+<img src="docs/Jetsmart - Diagrama.png" alt="Diagrama de Arquitectura" width="110%">
 
 > Tocar sobre la imagen del diagrama para apliarla y visualizarla mejor
 
