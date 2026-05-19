@@ -31,6 +31,8 @@ DENTRO DE LA VPC:
 FUERA DE LA VPC (managed):
   S3 · Cognito · API Gateway · Step Functions · SNS · SQS · Secrets Manager · CloudWatch
 ```
+##Diagrama
+<img src="docs/Jetsmart - Diagrama.png" alt="Diagrama de Arquitectura" width="80%">
 
 ## Requerimientos
 
