@@ -74,6 +74,16 @@ resource "aws_security_group_rule" "rds_from_bastion" {
   description              = "PostgreSQL from bastion SSM"
 }
 
+resource "aws_security_group_rule" "proxy_from_bastion" {
+  type                     = "ingress"
+  from_port                = 5432
+  to_port                  = 5432
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.bastion.id
+  security_group_id        = aws_security_group.rds_proxy.id
+  description              = "PostgreSQL from bastion SSM via proxy"
+}
+
 output "bastion_instance_id" {
   description = "ID del bastion para SSM port forwarding"
   value       = aws_instance.bastion.id
