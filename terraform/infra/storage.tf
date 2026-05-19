@@ -1,7 +1,8 @@
 # ── S3: Frontend estático ─────────────────────────────────────────────────────
 
 resource "aws_s3_bucket" "frontend" {
-  bucket = "${local.name_prefix}-${data.aws_caller_identity.current.account_id}-frontend"
+  bucket        = "${local.name_prefix}-${data.aws_caller_identity.current.account_id}-frontend"
+  force_destroy = true
 }
 
 resource "aws_s3_bucket_website_configuration" "frontend" {
@@ -53,7 +54,8 @@ resource "aws_s3_object" "system_prompt" {
 # ── S3: Assets privados (boarding passes, backups) ────────────────────────────
 
 resource "aws_s3_bucket" "assets" {
-  bucket = "${local.name_prefix}-${data.aws_caller_identity.current.account_id}-assets"
+  bucket        = "${local.name_prefix}-${data.aws_caller_identity.current.account_id}-assets"
+  force_destroy = true
 }
 
 resource "aws_s3_bucket_public_access_block" "assets" {
