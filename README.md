@@ -118,13 +118,6 @@ Flujo de prueba recomendado:
 4. **Check-in** → disponible únicamente las 24 horas previas al vuelo.
 5. **Reclamos** → `"Quiero reportar un problema con mi vuelo"` → Claude registra el reclamo en DynamoDB.
 
-Para verificar las ejecuciones de Step Functions:
-```bash
-aws stepfunctions list-executions \
-  --state-machine-arn $(terraform -chdir=terraform/infra output -raw step_functions_arn) \
-  --region us-east-1
-```
-
 ---
 
 ### Acceso al bastion y consultas a RDS
