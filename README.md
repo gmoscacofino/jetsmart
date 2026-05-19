@@ -122,47 +122,78 @@ Flujo de prueba recomendado:
 
 ### Acceso al bastion y consultas a RDS
 
-El bastion es una instancia EC2 en la subnet pública accesible **solo via SSM** (sin SSH ni puerto 22 abierto). Se usa para conectarse a la base de datos de analytics desde la máquina local.
+El bastion es una instancia EC2 en la subnet pública accesible **solo via SSM** (sin SSH ni puerto 22 abierto). SSM actúa como proxy autenticado con IAM — no requiere abrir el puerto 22 ni distribuir SSH keys.
 
-**Requisitos locales:** AWS CLI v2 + [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) + psql instalado
+> **Limitación de AWS Academy:** las credenciales del lab son temporales y personales. En un entorno real, el consultor tendría su propio usuario IAM con permisos acotados (`ssm:StartSession` sobre el bastion y acceso de red al RDS Proxy). En Academy, el mismo equipo de infra usa sus credenciales del lab para hacer el rol de consultor.
 
-**1. Obtener los valores necesarios:**
-```bash
-cd terraform/infra
-BASTION_ID=$(terraform output -raw bastion_instance_id)
-RDS_PROXY=$(terraform output -raw rds_proxy_endpoint)
+**Requisitos (instalar una sola vez):**
+- AWS CLI v2
+- [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
+- psql (o DBeaver/pgAdmin)
+
+**Paso 1 — Cargar credenciales AWS Academy (cada vez que se renueva el lab)**
+```powershell
+aws configure set aws_access_key_id TU_ACCESS_KEY_ID
+aws configure set aws_secret_access_key TU_SECRET_ACCESS_KEY
+aws configure set aws_session_token TU_SESSION_TOKEN
+aws configure set region us-east-1
 ```
 
-**2. Abrir el túnel SSM (deja la terminal abierta):**
-```bash
-aws ssm start-session \
-  --target "$BASTION_ID" \
-  --document-name AWS-StartPortForwardingSessionToRemoteHost \
-  --parameters "{\"host\":[\"$RDS_PROXY\"],\"portNumber\":[\"5432\"],\"localPortNumber\":[\"5433\"]}" \
+**Paso 2 — Obtener el ID del bastion y el endpoint del RDS Proxy**
+```powershell
+aws ec2 describe-instances `
+  --filters "Name=tag:Name,Values=jetsmart-prod-bastion" `
+  --query "Reservations[0].Instances[0].InstanceId" `
+  --output text --region us-east-1
+
+aws rds describe-db-proxies `
+  --query "DBProxies[?contains(DBProxyName,'jetsmart-prod')].Endpoint" `
+  --output text --region us-east-1
+```
+
+**Paso 3 — Abrir el túnel SSM (Terminal 1 — dejarla abierta)**
+```powershell
+Set-Content -Path "$env:TEMP\ssm-params.json" `
+  -Value '{"host":["ENDPOINT_DEL_PROXY"],"portNumber":["5432"],"localPortNumber":["5433"]}' `
+  -Encoding ascii
+
+aws ssm start-session `
+  --target ID_DEL_BASTION `
+  --document-name AWS-StartPortForwardingSessionToRemoteHost `
+  --parameters file://$env:TEMP/ssm-params.json `
   --region us-east-1
 ```
+Cuando aparezca `Waiting for connections...` el túnel está listo.
 
-**3. Conectar psql en otra terminal:**
-```bash
-psql -h localhost -p 5433 -U jetsmart_admin -d jetsmart_analytics
-# Ingresar la contraseña configurada en TF_VAR_RDS_PASSWORD
+**Paso 4 — Conectar psql (Terminal 2)**
+```powershell
+$env:PGPASSWORD = "TU_RDS_PASSWORD"
+psql "host=127.0.0.1 port=5433 dbname=jetsmart_analytics user=jetsmart_admin sslmode=require"
 ```
 
 **Consultas de ejemplo:**
 ```sql
--- Ver tablas creadas por la migración
-\dt
+-- Eventos registrados por tipo
+SELECT tipo_evento, COUNT(*) AS cantidad
+FROM eventos_chat
+GROUP BY tipo_evento ORDER BY cantidad DESC;
 
--- Eventos de analytics registrados
-SELECT event_type, user_id, created_at FROM analytics_events ORDER BY created_at DESC LIMIT 20;
+-- Últimos 20 eventos
+SELECT tipo_evento, usuario_id, timestamp
+FROM eventos_chat
+ORDER BY timestamp DESC LIMIT 20;
 
--- Reservas completadas
-SELECT * FROM bookings WHERE status = 'CONFIRMADA' ORDER BY created_at DESC;
-
--- Búsquedas de vuelos por ruta
-SELECT ruta, COUNT(*) AS busquedas FROM analytics_events
-WHERE event_type = 'busqueda_vuelo'
+-- Búsquedas por ruta
+SELECT datos->>'ruta' AS ruta, COUNT(*) AS busquedas
+FROM eventos_chat
+WHERE tipo_evento = 'busqueda_vuelo'
 GROUP BY ruta ORDER BY busquedas DESC;
+
+-- Compras completadas
+SELECT usuario_id, datos->>'amount' AS monto_usd, timestamp
+FROM eventos_chat
+WHERE tipo_evento = 'purchase_complete'
+ORDER BY timestamp DESC;
 ```
 
 ## Pipeline de GitHub Actions
