@@ -136,6 +136,23 @@ Flujo de prueba completo en modo demo:
 
 Cuando `TF_VAR_ANTHROPIC_API_KEY` está configurado, el chatbot usa **Claude Haiku** con acceso real a los datos en DynamoDB. Las respuestas son libres en lenguaje natural y el flujo de compra ejecuta Step Functions.
 
+El apply carga automáticamente **~660 vuelos de ejemplo** en DynamoDB (`scripts/seed_flights.py`): 20 rutas operadas por JetSmart (AEP↔SCL, AEP↔MDZ, AEP↔COR, AEP↔IGR, SCL↔ANF, SCL↔COR, SCL↔IGR) con vuelos los lunes, miércoles y viernes de los próximos 75 días. Los viernes tienen un precio ~15% más alto.
+
+Rutas disponibles:
+
+| Ruta | Vuelo mañana | Vuelo tarde | Precio desde |
+|------|-------------|-------------|-------------|
+| AEP → SCL | JA401 08:15 | JA403 18:00 | USD 89 |
+| SCL → AEP | JA402 11:30 | JA404 21:00 | USD 89 |
+| AEP → MDZ | JA201 07:30 | JA203 17:00 | USD 49 |
+| MDZ → AEP | JA202 09:30 | JA204 19:00 | USD 49 |
+| AEP → COR | JA101 06:45 | JA103 20:00 | USD 39 |
+| COR → AEP | JA102 09:00 | JA104 22:00 | USD 39 |
+| AEP → IGR | JA301 07:00 | — | USD 69 |
+| SCL → IGR | JA601 09:00 | — | USD 119 |
+| SCL → ANF | JA501 07:00 | — | USD 55 |
+| SCL → COR | JA701 10:00 | — | USD 129 |
+
 Flujo de prueba recomendado:
 
 1. **Buscar vuelos** → `"¿Qué vuelos hay de Buenos Aires a Mendoza?"`
