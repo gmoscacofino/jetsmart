@@ -36,7 +36,7 @@ Ir a **Settings → Secrets and variables → Actions → New repository secret*
 | `AWS_SESSION_TOKEN` | valor de `aws_session_token` |
 | `STATE_BUCKET_SUFFIX` | sufijo único para el bucket de estado — solo minúsculas, números y guiones (ej. `grupo8-2026`). Los nombres de bucket S3 son globales: si el job `backend` falla con `BucketAlreadyExists`, cambiar este sufijo por uno diferente (ej. `grupo8-2026b`) |
 | `TF_VAR_RDS_PASSWORD` | contraseña para la base de datos RDS |
-| `TF_VAR_ANTHROPIC_API_KEY` | API key de Anthropic para Claude |
+| `TF_VAR_ANTHROPIC_API_KEY` | Cargar la API key de Anthropic que fue entregada al docente por separado. |
 
 ### Paso 2 — Crear el backend (primera vez)
 
@@ -90,8 +90,6 @@ Tras el deploy, abrir la URL de `frontend_url` que aparece en el Summary del job
 ### Chatbot con Claude
 
 El chatbot usa **Claude Haiku** con acceso real a los datos en DynamoDB. Las respuestas son libres en lenguaje natural y el flujo de compra ejecuta Step Functions.
-
-> Para probar con Claude, cargar la API key de Anthropic en el secret `TF_VAR_ANTHROPIC_API_KEY`. La key fue entregada al docente por separado.
 
 El apply carga automáticamente **~660 vuelos de ejemplo** en DynamoDB (`scripts/seed_flights.py`): 20 rutas operadas por JetSmart (AEP↔SCL, AEP↔MDZ, AEP↔COR, AEP↔IGR, SCL↔ANF, SCL↔COR, SCL↔IGR) con vuelos los lunes, miércoles y viernes de los próximos 75 días. Los viernes tienen un precio ~15% más alto.
 
