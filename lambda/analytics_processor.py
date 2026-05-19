@@ -43,7 +43,7 @@ def _get_rds_conn():
         dbname          = creds["dbname"],
         user            = creds["username"],
         password        = creds["password"],
-        connect_timeout = 5,
+        connect_timeout = 30,
         sslmode         = "require",
     )
     _rds_conn.autocommit = False
