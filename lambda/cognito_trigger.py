@@ -21,7 +21,7 @@ def handler(event, context):
     trigger      = event.get("triggerSource", "")
 
     # Only run on new confirmed users, not on admin-created accounts
-    if trigger not in ("PostConfirmation_ConfirmSignUp", "PostConfirmation_ConfirmForgotPassword"):
+    if trigger != "PostConfirmation_ConfirmSignUp":
         return event
 
     try:

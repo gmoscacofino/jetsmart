@@ -57,6 +57,6 @@ def handler(event, context):
         ExpiresIn=900,
     )
 
-    log.info("Boarding pass listo — reserva: %s — url (15min): %s", reservation_id, url)
+    log.info("Boarding pass listo — reserva: %s — key: %s", reservation_id, key)
 
     return {**event, "boarding_pass_url": url}

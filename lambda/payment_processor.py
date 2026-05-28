@@ -90,10 +90,8 @@ def reserve_booking_handler(event, context):
     reservation_r  = event["reservation"]
     pasajeros      = int(reservation_r.get("pasajeros", 1))
     reservation_id = f"RES-{event['payment_id'].replace('-', '')[:8].upper()}"
-    # Use the chatbot-computed total (includes extras/seats/fees) if provided;
-    # fall back to base price * passengers from the flight record.
-    total = Decimal(str(reservation_r["total"])) if reservation_r.get("total") \
-        else Decimal(str(flight_info["precio_por_pasajero"])) * pasajeros
+    # Total calculado desde la base de datos — nunca del input del usuario.
+    total = Decimal(str(flight_info["precio_por_pasajero"])) * pasajeros
 
     passenger_name = reservation_r.get("nombre_pasajero", "")
     email          = reservation_r.get("email_contacto", "")
@@ -162,9 +160,7 @@ def collect_payment_handler(event, context):
     flight_info = event["flight_info"]
     reservation = event["reservation"]
     pasajeros   = int(reservation.get("pasajeros", 1))
-    # Use the chatbot-provided total (includes extras/seats/fees); fall back to base price.
-    total = float(reservation["total"]) if reservation.get("total") \
-        else flight_info["precio_por_pasajero"] * pasajeros
+    total = float(flight_info["precio_por_pasajero"]) * pasajeros
     tx_id = f"TX-{event['payment_id'].replace('-', '')[:12].upper()}"
 
     log.info("Pago mock aprobado — total: $%.2f — tx: %s", total, tx_id)

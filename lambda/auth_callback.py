@@ -26,9 +26,10 @@ def handler(event, context):
     qs     = event.get("queryStringParameters") or {}
     code   = qs.get("code")
     error  = qs.get("error")
+    state  = qs.get("state", "")
 
     if error:
-        return _redirect(f"{FRONTEND_URL}#error={urllib.parse.quote(error)}")
+        return _redirect(f"{FRONTEND_URL}#error={urllib.parse.quote(error)}&state={urllib.parse.quote(state)}")
 
     if not code:
         return _redirect(f"{FRONTEND_URL}#error=missing_code")
@@ -36,10 +37,10 @@ def handler(event, context):
     try:
         tokens = _exchange_code(code)
         id_token = tokens.get("id_token", "")
-        return _redirect(f"{FRONTEND_URL}#id_token={id_token}")
+        return _redirect(f"{FRONTEND_URL}#id_token={id_token}&state={urllib.parse.quote(state)}")
     except Exception as e:
         log.error("Token exchange failed: %s", e)
-        return _redirect(f"{FRONTEND_URL}#error=token_exchange_failed")
+        return _redirect(f"{FRONTEND_URL}#error=token_exchange_failed&state={urllib.parse.quote(state)}")
 
 
 def _exchange_code(code: str) -> dict:

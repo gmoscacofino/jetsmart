@@ -1,8 +1,9 @@
-import os, json, uuid, time, logging, base64, re
+import os, json, uuid, time, logging, base64, re, urllib.request
 from datetime import datetime, timezone, date, timedelta
 
 import boto3
 import anthropic
+from jose import jwk, jwt as jose_jwt
 
 log = logging.getLogger()
 log.setLevel(logging.INFO)
@@ -14,7 +15,7 @@ SECRET_ARN           = os.environ["ANTHROPIC_SECRET_ARN"]
 SF_ARN               = os.environ.get("STEP_FUNCTIONS_ARN", "")
 SYSTEM_PROMPT_BUCKET = os.environ["SYSTEM_PROMPT_BUCKET"]
 SYSTEM_PROMPT_KEY    = os.environ["SYSTEM_PROMPT_KEY"]
-FRONTEND_URL         = os.environ.get("FRONTEND_URL", "*")
+FRONTEND_URL         = os.environ.get("FRONTEND_URL") or "*"
 COGNITO_POOL_ID      = os.environ.get("COGNITO_USER_POOL_ID", "")
 
 dynamodb = boto3.resource("dynamodb", region_name=REGION)
@@ -55,23 +56,55 @@ def _build_system_prompt() -> str:
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
+_jwks_cache: dict = {}
+
+def _get_jwks() -> list:
+    now = time.time()
+    if _jwks_cache.get("keys") and now < _jwks_cache.get("expires", 0):
+        return _jwks_cache["keys"]
+    url = f"https://cognito-idp.{REGION}.amazonaws.com/{COGNITO_POOL_ID}/.well-known/jwks.json"
+    with urllib.request.urlopen(url, timeout=5) as resp:
+        keys = json.loads(resp.read())["keys"]
+    _jwks_cache["keys"] = keys
+    _jwks_cache["expires"] = now + 3600
+    return keys
+
+
 def _parse_jwt(token: str) -> dict:
     parts = token.split(".")
     if len(parts) != 3:
         raise ValueError("JWT inválido")
     try:
-        padding = 4 - len(parts[1]) % 4
-        payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * padding))
+        header_padding = 4 - len(parts[0]) % 4
+        header = json.loads(base64.urlsafe_b64decode(parts[0] + "=" * header_padding))
     except Exception:
         raise ValueError("JWT inválido")
-    if payload.get("exp", 0) < time.time():
-        raise ValueError("Token expirado")
-    if COGNITO_POOL_ID:
+
+    kid = header.get("kid")
+    if not kid:
+        raise ValueError("JWT sin kid")
+
+    keys = _get_jwks()
+    key_data = next((k for k in keys if k["kid"] == kid), None)
+    if not key_data:
+        raise ValueError("JWT key no reconocida")
+
+    try:
+        public_key = jwk.construct(key_data)
         expected_iss = f"https://cognito-idp.{REGION}.amazonaws.com/{COGNITO_POOL_ID}"
-        if payload.get("iss") != expected_iss:
-            raise ValueError("Token de emisor no reconocido")
-        if payload.get("token_use") not in ("id", "access"):
-            raise ValueError("Tipo de token inválido")
+        payload = jose_jwt.decode(
+            token,
+            public_key,
+            algorithms=["RS256"],
+            issuer=expected_iss,
+            options={"verify_aud": False},
+        )
+    except Exception as e:
+        raise ValueError(f"Token inválido: {e}")
+
+    if payload.get("token_use") not in ("id", "access"):
+        raise ValueError("Tipo de token inválido")
+
     return payload
 
 

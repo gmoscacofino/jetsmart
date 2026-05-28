@@ -35,7 +35,7 @@ build_layer() {
   echo "    Listo: $(du -sh "$BUILDS_DIR/${name}-layer.zip" | cut -f1)"
 }
 
-build_layer "anthropic" "anthropic"
+build_layer "anthropic" "anthropic" "python-jose[cryptography]"
 build_layer "psycopg2"  "psycopg2-binary"
 
 echo ""
