@@ -2,11 +2,14 @@ const Auth = (() => {
   const TOKEN_KEY = 'jetsmart_id_token';
 
   function buildCognitoUrl(path, responseType) {
+    const state = crypto.randomUUID();
+    sessionStorage.setItem('oauth_state', state);
     const params = new URLSearchParams({
       response_type: responseType,
       client_id:     CONFIG.clientId,
       redirect_uri:  CONFIG.callbackUrl,
       scope:         'openid email profile',
+      state,
     });
     return `${CONFIG.cognitoDomain}/${path}?${params}`;
   }
@@ -37,7 +40,12 @@ const Auth = (() => {
         return;
       }
 
-      const params = new URLSearchParams(hash.replace(/^#/, ''));
+      const params        = new URLSearchParams(hash.replace(/^#/, ''));
+      const returnedState = params.get('state');
+      const savedState    = sessionStorage.getItem('oauth_state');
+      sessionStorage.removeItem('oauth_state');
+      if (!returnedState || returnedState !== savedState) return;
+
       const token = params.get('id_token') || params.get('token');
       if (token) {
         localStorage.setItem(TOKEN_KEY, token);
