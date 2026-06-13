@@ -1,8 +1,20 @@
 const Auth = (() => {
   const TOKEN_KEY = 'jetsmart_id_token';
 
+  // crypto.randomUUID() solo funciona en secure contexts (HTTPS).
+  // El frontend se sirve por S3 website hosting (HTTP), así que cae aquí.
+  function uuid() {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      try { return crypto.randomUUID(); } catch (_) {}
+    }
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+      const r = Math.random() * 16 | 0;
+      return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+    });
+  }
+
   function buildCognitoUrl(path, responseType) {
-    const state = crypto.randomUUID();
+    const state = uuid();
     sessionStorage.setItem('oauth_state', state);
     const params = new URLSearchParams({
       response_type: responseType,
