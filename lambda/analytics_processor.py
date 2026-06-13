@@ -3,109 +3,28 @@ Lambda: SQS analytics processor.
 
 Triggered by SQS (batch_size=10). Each message is an event published to the
 SNS events topic by chat_handler or payment_processor. Unwraps the SNS envelope
-and writes the raw event log to RDS PostgreSQL via RDS Proxy.
+and escribe los eventos crudos en S3 en formato JSON Lines (.jsonl), particionado
+por dt=YYYY-MM-DD/hh=HH para que Athena pueda hacer partition pruning.
+
+El equipo de business analytics consulta los eventos directamente vía Athena
+(Glue Crawler descubre el schema automáticamente).
 """
-import os, json, logging, time, socket
+import os, json, logging
 from datetime import datetime, timezone
 
 import boto3
-import psycopg2
-from psycopg2.extras import execute_values
-
-# Garantiza que los intentos de conexión TCP respeten el timeout aunque el SG
-# descarte paquetes silenciosamente (sin RST). psycopg2 connect_timeout solo
-# funciona de forma confiable cuando el host envía RST; con drop silencioso el
-# OS espera su propio timeout (~2-3 min). Este setdefaulttimeout actúa a nivel
-# de socket y corta la espera en 30s en cualquier caso.
-socket.setdefaulttimeout(30)
 
 log = logging.getLogger()
 log.setLevel(logging.INFO)
 
-REGION             = os.environ["AWS_REGION_VAR"]
-RDS_SECRET_ARN     = os.environ["RDS_SECRET_ARN"]
-RDS_PROXY_ENDPOINT = os.environ["RDS_PROXY_ENDPOINT"]
+REGION           = os.environ["AWS_REGION_VAR"]
+ANALYTICS_BUCKET = os.environ["ANALYTICS_BUCKET"]
+EVENTS_PREFIX    = os.environ.get("ANALYTICS_PREFIX", "events")
 
-sm = boto3.client("secretsmanager", region_name=REGION)
-
-_rds_conn = None
-_schema_ready = False
-
-
-def _get_rds_conn():
-    global _rds_conn
-    if _rds_conn and not _rds_conn.closed:
-        if _rds_conn.status != psycopg2.extensions.STATUS_READY:
-            try:
-                _rds_conn.rollback()
-            except Exception:
-                _rds_conn = None
-        if _rds_conn:
-            return _rds_conn
-    secret = sm.get_secret_value(SecretId=RDS_SECRET_ARN)
-    creds  = json.loads(secret["SecretString"])
-    _rds_conn = psycopg2.connect(
-        host            = RDS_PROXY_ENDPOINT,
-        port            = creds.get("port", 5432),
-        dbname          = creds["dbname"],
-        user            = creds["username"],
-        password        = creds["password"],
-        connect_timeout = 30,
-        sslmode         = "require",
-    )
-    _rds_conn.autocommit = False
-    return _rds_conn
-
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS eventos_chat (
-    id          BIGSERIAL PRIMARY KEY,
-    tipo_evento VARCHAR(50)  NOT NULL,
-    usuario_id  VARCHAR(100) NOT NULL,
-    timestamp   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    datos       JSONB,
-    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS idx_eventos_tipo      ON eventos_chat (tipo_evento);
-CREATE INDEX IF NOT EXISTS idx_eventos_usuario   ON eventos_chat (usuario_id);
-CREATE INDEX IF NOT EXISTS idx_eventos_timestamp ON eventos_chat (timestamp);
-"""
+s3 = boto3.client("s3", region_name=REGION)
 
 
 def handler(event, context):
-    if event.get("migrate"):
-        # RDS Proxy puede tardar unos minutos en estar disponible tras el deploy.
-        # Reintentamos hasta 5 veces con 15s entre intentos (75s total < timeout 120s).
-        global _rds_conn
-        for attempt in range(1, 6):
-            try:
-                conn = _get_rds_conn()
-                conn.rollback()
-                with conn.cursor() as cur:
-                    cur.execute(SCHEMA)
-                conn.commit()
-                log.info("Schema migration complete (attempt %d)", attempt)
-                return {"migrated": True}
-            except Exception as e:
-                _rds_conn = None
-                if attempt == 5:
-                    raise
-                log.warning("Migration attempt %d/5 failed: %s — retrying in 15s", attempt, e)
-                time.sleep(15)
-
-    global _schema_ready
-    if not _schema_ready:
-        try:
-            conn = _get_rds_conn()
-            conn.rollback()
-            with conn.cursor() as cur:
-                cur.execute(SCHEMA)
-            conn.commit()
-            _schema_ready = True
-            log.info("Schema ensured on cold start")
-        except Exception as e:
-            log.warning("Schema check failed (will retry on next invocation): %s", e)
-
     records = event.get("Records", [])
     log.info("Processing %d SQS records", len(records))
 
@@ -113,39 +32,40 @@ def handler(event, context):
     for record in records:
         try:
             body = json.loads(record["body"])
-            if "Message" in body:
+            # SNS → SQS wrap: el mensaje real viene en body.Message (string JSON)
+            if isinstance(body, dict) and "Message" in body:
                 body = json.loads(body["Message"])
             rows.append(body)
         except Exception as e:
             log.warning("Skipping malformed record: %s", e)
 
     if not rows:
-        return
+        return {"written": 0}
+
+    now = datetime.now(timezone.utc)
+    ingested_at = now.isoformat()
+    for r in rows:
+        r["ingested_at"] = ingested_at
+
+    # Particionamiento Hive-style: dt=YYYY-MM-DD/hh=HH
+    # El Glue Crawler reconoce este formato como particiones automáticamente.
+    key = (
+        f"{EVENTS_PREFIX}/"
+        f"dt={now.strftime('%Y-%m-%d')}/"
+        f"hh={now.strftime('%H')}/"
+        f"{context.aws_request_id}.jsonl"
+    )
+    body = "\n".join(json.dumps(r, default=str) for r in rows).encode("utf-8")
 
     try:
-        _write_to_rds(rows)
-    except Exception as e:
-        log.error("RDS write failed (will retry via SQS): %s", e)
-        raise
-
-
-def _write_to_rds(rows: list):
-    conn = _get_rds_conn()
-    values = [
-        (
-            r.get("event_type", "unknown"),
-            r.get("user_id", "anon"),
-            r.get("timestamp", datetime.now(timezone.utc).isoformat()),
-            json.dumps(r.get("payload", {})),
+        s3.put_object(
+            Bucket=ANALYTICS_BUCKET,
+            Key=key,
+            Body=body,
+            ContentType="application/x-ndjson",
         )
-        for r in rows
-    ]
-    sql = """
-        INSERT INTO eventos_chat (tipo_evento, usuario_id, timestamp, datos)
-        VALUES %s
-        ON CONFLICT DO NOTHING
-    """
-    with conn.cursor() as cur:
-        execute_values(cur, sql, values)
-    conn.commit()
-    log.info("Inserted %d rows into RDS", len(values))
+        log.info("Wrote %d events to s3://%s/%s", len(rows), ANALYTICS_BUCKET, key)
+        return {"written": len(rows), "key": key}
+    except Exception as e:
+        log.error("S3 put_object failed (will retry via SQS): %s", e)
+        raise

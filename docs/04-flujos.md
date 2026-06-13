@@ -240,32 +240,43 @@ Usuario descarga el boarding pass directamente desde S3
 
 ---
 
-## Flujo 6 — Dashboard del admin
+## Flujo 6 — Analytics para el equipo de business analytics
+
+> **Cambio respecto al TP3:** el dashboard admin en el frontend se eliminó. El equipo de business analytics consume los datos directamente vía Athena con cliente SQL externo (DBeaver / DataGrip).
 
 ```
-Admin inicia sesión en Cognito
-El token incluye que pertenece al grupo "admins"
+Eventos del chat (chat_handler, payment_processor)
+        ↓ publica
+SNS topic events
+        ↓ fan-out
+SQS analytics (buffer + DLQ)
+        ↓ trigger batch_size=10
+Lambda analytics-processor
+        ↓ put_object JSON Lines
+S3 jetsmart-analytics/events/dt=YYYY-MM-DD/hh=HH/<uuid>.jsonl
+
+(cada hora, en paralelo)
+Glue Crawler
+        ↓ infiere schema + particiones
+Glue Data Catalog (jetsmart_prod_analytics.events)
+
+(consulta desde el equipo de business analytics)
+DBeaver / DataGrip con Athena JDBC driver
+        ↓ SQL
+Athena Workgroup jetsmart-prod-analytics
+        ↓ lee
+S3 events + Glue Catalog → resultados
         ↓
-Frontend detecta el grupo "admins" en el token
-Muestra el dashboard de analytics en lugar del chatbot
-        ↓
-Frontend hace requests autenticados:
-  GET /api/admin/metrics
-        ↓
-API Gateway invoca Lambda admin-metrics
-        ↓
-Lambda verifica que el token pertenece al grupo "admins"
-Si no es admin → responde 403 Forbidden
-Si es admin → conecta a RDS y ejecuta consultas SQL:
-  SELECT ruta, COUNT(*) as total
-  FROM eventos
-  WHERE tipo = 'busqueda_vuelo'
-  GROUP BY ruta
-  ORDER BY total DESC
-        ↓
-Lambda devuelve los datos al frontend
-Frontend renderiza los gráficos y tablas del dashboard
+Equipo de business analytics:
+  - reportes diarios, semanales, mensuales
+  - búsquedas top por ruta
+  - conversiones (búsquedas → compras)
+  - tipos de reclamos más frecuentes
 ```
+
+**Por qué no hay dashboard en la app web:** el dashboard de admin del TP3 (`GET /api/admin/metrics`) era una capa más para mostrar lo mismo que ahora muestra Athena con menos código. Para el equipo de business analytics es más útil tener SQL ad-hoc en su cliente preferido que un dashboard fijo.
+
+**Frescura de datos:** el Glue Crawler corre cada hora. Para refresh inmediato (útil en demo) se invoca con `aws glue start-crawler --name jetsmart-prod-events-crawler`.
 
 ---
 

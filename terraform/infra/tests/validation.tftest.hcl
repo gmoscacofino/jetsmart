@@ -3,32 +3,11 @@
 # Ejecutar con: terraform test (desde terraform/infra/)
 
 mock_provider "aws" {
-  mock_data "aws_availability_zones" {
-    defaults = {
-      names = ["us-east-1a", "us-east-1b", "us-east-1c"]
-      state = "available"
-    }
-  }
   mock_data "aws_iam_role" {
     defaults = {
       arn       = "arn:aws:iam::123456789012:role/LabRole"
       name      = "LabRole"
       unique_id = "AROA000000000000000000"
-    }
-  }
-  mock_data "aws_iam_instance_profile" {
-    defaults = {
-      arn  = "arn:aws:iam::123456789012:instance-profile/LabInstanceProfile"
-      name = "LabInstanceProfile"
-    }
-  }
-  mock_data "aws_ami" {
-    defaults = {
-      id                  = "ami-0abcdef1234567890"
-      name                = "al2023-ami-2023.0.0-x86_64"
-      owner_id            = "137112412989"
-      root_device_type    = "ebs"
-      virtualization_type = "hvm"
     }
   }
   mock_data "aws_caller_identity" {
@@ -48,7 +27,6 @@ run "rechaza_environment_invalido" {
 
   variables {
     anthropic_api_key   = "sk-ant-test-key"
-    rds_password        = "test-password-123"
     state_bucket_suffix = "test"
     environment         = "production"
   }
@@ -62,7 +40,6 @@ run "acepta_environment_dev" {
 
   variables {
     anthropic_api_key   = "sk-ant-test-key"
-    rds_password        = "test-password-123"
     state_bucket_suffix = "test"
     environment         = "dev"
   }
@@ -74,7 +51,6 @@ run "acepta_environment_staging" {
 
   variables {
     anthropic_api_key   = "sk-ant-test-key"
-    rds_password        = "test-password-123"
     state_bucket_suffix = "test"
     environment         = "staging"
   }
@@ -86,7 +62,6 @@ run "acepta_environment_prod" {
 
   variables {
     anthropic_api_key   = "sk-ant-test-key"
-    rds_password        = "test-password-123"
     state_bucket_suffix = "test"
     environment         = "prod"
   }

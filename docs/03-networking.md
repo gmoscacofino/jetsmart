@@ -1,207 +1,107 @@
 # 03 — Networking
 
-## Conceptos base
+## Por qué no hay VPC
 
-### VPC (Virtual Private Cloud)
+La arquitectura **TP4 no usa VPC**. Esta es una decisión deliberada después del feedback del TP3.
 
-La VPC es la red privada que contiene todos los recursos de la aplicación en AWS. Es como el edificio donde viven los servidores — vos decidís qué puertas tiene, quién puede entrar desde afuera y quién puede salir.
+### Regla aplicada
 
-Sin VPC, los recursos flotarían expuestos en la infraestructura de AWS sin ningún aislamiento.
+Las VPCs sirven para **aislar recursos con identidad de red persistente**: EC2, RDS, ElastiCache, contenedores ECS/EKS, instancias de Elasticsearch, etc. Estos recursos tienen IPs, interfaces de red y necesitan reglas de tráfico definidas.
 
-### Internet Gateway (IGW)
+**Cuando una arquitectura es 100% Lambda + servicios managed regionales**, no hay nada para aislar. Las Lambdas no tienen IP persistente. DynamoDB, SNS, SQS, Step Functions, S3, Cognito, Glue, Athena son endpoints regionales gestionados por AWS — no viven en tu red, viven en la red de AWS.
 
-El Internet Gateway es la puerta de entrada y salida de internet hacia la VPC. Sin él, ningún recurso dentro de la VPC puede recibir tráfico de internet ni salir hacia él.
+Forzar una VPC en este escenario significa crear subnets, route tables, Security Groups, VPC Endpoints e ENIs sin un solo recurso adentro que los justifique. Es over-engineering.
 
-Se asocia a la VPC (uno por VPC) y se referencia en las route tables de las subnets públicas.
+### Comparación con el TP3
 
-```
-Internet ←──→ Internet Gateway ←──→ VPC
-```
+| Componente | TP3 (con VPC) | TP4 (sin VPC) |
+|---|---|---|
+| RDS PostgreSQL | En subnet privada de datos | **Eliminado** (data lake S3 + Athena) |
+| RDS Proxy | En subnet privada de cómputo | **Eliminado** |
+| Bastion EC2 | En subnet pública con SSM | **Eliminado** |
+| Lambda analytics-processor | En VPC para acceder a RDS | Regional — escribe a S3 |
+| VPC + 6 subnets + IGW + NAT GW | Sí | **Eliminados** |
+| Security Groups (lambda, rds, rds_proxy, vpc_endpoints, bastion) | 5 SGs | **Eliminados** |
+| VPC Endpoints (Secrets Manager, SQS, CloudWatch Logs) | 3 endpoints Interface | **Eliminados** |
 
-### Subnets
+### Trade-offs honestos
 
-Una subnet es una división de la red dentro de la VPC. Hay dos tipos:
+**Pierdo:**
+- **VPC Flow Logs** — ya no veo el tráfico de red L3/L4 de las Lambdas. Útil para detectar exfiltración o port scans en un escenario comprometido.
+- **Contención de egress** — sin VPC sin NAT, no puedo "encerrar" a las Lambdas para que no salgan a internet. Lo mitigo con IAM least-privilege: cada Lambda sólo tiene permisos para los servicios AWS específicos que necesita (LabRole de Academy es amplio, pero en producción real serían roles por función).
 
-**Subnet pública** — su route table tiene una ruta hacia el Internet Gateway.
-Los recursos acá son accesibles desde internet (si tienen IP pública).
+**Gano:**
+- **Cold start mínimo** — sin VPC, las Lambdas arrancan en ~200ms. Con VPC y ENI hubieran sido 500ms-2s.
+- **Costo cero de networking** — sin NAT Gateway (USD/hora), sin Interface Endpoints (USD/hora).
+- **Menos puntos de falla** — sin SGs ni route tables que mantener, sin endpoints que puedan caerse.
+- **Mantenibilidad** — el Terraform es ~40% más chico y ~60% más rápido de aplicar.
 
-**Subnet privada** — su route table NO tiene ruta al Internet Gateway.
-Los recursos acá están aislados. Nadie de afuera puede llegar directamente.
+### Auditoría sin VPC Flow Logs
 
-### Route Tables
+La pérdida de Flow Logs se compensa con:
 
-Una route table es una tabla de reglas que define adónde va el tráfico de red. Cada subnet está asociada a una route table.
+- **CloudTrail** — registra toda API call de Lambda a otros servicios AWS. Quién (qué Lambda identificada por su execution role), cuándo, qué operación (PutItem, Publish, etc.), con qué parámetros, resultado. Está activo por default.
+- **CloudWatch Logs** — todo lo que loggea la Lambda (`print()`, `logger.info()`). Errores, traces aplicativos.
 
-**Route table pública:**
-```
-Destino          →  Vía
-10.0.0.0/16      →  local (tráfico interno de la VPC)
-0.0.0.0/0        →  Internet Gateway
-```
-
-**Route table privada:**
-```
-Destino          →  Vía
-10.0.0.0/16      →  local (tráfico interno de la VPC)
-0.0.0.0/0        →  NAT Gateway
-```
-
-La diferencia clave: la privada no apunta al IGW directamente — apunta al NAT Gateway para salidas a internet.
-
-### NAT Gateway
-
-La Lambda `analytics-processor` corre dentro de la VPC (necesita acceso a RDS en subnet privada) pero también puede necesitar salida a internet. El NAT Gateway resuelve esto.
-
-Vive en la subnet pública y actúa de intermediario:
-
-```
-Lambda analytics (subnet privada)
-    → NAT Gateway (subnet pública)
-        → Internet Gateway
-            → internet
-```
-
-Desde afuera nadie puede entrar a la Lambda. Pero la Lambda sí puede salir. El NAT Gateway "traduce" la dirección privada a una IP pública para que pueda salir a internet.
-
-**Nota:** la Lambda `chat-handler` **no está en la VPC** — necesita llamar a la API de Anthropic directamente y ponerla en VPC requeriría un NAT Gateway adicional solo para eso. Al estar fuera de la VPC, llama a internet directamente sin pasar por la red interna.
-
-### Zonas de disponibilidad (AZs)
-
-AWS divide cada región en zonas de disponibilidad físicamente separadas (distintos centros de datos). Si una zona falla, las otras siguen funcionando.
-
-La arquitectura usa **2 AZs** (AZ-a y AZ-b) para:
-1. **Alta disponibilidad**: si una AZ cae, la aplicación sigue corriendo en la otra.
-2. **Requisito de RDS**: RDS necesita al menos 2 subnets en distintas AZs para el subnet group.
+CloudTrail es **estrictamente más útil para auditoría aplicativa** que Flow Logs. Flow Logs sirve para detección de comportamiento anómalo de red, no para "¿qué hizo cada función?".
 
 ---
 
-## Diseño de subnets
+## Edge networking — lo que sí hay
 
-La arquitectura tiene 6 subnets distribuidas en 2 AZs:
+Aunque no hay VPC propia, la arquitectura interactúa con varios componentes de red:
 
-```
-VPC: 10.0.0.0/16
+### Internet Gateway implícito
 
-┌─────────────────────────┬─────────────────────────┐
-│   AZ-a (us-east-1a)     │   AZ-b (us-east-1b)     │
-├─────────────────────────┼─────────────────────────┤
-│ public-a  10.0.1.0/24   │ public-b  10.0.2.0/24   │
-│ - NAT Gateway           │                         │
-├─────────────────────────┼─────────────────────────┤
-│ private-compute-a        │ private-compute-b       │
-│   10.0.3.0/24           │   10.0.4.0/24           │
-│ - Lambda analytics      │ - Lambda analytics      │
-├─────────────────────────┼─────────────────────────┤
-│ private-data-a           │ private-data-b          │
-│   10.0.5.0/24           │   10.0.6.0/24           │
-│ - RDS PostgreSQL        │ - RDS subnet group      │
-└─────────────────────────┴─────────────────────────┘
-```
+Cada Lambda, al estar en la infraestructura administrada de AWS, sale a internet sin pasar por una red de cliente. Para el `chat-handler` que llama a la API de Anthropic, este es el camino directo (sin NAT, sin pérdida de latencia).
 
-Las Lambdas del flujo de chat y pagos **no están en la VPC** — corren en la infraestructura administrada de AWS y acceden a DynamoDB, SNS y SQS directamente por endpoints públicos de AWS (sin pasar por la VPC).
+### S3 estático con HTTP
 
----
+El frontend está en un bucket S3 con **website hosting** (HTTP). Es público por necesidad del modelo de site estático.
 
-## Security Groups
+> Por qué no HTTPS en el frontend: AWS Academy no expone los plans de Route 53 + ACM + CloudFront fácilmente y agregaría mucho costo y tiempo de provisioning. Para el TP el HTTP es aceptable; en producción se pondría CloudFront delante con certificado ACM y dominio propio.
 
-Un Security Group es un firewall a nivel de recurso. Define qué tráfico puede entrar y salir de cada componente.
+### Cognito Hosted UI con HTTPS
 
-La regla de diseño: **cada recurso solo acepta tráfico del componente que necesita hablarle**.
+Cognito provee un endpoint HTTPS estable (`https://<domain>.auth.us-east-1.amazoncognito.com`). Es el único componente que recibe las credenciales del usuario.
 
-### SG-Lambda (analytics-processor en VPC)
-```
-Entrada:  (ninguna — Lambda no recibe conexiones entrantes)
-Salida:   puerto 5432 hacia SG-RDS-Proxy (PostgreSQL)
-          puerto 443 dentro del CIDR de la VPC (hacia VPC Endpoints)
-```
+### API Gateway con HTTPS
 
-### SG-RDS-Proxy
-```
-Entrada:  puerto 5432 desde SG-Lambda únicamente
-Salida:   puerto 5432 hacia SG-RDS únicamente
-```
+Cada API Gateway (chatbot-api y auth-api) tiene URL HTTPS estable. Esto es lo que habilita el **workaround Cognito**: la Lambda `auth-callback` detrás de API Gateway es el bridge HTTPS entre Cognito Hosted UI (HTTPS) y el frontend S3 (HTTP).
 
-El RDS Proxy está entre Lambda y RDS. Lambda no habla directamente con RDS — habla con el proxy, que mantiene el pool de conexiones.
+### Cognito Authorizer
 
-### SG-RDS
-```
-Entrada:  puerto 5432 desde SG-RDS-Proxy
-          puerto 5432 desde SG-Bastion (acceso operativo)
-Salida:   ninguna
-```
+API Gateway del chatbot valida el JWT con un Cognito Authorizer (`aws_api_gateway_authorizer` tipo `COGNITO_USER_POOLS`). Las requests sin token o con token inválido reciben `401` antes de llegar a Lambda — el rechazo ocurre en el edge.
 
-### SG-Bastion
-```
-Entrada:  ninguna (sin SSH, sin puerto 22)
-Salida:   todo outbound (necesita conectarse a SSM y a RDS)
-```
-
-### SG-VPC-Endpoints
-```
-Entrada:  puerto 443 desde SG-Lambda únicamente
-Salida:   ninguna
-```
+**Excepción:** API Gateway de `auth-callback` queda con `authorization = "NONE"` porque Cognito redirige a ese endpoint con el `code` en query string (sin Authorization header). Es parte del workaround.
 
 ---
 
-## VPC Endpoints
+## Modelo de seguridad
 
-Los VPC Endpoints permiten que recursos dentro de la VPC se comuniquen con servicios de AWS sin que el tráfico salga a internet. Evitan pasar por el NAT Gateway, lo que reduce costos y mejora la seguridad.
+Sin VPC, la seguridad se basa en cuatro capas:
 
-Los tres son de tipo **Interface** (crean una ENI dentro de la subnet privada con `private_dns_enabled = true`):
+| Capa | Mecanismo |
+|---|---|
+| Identidad del usuario | Cognito User Pool — registro y autenticación |
+| Autorización en el perímetro | API Gateway Cognito Authorizer — rechaza JWT inválidos |
+| Identidad de las Lambdas | LabRole con permisos limitados a los servicios que cada función usa |
+| Encriptación | TLS para HTTPS (API GW, Cognito), SSE-S3 en buckets, SSE en DynamoDB |
 
-### Secrets Manager Interface Endpoint
-La Lambda analytics lee las credenciales de RDS desde Secrets Manager sin salir a internet.
-
-```
-Lambda analytics-processor → VPC Interface Endpoint → Secrets Manager
-```
-
-### SQS Interface Endpoint
-La Lambda analytics consume mensajes de la cola `analytics-queue` desde dentro de la VPC, sin pasar por el NAT Gateway.
-
-```
-Lambda analytics-processor → VPC Interface Endpoint → SQS analytics-queue
-```
-
-### CloudWatch Logs Interface Endpoint
-La Lambda analytics escribe sus logs directamente en CloudWatch sin salir a internet.
-
-```
-Lambda analytics-processor → VPC Interface Endpoint → CloudWatch Logs
-```
+Ningún recurso de datos tiene acceso público:
+- DynamoDB sólo accesible por Lambdas con LabRole.
+- S3 analytics y assets con `public_access_block` activo en todas las dimensiones.
+- Secrets Manager sólo accesible por Lambdas autorizadas.
+- S3 frontend público porque es **necesario para servir HTML/CSS/JS**, pero no contiene info sensible.
 
 ---
 
-## Resumen del flujo de red
+## ¿Qué pasaría si tuviéramos requisitos de compliance?
 
-### Chat (fuera de la VPC)
+Si en producción necesitáramos cumplir un estándar tipo PCI-DSS o HIPAA, la respuesta sería:
+1. Volver a meter Lambdas en VPC para tener VPC Flow Logs.
+2. Agregar VPC Endpoints (Gateway gratis para DynamoDB, Interface para los demás) para que el tráfico no salga a internet.
+3. Mover el bucket S3 a una bucket policy que sólo permita acceso via VPC Endpoint.
+4. Reemplazar LabRole por roles IAM per-función con least-privilege estricto.
 
-```
-Usuario
-  │
-  ↓ HTTPS
-API Gateway
-  │
-  ↓ invocación
-Lambda chat-handler (fuera de VPC)
-  │
-  ├──→ DynamoDB (endpoint público de AWS)
-  ├──→ Secrets Manager (endpoint público de AWS)
-  ├──→ SNS (endpoint público de AWS)
-  └──→ Anthropic API (internet — sin VPC, sin NAT)
-```
-
-### Analytics (dentro de la VPC)
-
-```
-SQS analytics-queue (VPC Interface Endpoint)
-  │
-  ↓ trigger
-Lambda analytics-processor (subnet privada — cómputo)
-  │
-  ├──→ RDS Proxy (subnet privada — cómputo) → RDS PostgreSQL (subnet privada — datos)
-  ├──→ SQS (VPC Interface Endpoint — sin internet)
-  ├──→ Secrets Manager (VPC Interface Endpoint — sin internet)
-  └──→ CloudWatch Logs (VPC Interface Endpoint — sin internet)
-```
+Para el escenario actual (TP académico, chatbot de demo), todo eso es over-engineering.

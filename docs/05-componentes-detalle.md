@@ -12,7 +12,7 @@ Lambda es el servicio de cómputo principal de este proyecto. Cada función Lamb
 
 | Nombre | Trigger | Función |
 |---|---|---|
-| `chat-handler` | API Gateway (todos los paths) | Punto de entrada principal: chat con tool use, historial, reservas del usuario, métricas admin, inicio de pago |
+| `chat-handler` | API Gateway (todos los paths, **detrás de Cognito Authorizer**) | Punto de entrada principal: chat con tool use, historial, reservas del usuario, inicio de pago. Lee claims ya validados de `event.requestContext.authorizer.claims` (sin validación JWT manual) |
 | `payment-reserve-flight` | Step Functions (estado ReserveFlight) | Verifica disponibilidad y bloquea asientos en DynamoDB (decremento atómico con ConditionExpression) |
 | `payment-reserve-booking` | Step Functions (estado ReserveBooking) | Crea la reserva en DynamoDB con estado PENDIENTE |
 | `payment-collect-payment` | Step Functions (estado CollectPayment) | Procesa el cobro (mock; en producción llama al gateway de pagos) |
@@ -20,11 +20,11 @@ Lambda es el servicio de cómputo principal de este proyecto. Cada función Lamb
 | `payment-refund-payment` | Step Functions (compensación) | Revierte el cobro si ConfirmBooking falla |
 | `payment-cancel-booking` | Step Functions (compensación) | Cancela la reserva si fue creada |
 | `payment-release-flight` | Step Functions (compensación) | Libera los asientos bloqueados si ReserveFlight se ejecutó |
-| `boarding-pass` | Step Functions (PostBookingActions, rama paralela) | Genera el boarding pass y lo sube a S3 como pre-signed URL |
+| `boarding-pass` | Step Functions (PostBookingActions, rama paralela) | Genera el boarding pass y lo persiste en DynamoDB |
 | `notification` | Step Functions (PostBookingActions + error path) | Envía confirmación al usuario (éxito o fracaso del pago) |
-| `analytics-processor` | SQS analytics-queue | Escribe eventos en RDS PostgreSQL (en VPC) |
-| `auth-callback` | API Gateway GET /callback | Intercambia authorization code por tokens JWT |
-| `cognito-trigger` | Cognito post-registration | Asigna grupo `users` y crea perfil en DynamoDB |
+| `analytics-processor` | SQS analytics-queue | Escribe eventos crudos en S3 como JSON Lines particionado por fecha (TP4: ya no escribe a RDS) |
+| `auth-callback` | API Gateway GET /callback (bridge HTTPS del workaround) | Intercambia authorization code por tokens JWT y redirige al frontend |
+| `cognito-trigger` | Cognito post-registration | Asigna grupo `users` al usuario nuevo |
 
 ### Tool use en chat-handler
 
@@ -41,12 +41,11 @@ Ver explicación completa en [01 — Cómo funciona un chatbot](./01-como-funcio
 
 Todas las Lambdas usan **Python 3.12**. El timeout configurable es de 30 segundos por defecto (variable `lambda_timeout`).
 
-### Lambda en VPC vs. fuera de VPC
+### Todas las Lambdas regionales (sin VPC)
 
-| Lambda | En VPC | Razón |
-|---|---|---|
-| `analytics-processor` | Sí (subnets privadas) | Necesita acceso a RDS en subnet privada |
-| Todas las demás | No | Acceden a DynamoDB/SNS/SQS via endpoints públicos de AWS; chat-handler necesita llamar a Anthropic (internet) sin NAT |
+En el TP4 **ninguna Lambda usa VPC**. La justificación está en `docs/03-networking.md`: sin recursos persistentes (RDS, EC2), la VPC era over-engineering. Las Lambdas acceden a DynamoDB, SNS, SQS, Step Functions, S3, Secrets Manager directamente por endpoints regionales de AWS — el tráfico va por la red interna de AWS, encriptado con TLS.
+
+Ganancia concreta: cold start ~200ms en lugar de 500ms-2s.
 
 ---
 
@@ -56,21 +55,44 @@ API Gateway es el punto de entrada HTTP del sistema. Lambda no tiene URL propia 
 
 ### Dos instancias de API Gateway
 
-**1. API principal (chatbot)**
-- Maneja: `POST /api/chat`, `GET /api/reservations`, `POST /api/payment`, `GET /api/admin/metrics`
-- Usa un recurso `{proxy+}` que captura todos los paths y los enruta a la Lambda correspondiente según el path en el handler
+**1. API principal (chatbot) — protegida por Cognito Authorizer**
+- Maneja: `POST /api/chat`, `GET /api/reservations`, `POST /api/payment`.
+- Usa un recurso `{proxy+}` que captura todos los paths y los enruta a `chat-handler`.
+- Método `ANY /{proxy+}` con `authorization = "COGNITO_USER_POOLS"` y un `aws_api_gateway_authorizer` que valida el JWT contra el User Pool.
+- Método `OPTIONS /{proxy+}` con `authorization = "NONE"` y `MOCK` integration para servir el preflight CORS sin invocar Lambda.
+- Método `ANY /` con `authorization = "NONE"` para exponer `/health` sin auth.
 
-**2. API de auth (callback)**
-- Maneja: `GET /callback`
-- Invoca exclusivamente la Lambda `auth-callback`
-- Es el redirect URI registrado en el Cognito App Client
+**2. API de auth (callback) — bridge del workaround Cognito**
+- Maneja: `GET /callback`.
+- Invoca exclusivamente la Lambda `auth-callback`.
+- Es el redirect URI registrado en el Cognito App Client.
+- `authorization = "NONE"` porque Cognito redirige con `?code=...` en query string (sin Authorization header). Está documentado en `teoria/notas-de-clase/workaround-cognito.md`.
+
+### Cognito Authorizer — cambio respecto al TP3
+
+En el TP3, la Lambda `chat-handler` descargaba el JWKS de Cognito, parseaba el JWT manualmente con `python-jose` y validaba firma/issuer/token_use por cuenta propia. Eran ~50 líneas de código aplicativo manejando un problema de seguridad estándar.
+
+En el TP4, API Gateway hace toda esa validación con un recurso de Terraform:
+
+```hcl
+resource "aws_api_gateway_authorizer" "cognito" {
+  name            = "${var.name_prefix}-cognito-authorizer"
+  type            = "COGNITO_USER_POOLS"
+  rest_api_id     = aws_api_gateway_rest_api.chatbot.id
+  provider_arns   = [var.cognito_user_pool_arn]
+  identity_source = "method.request.header.Authorization"
+}
+```
+
+Los claims llegan a la Lambda ya validados en `event.requestContext.authorizer.claims`. Si el token es inválido, API GW devuelve `401` antes de invocar Lambda — sin gastar invocación ni cold start. El layer `python-jose` también desapareció.
 
 ### Por qué API Gateway y no una URL de Lambda
 
-Lambda Function URLs (feature más nueva de AWS) podrían reemplazar API Gateway para casos simples. Se eligió API Gateway porque:
-- Permite centralizar la autorización
-- Más familiar y documentado para el contexto académico
-- Permite agregar rate limiting y WAF en producción
+Lambda Function URLs son más simples pero no soportan Cognito Authorizer nativo (tendría que volver a validar manualmente). API Gateway permite:
+- Cognito Authorizer plug-and-play.
+- Throttling configurable (10 req/s sostenido, 20 burst).
+- CORS preflight con MOCK integration.
+- Stages independientes (dev / staging / prod).
 
 ---
 
@@ -92,7 +114,7 @@ El topic `events` recibe eventos de dos fuentes:
 - Mensajes de chat (publicados por `chat-handler`)
 - Compras completadas (publicadas por `payment-confirm-booking`)
 
-Todos llegan a la misma `analytics-queue` → `analytics-processor` → RDS. Si en el futuro se quiere agregar otro consumidor (por ejemplo, un servicio de marketing que dispara emails), basta con suscribirlo al topic — sin tocar el código de los publicadores.
+Todos llegan a la misma `analytics-queue` → `analytics-processor` → **S3 analytics** (JSON Lines particionado). Si en el futuro se quiere agregar otro consumidor (por ejemplo, un servicio de marketing que dispara emails), basta con suscribirlo al topic — sin tocar el código de los publicadores.
 
 ---
 
@@ -104,27 +126,27 @@ SQS es una cola de mensajes. El productor pone mensajes en la cola y el consumid
 
 | Queue | Fuente | Propósito |
 |---|---|---|
-| `analytics-queue` | SNS `events` | Trigger de `analytics-processor` para escribir en RDS |
-| `analytics-dlq` | `analytics-queue` (mensajes fallidos) | Retención de eventos de analytics que fallaron |
+| `analytics-queue` | SNS `events` | Trigger de `analytics-processor` para escribir en S3 (data lake) |
+| `analytics-dlq` | `analytics-queue` (mensajes fallidos) | Retención de eventos de analytics que fallaron 3 veces |
 | `booking-failed-dlq` | Step Functions (estado BookingDLQ) | Retención de reservas fallidas para investigación (14 días) |
 
 El flujo de pago ya no usa colas SQS entre sus pasos — Step Functions orquesta directamente cada Lambda de pago y maneja retries y compensaciones.
 
 ### Por qué SQS para analytics y no invocación directa
 
-Para analytics, el volumen puede ser alto (un evento por cada mensaje de chat). SQS desacopla la escritura en RDS:
+Para analytics, el volumen puede ser alto (un evento por cada mensaje de chat). SQS desacopla la escritura a S3:
 
 ```
 Sin SQS:
-chat-handler → analytics-processor Lambda → RDS
-(si RDS está lento, chat-handler espera → el usuario espera)
+chat-handler → analytics-processor Lambda → S3
+(si S3 está lento, chat-handler espera → el usuario espera)
 
 Con SQS:
-chat-handler → SNS → SQS → analytics-processor → RDS
+chat-handler → SNS → SQS → analytics-processor → S3
 (chat-handler termina inmediatamente; analytics se procesa después)
 ```
 
-La escritura en RDS puede tardar decenas de milisegundos. Sacarla del path sincrónico del chat mejora la latencia percibida por el usuario.
+Aunque S3 PutObject es rápido (~50ms), sacarlo del path sincrónico del chat mejora la latencia y permite reintentos automáticos con DLQ si algo falla.
 
 ### Long polling
 
@@ -196,33 +218,50 @@ Ver el diseño completo en [07 — Capa de datos](./07-data-layer.md).
 
 ### Por qué DynamoDB para el chat
 
-- **Sin VPC**: la Lambda chat-handler no está en la VPC. DynamoDB es accesible por endpoint público de AWS, sin necesidad de NAT ni VPC.
+- **Sin VPC**: ninguna Lambda usa VPC. DynamoDB es accesible por endpoint regional de AWS.
 - **Latencia baja**: operaciones de GetItem/PutItem en < 5ms — no frena al usuario.
 - **Escala automática**: on-demand billing, sin capacidad que administrar.
 
 ---
 
-## RDS PostgreSQL
+## Data Lake: S3 + Glue + Athena
 
-Base de datos relacional para analytics. Vive en subnets privadas dentro de la VPC.
+La capa de analytics histórico **reemplaza al RDS PostgreSQL del TP3** con un patrón data lake estándar.
 
-Ver el schema completo en [07 — Capa de datos](./07-data-layer.md).
+### S3 — almacenamiento crudo
 
-### Por qué en la VPC (y por qué eso afecta a Lambda)
-
-RDS no tiene un endpoint público accesible desde internet — solo es accesible desde dentro de la VPC. Por eso la Lambda `analytics-processor` debe correr dentro de la VPC con el security group correcto.
-
-### RDS Proxy
-
-Entre `analytics-processor` y RDS hay un **RDS Proxy** (`aws_db_proxy.main`). El proxy mantiene un pool de conexiones persistentes contra RDS — cada invocación de Lambda reutiliza una conexión existente en lugar de abrir una nueva. Esto es crítico porque Lambda puede tener decenas de instancias simultáneas: sin proxy, RDS recibiría decenas de conexiones nuevas por segundo y agotaría su límite de conexiones (`max_connections`).
-
-El proxy lee las credenciales de RDS directamente desde Secrets Manager y autentica a Lambda sin exponer la contraseña. La Lambda solo conoce el endpoint del proxy, no el de RDS.
+Bucket `jetsmart-prod-<account-id>-analytics` con encriptación SSE-S3 y bloqueo de acceso público. Estructura de keys particionada Hive-style para que Athena haga *partition pruning* en sus queries:
 
 ```
-Lambda analytics-processor
-    → RDS Proxy (pool de conexiones) → RDS PostgreSQL
-       (lee credenciales de Secrets Manager)
+s3://jetsmart-prod-<account-id>-analytics/
+└── events/
+    └── dt=2026-06-13/
+        └── hh=14/
+            └── <uuid>.jsonl    ← uno por invocación de analytics-processor
 ```
+
+Cada `.jsonl` contiene una línea JSON por evento. Lifecycle policy: archivar a Glacier después de 90 días, expirar los resultados de Athena después de 14 días.
+
+### Glue Data Catalog y Crawler
+
+`aws_glue_catalog_database.analytics` es el catálogo de metadata. **Glue Crawler** (`aws_glue_crawler.events`) corre cada hora, descubre el schema de los `.jsonl` y crea/actualiza la tabla `events` con las columnas inferidas (event_type, user_id, timestamp, payload, ingested_at) y las particiones `dt`, `hh`.
+
+El crawler usa el LabRole de Academy, que tiene permisos sobre el bucket S3 de analytics y sobre el Glue Catalog.
+
+### Athena — consultas SQL
+
+`aws_athena_workgroup.analytics` es el workgroup del equipo de business analytics. Sus resultados se escriben a `s3://...-analytics/athena-results/` (encriptados con SSE-S3).
+
+El equipo se conecta con cliente SQL externo (DBeaver / DataGrip) usando el driver JDBC de Athena. Pueden tirar queries en Presto/Trino SQL:
+
+```sql
+SELECT event_type, COUNT(*)
+FROM jetsmart_prod_analytics.events
+WHERE dt >= '2026-06-01'
+GROUP BY 1;
+```
+
+Sin VPC, sin RDS Proxy, sin pool de conexiones — Athena es serverless puro, paga por TB escaneado (~5 USD/TB).
 
 ---
 
@@ -243,24 +282,26 @@ Usa la **Cognito Hosted UI** — una página de login que AWS genera automática
 | Grupo | Quién | Qué accede |
 |---|---|---|
 | `users` | Cualquier usuario registrado | El chatbot, sus reservas, check-in |
-| `admins` | Equipo / profesores | Dashboard de analytics |
 
-El grupo se incluye en el ID Token del usuario. La Lambda de chat y el frontend lo leen para decidir qué mostrar y qué permitir.
+> En TP3 había un grupo `admins` para un dashboard de analytics. En TP4 ese dashboard se eliminó — el equipo de business analytics consume Athena directamente con cliente SQL (mejor patrón). El grupo `users` es el único activo.
+
+El grupo se incluye en el ID Token del usuario. La Lambda chat-handler lo lee desde los claims si lo necesita.
 
 ---
 
 ## Secrets Manager
 
-Guarda dos secretos:
+Guarda un único secreto:
 
 | Secreto | Contenido |
 |---|---|
-| `jetsmart/anthropic-api-key` | La API key de Anthropic |
-| `jetsmart/rds-credentials` | Host, puerto, usuario y contraseña de RDS |
+| `jetsmart-prod/anthropic-api-key` | La API key de Anthropic |
 
-La Lambda chat-handler lee la API key de Anthropic al arrancar. La Lambda analytics-processor lee las credenciales de RDS cada vez que procesa un mensaje (o las cachea en el contexto de ejecución).
+> El secreto `jetsmart-prod/rds-credentials` del TP3 se eliminó junto con RDS.
 
-Los secretos están encriptados con AWS managed KMS keys.
+La Lambda `chat-handler` lee la API key de Anthropic en el cold start y la cachea en el contexto de ejecución.
+
+El secreto está encriptado con AWS managed KMS keys.
 
 ---
 
@@ -291,29 +332,36 @@ Retención configurada en 30 días.
 
 ## S3
 
-Dos buckets con propósitos distintos:
+Tres buckets con propósitos distintos:
 
-### `jetsmart-frontend`
+### `jetsmart-prod-<account-id>-frontend`
 - Archivos estáticos del sitio web (HTML, CSS, JS)
 - Static website hosting habilitado
 - Público (accesible desde internet)
 - Sin versionado (los archivos se sobreescriben en cada deploy)
 
-### `jetsmart-assets`
+### `jetsmart-prod-<account-id>-assets`
 - Boarding passes generados por Lambda
-- Backups de DynamoDB
 - **System prompt de Claude** (`config/system_prompt.txt`) — guardado en S3 para evitar el límite de 4 KB de variables de entorno de Lambda. La Lambda lo descarga en el cold start.
 - Privado — acceso a boarding passes via pre-signed URLs temporales (15 min)
 - Lifecycle: boarding passes expiran en 90 días; backups migran a STANDARD_IA a los 30 días
 - Encriptación AES-256 habilitada por defecto
 
+### `jetsmart-prod-<account-id>-analytics`
+- Eventos crudos del chatbot en formato JSON Lines particionado: `events/dt=YYYY-MM-DD/hh=HH/<uuid>.jsonl`
+- Resultados de queries Athena en `athena-results/`
+- Privado con `public_access_block` activo en todas las dimensiones
+- Lifecycle: archivar particiones a Glacier después de 90 días; expirar resultados Athena a los 14 días
+- Encriptación AES-256
+
 ## Lambda Layers
 
-Dos layers compilados para Python 3.12 en Linux x86_64:
+Un único layer compilado para Python 3.12 en Linux x86_64:
 
 | Layer | Contenido | Usada por |
 |---|---|---|
 | `jetsmart-prod-anthropic` | SDK `anthropic` + dependencias HTTP | `chat-handler` |
-| `jetsmart-prod-psycopg2` | Driver PostgreSQL `psycopg2-binary` | `analytics-processor` |
 
-Los layers se construyen localmente con `scripts/build-layers.sh` antes de correr `terraform apply`. El script usa `--platform manylinux2014_x86_64` para garantizar compatibilidad con el runtime de Lambda.
+> El layer `jetsmart-prod-psycopg2` del TP3 (driver PostgreSQL) se eliminó junto con RDS. La validación JWT manual con `python-jose` también desapareció — la hace ahora el Cognito Authorizer.
+
+El layer se construye localmente con `scripts/build-layers.sh` antes de correr `terraform apply`. El script usa `--platform manylinux2014_x86_64` para garantizar compatibilidad con el runtime de Lambda.

@@ -47,6 +47,16 @@ resource "aws_api_gateway_rest_api" "chatbot" {
   description = "Endpoints del chatbot JetSmart"
 }
 
+# Cognito Authorizer — valida el JWT en el perímetro, antes de invocar Lambda.
+# Reemplaza la validación manual que hacía chat_handler.py con python-jose.
+resource "aws_api_gateway_authorizer" "cognito" {
+  name            = "${var.name_prefix}-cognito-authorizer"
+  type            = "COGNITO_USER_POOLS"
+  rest_api_id     = aws_api_gateway_rest_api.chatbot.id
+  provider_arns   = [var.cognito_user_pool_arn]
+  identity_source = "method.request.header.Authorization"
+}
+
 # Recurso proxy {proxy+} — enruta cualquier path a chat_handler
 resource "aws_api_gateway_resource" "proxy" {
   rest_api_id = aws_api_gateway_rest_api.chatbot.id
@@ -54,12 +64,13 @@ resource "aws_api_gateway_resource" "proxy" {
   path_part   = "{proxy+}"
 }
 
-# ANY /{proxy+} — sin auth en API GW, la Lambda valida el JWT
+# ANY /{proxy+} — Cognito Authorizer rechaza requests sin JWT válido
 resource "aws_api_gateway_method" "proxy_any" {
   rest_api_id   = aws_api_gateway_rest_api.chatbot.id
   resource_id   = aws_api_gateway_resource.proxy.id
   http_method   = "ANY"
-  authorization = "NONE"
+  authorization = "COGNITO_USER_POOLS"
+  authorizer_id = aws_api_gateway_authorizer.cognito.id
 }
 
 resource "aws_api_gateway_integration" "proxy" {
@@ -72,7 +83,50 @@ resource "aws_api_gateway_integration" "proxy" {
   timeout_milliseconds    = 29000 # API GW max; Lambda timeout de 60s cubre cold starts
 }
 
-# ANY / (root) — necesario para que /health funcione
+# OPTIONS /{proxy+} — CORS preflight sin auth (los browsers no mandan token en OPTIONS).
+# Respuesta MOCK con headers CORS — no invoca la Lambda.
+resource "aws_api_gateway_method" "proxy_options" {
+  rest_api_id   = aws_api_gateway_rest_api.chatbot.id
+  resource_id   = aws_api_gateway_resource.proxy.id
+  http_method   = "OPTIONS"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "proxy_options" {
+  rest_api_id = aws_api_gateway_rest_api.chatbot.id
+  resource_id = aws_api_gateway_resource.proxy.id
+  http_method = aws_api_gateway_method.proxy_options.http_method
+  type        = "MOCK"
+  request_templates = {
+    "application/json" = "{\"statusCode\": 200}"
+  }
+}
+
+resource "aws_api_gateway_method_response" "proxy_options" {
+  rest_api_id = aws_api_gateway_rest_api.chatbot.id
+  resource_id = aws_api_gateway_resource.proxy.id
+  http_method = aws_api_gateway_method.proxy_options.http_method
+  status_code = "200"
+  response_parameters = {
+    "method.response.header.Access-Control-Allow-Headers" = true
+    "method.response.header.Access-Control-Allow-Methods" = true
+    "method.response.header.Access-Control-Allow-Origin"  = true
+  }
+}
+
+resource "aws_api_gateway_integration_response" "proxy_options" {
+  rest_api_id = aws_api_gateway_rest_api.chatbot.id
+  resource_id = aws_api_gateway_resource.proxy.id
+  http_method = aws_api_gateway_method.proxy_options.http_method
+  status_code = aws_api_gateway_method_response.proxy_options.status_code
+  response_parameters = {
+    "method.response.header.Access-Control-Allow-Headers" = "'Authorization,Content-Type'"
+    "method.response.header.Access-Control-Allow-Methods" = "'GET,POST,OPTIONS'"
+    "method.response.header.Access-Control-Allow-Origin"  = "'${var.frontend_url}'"
+  }
+}
+
+# ANY / (root) — sin auth: solo expone /health para healthchecks externos
 resource "aws_api_gateway_method" "root_any" {
   rest_api_id   = aws_api_gateway_rest_api.chatbot.id
   resource_id   = aws_api_gateway_rest_api.chatbot.root_resource_id
@@ -95,9 +149,25 @@ resource "aws_api_gateway_integration" "root" {
 resource "aws_api_gateway_deployment" "chatbot" {
   rest_api_id = aws_api_gateway_rest_api.chatbot.id
 
+  # Force redeploy cuando cambian recursos del API
+  triggers = {
+    redeploy = sha1(jsonencode([
+      aws_api_gateway_resource.proxy.id,
+      aws_api_gateway_method.proxy_any.id,
+      aws_api_gateway_method.proxy_options.id,
+      aws_api_gateway_method.root_any.id,
+      aws_api_gateway_integration.proxy.id,
+      aws_api_gateway_integration.proxy_options.id,
+      aws_api_gateway_integration.root.id,
+      aws_api_gateway_authorizer.cognito.id,
+    ]))
+  }
+
   depends_on = [
     aws_api_gateway_integration.proxy,
+    aws_api_gateway_integration.proxy_options,
     aws_api_gateway_integration.root,
+    aws_api_gateway_integration_response.proxy_options,
   ]
 
   lifecycle {

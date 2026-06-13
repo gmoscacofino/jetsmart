@@ -21,53 +21,12 @@ variable "environment" {
   }
 }
 
-# ── Networking ────────────────────────────────────────────────────────────────
-
-variable "vpc_cidr" {
-  description = "CIDR block for the VPC"
-  type        = string
-  default     = "10.0.0.0/16"
-}
-
 # ── Lambda ────────────────────────────────────────────────────────────────────
 
 variable "lambda_timeout" {
   description = "Default timeout in seconds for Lambda functions"
   type        = number
   default     = 30
-}
-
-# ── Database ──────────────────────────────────────────────────────────────────
-
-variable "rds_instance_class" {
-  description = "RDS instance class"
-  type        = string
-  default     = "db.t3.micro"
-}
-
-variable "rds_allocated_storage" {
-  description = "Allocated storage in GB for RDS"
-  type        = number
-  default     = 20
-}
-
-variable "rds_db_name" {
-  description = "Name of the initial database in RDS"
-  type        = string
-  default     = "jetsmart_analytics"
-}
-
-variable "rds_username" {
-  description = "Master username for RDS"
-  type        = string
-  default     = "jetsmart_admin"
-  sensitive   = true
-}
-
-variable "rds_password" {
-  description = "Master password for RDS"
-  type        = string
-  sensitive   = true
 }
 
 # ── Secrets ───────────────────────────────────────────────────────────────────

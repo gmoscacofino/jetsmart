@@ -44,13 +44,12 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      # ZIPs placeholder para que filebase64sha256() no falle en validate/test.
-      # No contienen código real — el deploy job construye los layers reales.
-      - name: Create placeholder layer ZIPs
+      # ZIP placeholder para que filebase64sha256() no falle en validate/test.
+      # No contiene código real — el deploy job construye el layer real.
+      - name: Create placeholder layer ZIP
         run: |
           mkdir -p builds
           python3 -c "import zipfile; zipfile.ZipFile('builds/anthropic-layer.zip', 'w').close()"
-          python3 -c "import zipfile; zipfile.ZipFile('builds/psycopg2-layer.zip', 'w').close()"
 
       # -backend=false evita conectarse a S3 — solo inicializa providers
       - name: Terraform Init (sin backend)
@@ -142,7 +141,8 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      # Construye los Lambda Layers reales compilados para Linux x86_64
+      # Construye el Lambda Layer real compilado para Linux x86_64.
+      # En TP4 sólo queda el layer Anthropic — psycopg2 se eliminó junto con RDS.
       - name: Build Lambda Layers
         working-directory: ${{ github.workspace }}
         run: bash scripts/build-layers.sh
@@ -156,63 +156,36 @@ jobs:
             -backend-config="use_lockfile=true" \
             -backend-config="encrypt=true"
 
-      # Los cleanup corren ANTES del plan para que Terraform detecte cualquier
-      # drift generado por la limpieza e incluya la corrección en el mismo plan.
-      # Si corrieran después del plan, las reglas borradas quedarían eliminadas
-      # porque el apply ejecutaría un plan ya desactualizado.
-      - name: Cleanup secrets pendientes de eliminación
+      # Cleanup de secret Anthropic en estado pendiente de eliminación (de runs anteriores).
+      # AWS Secrets Manager bloquea recrear un secret con el mismo nombre si está scheduled-for-deletion.
+      - name: Cleanup secret Anthropic pendiente de eliminación
         if: github.event.inputs.action == 'apply'
         run: |
-          for SECRET in "jetsmart-prod/anthropic-api-key" "jetsmart-prod/rds-credentials"; do
-            DELETED=$(aws secretsmanager describe-secret \
-              --secret-id "$SECRET" --region ${{ env.AWS_REGION }} \
-              --query 'DeletedDate' --output text 2>/dev/null) || true
-            if [ -n "$DELETED" ] && [ "$DELETED" != "None" ]; then
-              echo "Force-deleting pending secret: $SECRET"
-              aws secretsmanager delete-secret \
-                --secret-id "$SECRET" \
-                --force-delete-without-recovery \
-                --region ${{ env.AWS_REGION }} 2>/dev/null && echo "Deleted" || true
-            else
-              echo "Secret $SECRET no está pendiente de eliminación (ok)"
-            fi
-          done
-
-      - name: Cleanup reglas SG inline residuales
-        if: github.event.inputs.action == 'apply'
-        run: |
-          LAMBDA_SG=$(terraform state show aws_security_group.lambda 2>/dev/null \
-            | awk '/^\s+id\s+=/ {gsub(/"/, "", $3); print $3}')
-          PROXY_SG=$(terraform state show aws_security_group.rds_proxy 2>/dev/null \
-            | awk '/^\s+id\s+=/ {gsub(/"/, "", $3); print $3}')
-          [ -z "$LAMBDA_SG" ] && echo "SGs no en state aún, skipping" && exit 0
-          echo "Lambda SG: $LAMBDA_SG | Proxy SG: $PROXY_SG"
-          aws ec2 revoke-security-group-egress \
-            --group-id "$LAMBDA_SG" \
-            --ip-permissions '[{"IpProtocol":"tcp","FromPort":443,"ToPort":443,"IpRanges":[{"CidrIp":"10.0.0.0/16"}]}]' \
-            --region ${{ env.AWS_REGION }} 2>/dev/null \
-            && echo "Removed egress 443 (era inline)" || echo "Egress 443 no presente (ok)"
-          aws ec2 revoke-security-group-ingress \
-            --group-id "$PROXY_SG" \
-            --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":5432,\"ToPort\":5432,\"UserIdGroupPairs\":[{\"GroupId\":\"$LAMBDA_SG\"}]}]" \
-            --region ${{ env.AWS_REGION }} 2>/dev/null \
-            && echo "Removed ingress 5432 (era inline)" || echo "Ingress 5432 no presente (ok)"
+          SECRET="jetsmart-prod/anthropic-api-key"
+          DELETED=$(aws secretsmanager describe-secret \
+            --secret-id "$SECRET" --region ${{ env.AWS_REGION }} \
+            --query 'DeletedDate' --output text 2>/dev/null) || true
+          if [ -n "$DELETED" ] && [ "$DELETED" != "None" ]; then
+            echo "Force-deleting pending secret: $SECRET"
+            aws secretsmanager delete-secret \
+              --secret-id "$SECRET" \
+              --force-delete-without-recovery \
+              --region ${{ env.AWS_REGION }} 2>/dev/null && echo "Deleted" || true
+          else
+            echo "Secret $SECRET no está pendiente de eliminación (ok)"
+          fi
 
       - name: Terraform Plan
         env:
           TF_VAR_anthropic_api_key:   ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
-          TF_VAR_rds_password:        ${{ secrets.TF_VAR_RDS_PASSWORD }}
           TF_VAR_state_bucket_suffix: ${{ secrets.STATE_BUCKET_SUFFIX }}
-
         run: terraform plan -out=tfplan
 
       - name: Terraform Apply
         if: github.event.inputs.action == 'apply'
         env:
           TF_VAR_anthropic_api_key:   ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
-          TF_VAR_rds_password:        ${{ secrets.TF_VAR_RDS_PASSWORD }}
           TF_VAR_state_bucket_suffix: ${{ secrets.STATE_BUCKET_SUFFIX }}
-
         run: terraform apply -auto-approve tfplan
 
       - name: Inject Terraform outputs into config.js
@@ -239,73 +212,36 @@ jobs:
           pip install boto3 -q
           python3 ${{ github.workspace }}/scripts/seed_flights.py "$TABLE"
 
-      - name: Run RDS Migration
+      # Disparo inicial del Glue Crawler — descubre el schema en cuanto haya eventos.
+      # Si el bucket todavía está vacío el crawler termina sin crear tablas (ok).
+      - name: Disparar Glue Crawler inicial
         if: github.event.inputs.action == 'apply'
         run: |
-          FUNCTION=$(terraform output -raw analytics_processor_function_name)
-          PROXY_NAME=$(terraform output -raw rds_proxy_name)
-
-          # Phase 1: esperar a que el proxy exista y esté en estado "available"
-          echo "Esperando a que RDS Proxy esté en estado available..."
-          for i in $(seq 1 24); do
-            STATUS=$(aws rds describe-db-proxies \
-              --db-proxy-name "$PROXY_NAME" \
-              --region ${{ env.AWS_REGION }} \
-              --query 'DBProxies[0].Status' \
-              --output text 2>/dev/null || echo "unknown")
-            echo "Proxy status: $STATUS (intento $i/24)"
-            [ "$STATUS" = "available" ] && break
-            sleep 30
-          done
-          [ "$STATUS" != "available" ] && echo "Proxy no disponible tras 12 min" && exit 1
-
-          # Phase 2: esperar a que el proxy tenga conexión real hacia RDS
-          # describe-db-proxy-targets reporta TargetHealth.State=AVAILABLE solo cuando
-          # el proxy estableció al menos una conexión backend hacia la instancia RDS.
-          echo "Esperando a que RDS Proxy establezca conexión hacia RDS (target health)..."
-          for i in $(seq 1 20); do
-            TARGET_STATE=$(aws rds describe-db-proxy-targets \
-              --db-proxy-name "$PROXY_NAME" \
-              --region ${{ env.AWS_REGION }} \
-              --query 'Targets[0].TargetHealth.State' \
-              --output text 2>/dev/null || echo "unknown")
-            echo "Target health: $TARGET_STATE (intento $i/20)"
-            [ "$TARGET_STATE" = "AVAILABLE" ] && break
-            sleep 30
-          done
-          [ "$TARGET_STATE" != "AVAILABLE" ] && echo "Target health no AVAILABLE tras 10 min" && exit 1
-
-          # Phase 3: invocar migración con backoff exponencial (20s, 40s, 80s, 120s, 120s)
-          DELAY=20
-          for attempt in 1 2 3 4 5; do
-            echo "Migration attempt $attempt/5..."
-            aws lambda invoke \
-              --function-name "$FUNCTION" \
-              --payload '{"migrate": true}' \
-              --cli-binary-format raw-in-base64-out \
-              --cli-read-timeout 300 \
-              --region ${{ env.AWS_REGION }} \
-              response.json
-            cat response.json
-            if grep -q '"migrated"' response.json; then
-              echo "Migration successful on attempt $attempt"
-              exit 0
-            fi
-            [ $attempt -lt 5 ] && echo "Retrying in ${DELAY}s..." && sleep $DELAY
-            DELAY=$(( DELAY * 2 > 120 ? 120 : DELAY * 2 ))
-          done
-          echo "Migration failed after 5 attempts" && exit 1
+          CRAWLER=$(terraform output -raw glue_crawler_name)
+          aws glue start-crawler --name "$CRAWLER" --region ${{ env.AWS_REGION }} 2>/dev/null \
+            && echo "Crawler iniciado: $CRAWLER" \
+            || echo "Crawler ya estaba en ejecución (ok)"
 
       - name: Show Outputs
         if: github.event.inputs.action == 'apply'
         run: |
-          echo "## URLs del deploy" >> $GITHUB_STEP_SUMMARY
-          echo "| Recurso | URL |" >> $GITHUB_STEP_SUMMARY
-          echo "|---------|-----|" >> $GITHUB_STEP_SUMMARY
-          echo "| Frontend | $(terraform output -raw frontend_url) |" >> $GITHUB_STEP_SUMMARY
-          echo "| Chatbot API | $(terraform output -raw chatbot_api_url) |" >> $GITHUB_STEP_SUMMARY
-          echo "| Cognito Hosted UI | $(terraform output -raw cognito_hosted_ui_url) |" >> $GITHUB_STEP_SUMMARY
-          echo "| Auth Callback | $(terraform output -raw auth_callback_url) |" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## URLs del deploy"
+            echo "| Recurso | URL |"
+            echo "|---------|-----|"
+            echo "| Frontend | $(terraform output -raw frontend_url) |"
+            echo "| Chatbot API | $(terraform output -raw chatbot_api_url) |"
+            echo "| Cognito Hosted UI | $(terraform output -raw cognito_hosted_ui_url) |"
+            echo "| Auth Callback | $(terraform output -raw auth_callback_url) |"
+            echo ""
+            echo "## Capa de Analytics"
+            echo "| Recurso | Nombre |"
+            echo "|---------|--------|"
+            echo "| Bucket de eventos | $(terraform output -raw analytics_bucket) |"
+            echo "| Glue Database | $(terraform output -raw glue_database_name) |"
+            echo "| Glue Crawler | $(terraform output -raw glue_crawler_name) |"
+            echo "| Athena Workgroup | $(terraform output -raw athena_workgroup) |"
+          } >> $GITHUB_STEP_SUMMARY
 
   # ── Job 4: Destroy (destruye toda la infraestructura) ─────────────────────
   destroy:
@@ -334,12 +270,11 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      # Para destroy solo se necesitan los ZIPs — no hace falta compilar los layers reales
-      - name: Create placeholder layer ZIPs
+      # Para destroy solo se necesita el ZIP — no hace falta compilar el layer real
+      - name: Create placeholder layer ZIP
         run: |
           mkdir -p builds
           python3 -c "import zipfile; zipfile.ZipFile('builds/anthropic-layer.zip', 'w').close()"
-          python3 -c "import zipfile; zipfile.ZipFile('builds/psycopg2-layer.zip', 'w').close()"
 
       - name: Terraform Init
         run: |
@@ -354,7 +289,8 @@ jobs:
         run: |
           for BUCKET in \
             "jetsmart-prod-$(aws sts get-caller-identity --query Account --output text)-frontend" \
-            "jetsmart-prod-$(aws sts get-caller-identity --query Account --output text)-assets"; do
+            "jetsmart-prod-$(aws sts get-caller-identity --query Account --output text)-assets" \
+            "jetsmart-prod-$(aws sts get-caller-identity --query Account --output text)-analytics"; do
             echo "Vaciando s3://$BUCKET ..."
             aws s3 rm "s3://$BUCKET" --recursive --region ${{ env.AWS_REGION }} 2>/dev/null || true
           done
@@ -362,7 +298,5 @@ jobs:
       - name: Terraform Destroy
         env:
           TF_VAR_anthropic_api_key:   ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
-          TF_VAR_rds_password:        ${{ secrets.TF_VAR_RDS_PASSWORD }}
           TF_VAR_state_bucket_suffix: ${{ secrets.STATE_BUCKET_SUFFIX }}
-
         run: terraform destroy -auto-approve

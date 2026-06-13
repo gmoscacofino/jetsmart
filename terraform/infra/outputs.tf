@@ -48,18 +48,6 @@ output "dynamodb_table_name" {
   value       = aws_dynamodb_table.main.name
 }
 
-output "rds_endpoint" {
-  description = "Endpoint de RDS"
-  value       = aws_db_instance.rds.address
-  sensitive   = true
-}
-
-output "rds_proxy_endpoint" {
-  description = "Endpoint del RDS Proxy (usado por analytics_processor)"
-  value       = aws_db_proxy.main.endpoint
-  sensitive   = true
-}
-
 output "sqs_analytics_url" {
   description = "URL de la cola SQS de analytics"
   value       = aws_sqs_queue.analytics.url
@@ -71,11 +59,28 @@ output "sqs_booking_failed_dlq_url" {
 }
 
 output "analytics_processor_function_name" {
-  description = "Nombre de la Lambda analytics-processor (para migración manual)"
+  description = "Nombre de la Lambda analytics-processor"
   value       = aws_lambda_function.analytics_processor.function_name
 }
 
-output "rds_proxy_name" {
-  description = "Nombre del RDS Proxy (para polling de disponibilidad en el workflow)"
-  value       = aws_db_proxy.main.name
+# ── Analytics: S3 + Glue + Athena ─────────────────────────────────────────────
+
+output "analytics_bucket" {
+  description = "Bucket S3 donde analytics-processor escribe los eventos crudos"
+  value       = aws_s3_bucket.analytics.bucket
+}
+
+output "glue_database_name" {
+  description = "Database de Glue Data Catalog usado por Athena"
+  value       = aws_glue_catalog_database.analytics.name
+}
+
+output "glue_crawler_name" {
+  description = "Nombre del Glue Crawler (start-crawler para refrescar schema)"
+  value       = aws_glue_crawler.events.name
+}
+
+output "athena_workgroup" {
+  description = "Workgroup de Athena del equipo de business analytics"
+  value       = aws_athena_workgroup.analytics.name
 }

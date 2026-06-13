@@ -1,5 +1,5 @@
 output "api_url" {
-  description = "Base URL of the chatbot API Gateway (add /api/chat, /api/admin/metrics, etc.)"
+  description = "Base URL of the chatbot API Gateway (add /api/chat, /api/reservations, /api/payment)"
   value       = aws_api_gateway_stage.prod.invoke_url
 }
 

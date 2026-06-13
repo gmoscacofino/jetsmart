@@ -8,12 +8,4 @@ locals {
     Environment = var.environment
     ManagedBy   = "Terraform"
   }
-
-  # AZs disponibles (primeras 2 de la región)
-  azs = slice(data.aws_availability_zones.available.names, 0, 2)
-
-  # CIDRs de subnets calculados automáticamente desde el CIDR de la VPC
-  public_subnet_cidrs          = [cidrsubnet(var.vpc_cidr, 8, 1)]
-  private_compute_subnet_cidrs = [for i in range(2) : cidrsubnet(var.vpc_cidr, 8, i + 3)]
-  private_data_subnet_cidrs    = [for i in range(2) : cidrsubnet(var.vpc_cidr, 8, i + 5)]
 }

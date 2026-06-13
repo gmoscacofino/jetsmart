@@ -1,4 +1,4 @@
-# 07 — Capa de datos: DynamoDB y RDS
+# 07 — Capa de datos: DynamoDB + Data Lake (S3 + Athena)
 
 ---
 
@@ -24,8 +24,6 @@ Esto requiere diseñar el esquema **en función de los access patterns**: primer
 | Reclamo de usuario | `USER#{userId}` | `CLAIM#{claimId}` | Reclamo registrado por el chatbot |
 | Mensaje de chat | `SESSION#{sessionId}` | `MSG#{ISO-timestamp}#{uuid8}` | Historial de conversación con TTL de 7 días |
 | Vuelo disponible (mock) | `FLIGHT#{origen}#{destino}` | `DATE#{fecha}` | Datos de vuelo con contador de asientos |
-| Agregado diario (analytics) | `ANALYTICS#DAILY` | `DATE#{yyyy-mm-dd}` | Contadores de mensajes, búsquedas, compras, check-ins, reclamos e ingresos |
-| Ruta top (analytics) | `ANALYTICS#ROUTES` | `ROUTE#{ruta}` | Conteo de búsquedas y compras por ruta (ej: `AEP-MDZ`) |
 
 ---
 
@@ -49,10 +47,6 @@ Esto requiere diseñar el esquema **en función de los access patterns**: primer
 | AP14 | Confirmar reserva → CONFIRMADA | payment_processor (ConfirmBooking) | UpdateItem | `USER#{userId}` | `RESERVATION#{reservationId}` |
 | AP15 | Cancelar reserva → CANCELADA | payment_processor (CancelBooking) | UpdateItem | `USER#{userId}` | `RESERVATION#{reservationId}` |
 | AP16 | Liberar asientos (rollback) | payment_processor (ReleaseFlight) | UpdateItem | `FLIGHT#{origen}#{destino}` | `DATE#{fecha}` |
-| AP17 | Actualizar agregados diarios (ADD atómico) | analytics_processor | UpdateItem | `ANALYTICS#DAILY` | `DATE#{hoy}` |
-| AP18 | Actualizar top rutas (ADD atómico) | analytics_processor | UpdateItem | `ANALYTICS#ROUTES` | `ROUTE#{ruta}` |
-| AP19 | Leer métricas del dashboard (últimos 30 días) | chat_handler (admin) | Query | `ANALYTICS#DAILY` | begins_with `DATE#`, Limit=30, DESC |
-| AP20 | Leer top 5 rutas (dashboard) | chat_handler (admin) | Query | `ANALYTICS#ROUTES` | Limit=5, DESC |
 
 ---
 
@@ -122,23 +116,7 @@ duracion              : "2h 10m"
 aerolinea             : "JetSmart"
 ```
 
-**Agregado diario** (`ANALYTICS#DAILY` / `DATE#{yyyy-mm-dd}`)
-```
-searches        : entero — mensajes de chat del día (ADD atómico)
-flight_searches : entero — búsquedas de vuelo (tool search_flights) del día (ADD atómico)
-purchases       : entero — compras confirmadas del día (ADD atómico)
-checkins        : entero — check-ins realizados del día (ADD atómico)
-claims          : entero — reclamos iniciados del día (ADD atómico)
-revenue         : Decimal — ingresos del día (ADD atómico)
-```
-
-**Ruta top** (`ANALYTICS#ROUTES` / `ROUTE#{ruta}`)
-```
-route    : "AEP-MDZ"
-count    : entero — total de interacciones (búsquedas + compras) (ADD atómico)
-searches : entero — búsquedas de vuelo en esa ruta (ADD atómico)
-purchases: entero — compras confirmadas en esa ruta (ADD atómico)
-```
+> En TP3 había dos entidades adicionales (`ANALYTICS#DAILY` y `ANALYTICS#ROUTES`) que el dashboard admin leía. En TP4 fueron eliminadas — el equipo de business analytics consume los mismos datos vía Athena sobre S3, no via DynamoDB.
 
 ---
 
@@ -210,17 +188,6 @@ Si dos usuarios intentan reservar el último asiento simultáneamente, DynamoDB 
 }
 ```
 
-**Agregado diario:**
-```json
-{
-  "PK": "ANALYTICS#DAILY",
-  "SK": "DATE#2026-05-15",
-  "searches": 142,
-  "purchases": 8,
-  "revenue": "960.00"
-}
-```
-
 ---
 
 ### Configuración de la tabla
@@ -234,52 +201,57 @@ Si dos usuarios intentan reservar el último asiento simultáneamente, DynamoDB 
 
 ---
 
-## RDS PostgreSQL — Log de eventos para analytics
+## Data Lake — S3 + Glue + Athena (analytics histórico)
+
+> **Cambio respecto al TP3:** este capa reemplaza al **RDS PostgreSQL** (`eventos_chat` table) y al **RDS Proxy** del TP3. La razón está en `docs/02-arquitectura-general.md` ("Decisiones de arquitectura"): el patrón correcto para business analytics es un data lake serverless, no un OLTP postgres.
 
 ### Rol dentro de la arquitectura
 
-RDS almacena el **log detallado** de cada evento para el dashboard del administrador. El flujo es:
+Los eventos del chatbot se acumulan en S3 para consumo offline del equipo de business analytics:
 
 ```
-chat_handler / confirm_booking_handler
-        ↓ SNS publish (event_type, user_id, payload)
+chat_handler / confirm_booking_handler / cancel_booking_handler / ...
+        ↓ SNS publish (event_type, user_id, timestamp, payload)
     SNS events topic
         ↓ fan-out
-    SQS analytics (buffer, batch_size=10)
+    SQS analytics (buffer, batch_size=10, DLQ)
         ↓ trigger
-analytics_processor Lambda (dentro de VPC)
+analytics_processor Lambda (regional, sin VPC)
+        ↓ put_object (JSON Lines)
+    s3://...-analytics/events/dt=YYYY-MM-DD/hh=HH/<uuid>.jsonl
+        ↓ cron(0 * * * ? *) (cada hora)
+    Glue Crawler
+        ↓ descubre schema + particiones
+    Glue Data Catalog (database: jetsmart_prod_analytics, table: events)
         ↓
-    eventos_chat (RDS)    +    ANALYTICS#DAILY / ANALYTICS#ROUTES (DynamoDB)
+    Athena Workgroup
+        ↓ JDBC
+    Equipo Business Analytics (DBeaver / DataGrip)
 ```
-
-El dashboard del admin **lee desde DynamoDB** (agregados pre-computados), no desde RDS. RDS sirve para consultas ad-hoc futuras sobre el log completo.
 
 ---
 
-### Schema real (de `analytics_processor.py`)
+### Esquema descubierto por el Glue Crawler
 
-```sql
-CREATE TABLE IF NOT EXISTS eventos_chat (
-    id          BIGSERIAL    PRIMARY KEY,
-    tipo_evento VARCHAR(50)  NOT NULL,
-    usuario_id  VARCHAR(100) NOT NULL,
-    timestamp   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    datos       JSONB,
-    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-);
+El crawler inspecciona los `.jsonl` y crea la tabla `events` con columnas inferidas:
 
-CREATE INDEX IF NOT EXISTS idx_eventos_tipo      ON eventos_chat (tipo_evento);
-CREATE INDEX IF NOT EXISTS idx_eventos_usuario   ON eventos_chat (usuario_id);
-CREATE INDEX IF NOT EXISTS idx_eventos_timestamp ON eventos_chat (timestamp);
-```
+| Columna | Tipo Athena | Origen |
+|---|---|---|
+| `event_type` | string | Campo `event_type` del mensaje SNS |
+| `user_id` | string | Campo `user_id` |
+| `timestamp` | string (ISO-8601) | Campo `timestamp` |
+| `payload` | struct (anidado) | Campo `payload` (estructura variable según tipo de evento) |
+| `ingested_at` | string (ISO-8601) | Agregado por `analytics-processor` en el momento de la escritura |
+| `dt` | string (partition) | `YYYY-MM-DD` — particionada del path S3 |
+| `hh` | string (partition) | `HH` — particionada del path S3 |
 
-El schema se aplica automáticamente en cada `terraform apply` mediante `aws_lambda_invocation` que invoca `analytics_processor` con `{"migrate": true}`.
+> **Por qué particiones Hive-style:** Athena hace *partition pruning* automático cuando la query filtra por `dt` o `hh`. Una query que escanea solo `dt = '2026-06-13'` lee únicamente los archivos de ese día — no hace full-scan del bucket. Esto reduce el costo de Athena drásticamente.
 
 ---
 
-### Tipos de eventos y estructura de `datos`
+### Tipos de eventos y estructura de `payload`
 
-| tipo_evento | Quién publica | Estructura de `datos` |
+| event_type | Quién publica | Estructura de `payload` |
 |---|---|---|
 | `chat_message` | `chat_handler` — cada turno de conversación | `{ "session_id": "...", "message_length": 42 }` |
 | `purchase_complete` | `payment_processor` (ConfirmBooking, Saga paso 4) | `{ "amount": 120.0 }` |
@@ -287,31 +259,61 @@ El schema se aplica automáticamente en cada `terraform apply` mediante `aws_lam
 | `checkin_realizado` | `chat_handler` — al ejecutar tool `check_in` | `{ "reservation_id": "RES-XXXX", "flight_number": "JA101", "origin": "AEP", "destination": "MDZ" }` |
 | `reclamo_iniciado` | `chat_handler` — al ejecutar tool `create_claim` | `{ "claim_id": "CLM-XXXX", "tipo": "equipaje_perdido", "reservation_id": "RES-XXXX" }` |
 
-El campo `datos` viene del campo `payload` del evento SNS. Los campos de alto nivel (`user_id`, `timestamp`) se mapean a columnas directas; el resto va a `datos` como JSONB.
-
 ---
 
-### Ejemplo de registro en RDS
+### Ejemplo de archivo en S3
 
-```sql
-SELECT * FROM eventos_chat WHERE tipo_evento = 'purchase_complete' LIMIT 1;
+`s3://jetsmart-prod-123456789012-analytics/events/dt=2026-06-13/hh=14/abc-def-123.jsonl`:
 
- id | tipo_evento       | usuario_id                          | timestamp            | datos           | created_at
-----+-------------------+-------------------------------------+----------------------+-----------------+------------------
-  1 | purchase_complete | us-east-1:a1b2c3d4-e5f6-...        | 2026-05-15 14:35:00Z | {"amount": 120} | 2026-05-15T14:35Z
+```json
+{"event_type":"chat_message","user_id":"us-east-1:a1b2-...","timestamp":"2026-06-13T14:35:00Z","payload":{"session_id":"sess-1","message_length":42},"ingested_at":"2026-06-13T14:35:02Z"}
+{"event_type":"busqueda_vuelo","user_id":"us-east-1:a1b2-...","timestamp":"2026-06-13T14:35:10Z","payload":{"origen":"AEP","destino":"MDZ","fecha":"2026-06-20","pasajeros":1,"ruta":"AEP-MDZ"},"ingested_at":"2026-06-13T14:35:11Z"}
+{"event_type":"purchase_complete","user_id":"us-east-1:a1b2-...","timestamp":"2026-06-13T14:36:01Z","payload":{"amount":120.0},"ingested_at":"2026-06-13T14:36:02Z"}
 ```
 
 ---
 
-### Configuración de RDS
+### Queries de ejemplo desde Athena
+
+```sql
+-- Eventos por tipo, últimos 7 días
+SELECT event_type, COUNT(*) AS cantidad
+FROM jetsmart_prod_analytics.events
+WHERE dt >= date_format(current_date - interval '7' day, '%Y-%m-%d')
+GROUP BY event_type
+ORDER BY cantidad DESC;
+
+-- Compras totales del último mes
+SELECT
+  SUM(CAST(json_extract_scalar(payload, '$.amount') AS DOUBLE)) AS revenue_usd,
+  COUNT(*) AS purchases
+FROM jetsmart_prod_analytics.events
+WHERE event_type = 'purchase_complete'
+  AND dt >= date_format(current_date - interval '30' day, '%Y-%m-%d');
+
+-- Búsquedas más frecuentes por ruta
+SELECT
+  json_extract_scalar(payload, '$.ruta') AS ruta,
+  COUNT(*) AS busquedas
+FROM jetsmart_prod_analytics.events
+WHERE event_type = 'busqueda_vuelo'
+  AND dt >= date_format(current_date - interval '30' day, '%Y-%m-%d')
+GROUP BY 1
+ORDER BY busquedas DESC
+LIMIT 10;
+```
+
+---
+
+### Configuración
 
 | Parámetro | Valor | Razón |
 |---|---|---|
-| Engine | PostgreSQL 15 | Soporte nativo JSONB, funciones analíticas |
-| Instance class | `db.t3.micro` | Suficiente para el TP, costo mínimo en Academy |
-| Storage | 20 GB gp2 | Mínimo suficiente |
-| Multi-AZ | Deshabilitado | Reduce costo en Academy (no hay SLA real) |
-| Subnet | Privada (datos) | Sin acceso directo desde internet |
-| Acceso | Solo desde analytics_processor (VPC) + Bastion (SSM) | Security group restrictivo |
-| Encriptación at rest | Habilitado (AWS managed key) | Sin costo adicional |
-| Credenciales | Secrets Manager (`jetsmart/rds/credentials`) | Nunca hardcodeadas en código |
+| Formato | JSON Lines (`.jsonl`) | Simple, sin layers extras; Athena lo lee nativo |
+| Particionamiento | `dt=YYYY-MM-DD/hh=HH` | Partition pruning automático |
+| Encriptación at rest | AES-256 (SSE-S3) | Sin costo adicional |
+| Lifecycle | Glacier después de 90 días | Costo mínimo para retención histórica |
+| Crawler schedule | `cron(0 * * * ? *)` | Cada hora — balance entre frescura y costo |
+| Athena Workgroup | `jetsmart-prod-analytics` | Aislamiento de results y cost tracking del equipo |
+| Result location | `s3://...-analytics/athena-results/` | Resultados expiran a los 14 días |
+| Acceso | LabRole (Lambda) + LabRole (Crawler) + cliente SQL externo | IAM least-privilege |

@@ -28,7 +28,7 @@ resource "aws_cloudwatch_log_group" "this" {
 
 resource "aws_cloudwatch_metric_alarm" "analytics_processor_errors" {
   alarm_name          = "${local.name_prefix}-analytics-processor-errors"
-  alarm_description   = "Analytics processor Lambda errors — posible fallo de migración RDS o escritura SQS"
+  alarm_description   = "Analytics processor Lambda errors — posible fallo de escritura a S3 o lectura SQS"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
   metric_name         = "Errors"

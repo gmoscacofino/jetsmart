@@ -61,6 +61,11 @@ variable "frontend_url" {
 }
 
 variable "cognito_user_pool_id" {
-  description = "Cognito User Pool ID for JWT issuer validation"
+  description = "Cognito User Pool ID — pasado a la Lambda como env var (legacy, informativo)"
+  type        = string
+}
+
+variable "cognito_user_pool_arn" {
+  description = "Cognito User Pool ARN — usado por el API Gateway Cognito Authorizer"
   type        = string
 }

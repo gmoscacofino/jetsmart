@@ -1,7 +1,12 @@
 # ── Lambda: Analytics Processor ───────────────────────────────────────────────
 #
 # Disparada por SQS cuando llegan mensajes del SNS events (chat).
-# Escribe agregados en RDS. Debe estar en la VPC para acceder a RDS.
+# Escribe los eventos crudos en S3 (JSON Lines particionado por fecha) para que
+# Glue Crawler los catalogue y el equipo de business analytics los consulte vía
+# Athena con cliente SQL (DBeaver / DataGrip).
+#
+# Sin VPC: la Lambda sólo necesita acceso a S3 y SQS — servicios regionales
+# accesibles directamente desde Lambda gestionada por AWS.
 
 data "archive_file" "analytics_processor" {
   type        = "zip"
@@ -16,26 +21,17 @@ resource "aws_lambda_function" "analytics_processor" {
   runtime          = "python3.12"
   handler          = "analytics_processor.handler"
   role             = data.aws_iam_role.lab_role.arn
-  timeout          = 300
-  layers           = [aws_lambda_layer_version.psycopg2.arn]
-
-  vpc_config {
-    subnet_ids         = slice(module.vpc.private_subnets, 0, 2)
-    security_group_ids = [aws_security_group.lambda.id]
-  }
+  timeout          = 120
 
   environment {
     variables = {
-      AWS_REGION_VAR     = var.aws_region
-      RDS_SECRET_ARN     = aws_secretsmanager_secret.rds_credentials.arn
-      RDS_PROXY_ENDPOINT = aws_db_proxy.main.endpoint
+      AWS_REGION_VAR   = var.aws_region
+      ANALYTICS_BUCKET = aws_s3_bucket.analytics.bucket
+      ANALYTICS_PREFIX = "events"
     }
   }
 
-  depends_on = [
-    aws_db_proxy.main,
-    aws_secretsmanager_secret_version.rds_credentials,
-  ]
+  depends_on = [aws_s3_bucket.analytics]
 }
 
 resource "aws_lambda_event_source_mapping" "analytics_sqs" {

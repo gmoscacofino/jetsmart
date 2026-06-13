@@ -3,9 +3,11 @@
 # Uso: ./scripts/build-layers.sh
 # Requiere: pip3, Python 3.12, zip
 #
-# Genera dos ZIPs en terraform/infra/builds/:
+# Genera un ZIP en terraform/infra/builds/:
 #   anthropic-layer.zip  — SDK de Anthropic (usado por chat-handler)
-#   psycopg2-layer.zip   — Driver PostgreSQL (usado por analytics-processor)
+#
+# Nota: la validación JWT manual (python-jose) se eliminó cuando se activó el
+# Cognito Authorizer en API Gateway. La validación ahora la hace AWS.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -35,8 +37,7 @@ build_layer() {
   echo "    Listo: $(du -sh "$BUILDS_DIR/${name}-layer.zip" | cut -f1)"
 }
 
-build_layer "anthropic" "anthropic" "python-jose[cryptography]"
-build_layer "psycopg2"  "psycopg2-binary"
+build_layer "anthropic" "anthropic"
 
 echo ""
 echo "Layers disponibles en $BUILDS_DIR:"
