@@ -110,6 +110,7 @@ Si S3 falla (caso muy raro), el mensaje vuelve a SQS para reintento. Después de
 | 1 | S3 — frontend | Storage / Edge | Archivos estáticos del sitio web (HTML/CSS/JS). HTTP. |
 | 2 | S3 — assets | Storage | Boarding passes generados y system prompt del chatbot. |
 | 3 | S3 — analytics | Storage / Data lake | Eventos crudos en JSON Lines, particionado por `dt=YYYY-MM-DD/hh=HH`. |
+| 3b | S3 — backups | Storage / Backup | Exports diarios de DynamoDB (Hive-path `dynamodb/YYYY-MM-DD/...`). Lifecycle: 90d STANDARD → GLACIER → expira a 365d. |
 | 4 | Cognito User Pool | Auth | Registro y login con Hosted UI. |
 | 5 | Cognito Groups | Auth | `users` (chatbot). |
 | 6 | API Gateway — chatbot | Cómputo / Edge | Endpoint HTTPS `/api/*` → invoca chat-handler. **Protegido por Cognito Authorizer.** |
@@ -127,7 +128,9 @@ Si S3 falla (caso muy raro), el mensaje vuelve a SQS para reintento. Después de
 | 18 | Lambda — analytics-processor | Cómputo | Consume SQS, escribe S3 JSON Lines. |
 | 19 | Lambda — auth-callback | Cómputo | Bridge HTTPS del workaround. Intercambia code por tokens. |
 | 20 | Lambda — cognito-trigger | Cómputo | Post-registro: asigna grupo `users`. |
+| 20b | Lambda — backup-dynamodb | Cómputo | Disparada por EventBridge cron diario. Llama a `dynamodb:ExportTableToPointInTime` contra el bucket de backups. |
 | 21 | Step Functions | Orquestación | State machine del patrón Saga (reserva y pago). |
+| 21b | EventBridge Rule — backup-dynamodb-daily | Orquestación / Scheduling | Cron `0 3 * * ? *` (03:00 UTC). Único trigger basado en tiempo del sistema. |
 | 22 | SNS — events | Mensajería | Eventos del chat (mensajes, compras) → fan-out a SQS analytics. |
 | 23 | SNS — notifications | Mensajería | Notificaciones al usuario (booking confirmado / fallido). |
 | 24 | SQS — analytics | Mensajería | Buffer de eventos hacia analytics-processor. |
@@ -140,7 +143,7 @@ Si S3 falla (caso muy raro), el mensaje vuelve a SQS para reintento. Después de
 | 31 | Secrets Manager | Seguridad | API key Anthropic. |
 | 32 | Lambda Layer — anthropic | Cómputo | SDK de Anthropic compilado para Python 3.12. |
 | 33 | IAM — LabRole | Seguridad | Rol preexistente de AWS Academy — compartido por todas las Lambdas. |
-| 34 | CloudWatch (13 log groups) | Observabilidad | Logs de todas las Lambdas con retención de 30 días, creados con `for_each`. |
+| 34 | CloudWatch (14 log groups) | Observabilidad | Logs de todas las Lambdas con retención de 30 días. 13 vía `for_each` + 1 para `backup-dynamodb`. |
 
 ---
 
@@ -204,6 +207,21 @@ Si S3 falla (caso muy raro), el mensaje vuelve a SQS para reintento. Después de
                                                               ↓ SQL
                                               Equipo Business Analytics
                                               (DBeaver / DataGrip)
+
+                          Backups de DynamoDB:
+                          EventBridge cron(0 3 * * ? *)
+                                  │ invoke
+                                  ↓
+                          Lambda backup-dynamodb
+                                  │ ExportTableToPointInTime (async)
+                                  ↓
+                          DynamoDB service (lee PITR)
+                                  │ put_object
+                                  ↓
+                          S3 jetsmart-backups/dynamodb/YYYY-MM-DD/...
+                                  │ lifecycle
+                                  ↓
+                          90d → GLACIER → 365d expira
 ```
 
 **Sin VPC.** Toda la seguridad la garantizan: IAM (LabRole con least-privilege por servicio), Cognito (autenticación), Cognito Authorizer (autorización a nivel de API), encriptación en tránsito (HTTPS de API Gateway, TLS de servicios AWS), encriptación en reposo (S3 SSE-S3, DynamoDB SSE).
