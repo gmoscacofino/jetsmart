@@ -24,8 +24,7 @@ resource "aws_cognito_user_pool" "main" {
 
 locals {
   cognito_groups = {
-    users  = "Usuarios finales del chatbot"
-    admins = "Administradores con acceso al dashboard de analytics"
+    users = "Usuarios finales del chatbot"
   }
 }
 
