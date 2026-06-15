@@ -40,8 +40,19 @@ const Auth = (() => {
     },
 
     logout() {
+      // Limpiar el token local primero — si algo del flujo Cognito falla,
+      // el user al menos queda sin token en el browser.
       localStorage.removeItem(TOKEN_KEY);
-      window.location.href = CONFIG.frontendUrl;
+      sessionStorage.removeItem('oauth_state');
+      // Disparar el logout de Cognito para invalidar la cookie de sesión
+      // del Hosted UI. Sin esto, un nuevo "Login" auto-loguea sin password.
+      // Después del logout, Cognito redirige a logout_uri (registrado en el
+      // User Pool Client) — debe ser exactamente CONFIG.frontendUrl.
+      const params = new URLSearchParams({
+        client_id:  CONFIG.clientId,
+        logout_uri: CONFIG.frontendUrl,
+      });
+      window.location.href = `${CONFIG.cognitoDomain}/logout?${params}`;
     },
 
     // Called from App.init() when URL hash contains tokens

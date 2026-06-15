@@ -49,7 +49,10 @@ resource "aws_cognito_user_pool_client" "frontend" {
   allowed_oauth_scopes                 = ["email", "openid", "profile"]
 
   callback_urls = ["https://${aws_api_gateway_rest_api.auth.id}.execute-api.${var.aws_region}.amazonaws.com/${var.environment}/callback"]
-  logout_urls   = ["https://${aws_api_gateway_rest_api.auth.id}.execute-api.${var.aws_region}.amazonaws.com/${var.environment}/logout"]
+  # logout_uri al que Cognito redirige DESPUÉS de invalidar la sesión del Hosted UI.
+  # El frontend hace Auth.logout() → ${cognitoDomain}/logout?logout_uri=FRONTEND_URL
+  # Cognito valida que logout_uri match exacto contra esta lista antes de redirigir.
+  logout_urls = [var.frontend_url]
 
   supported_identity_providers = ["COGNITO"]
 
