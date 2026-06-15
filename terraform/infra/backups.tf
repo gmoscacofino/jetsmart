@@ -23,6 +23,11 @@
 #   -   90 días: GLACIER       (retrieval 3-5 h)
 #   -  365 días: DEEP_ARCHIVE  (retrieval 12 h, costo mínimo)
 #   - 3650 días: expira
+#
+# Versionado: enabled. Protege contra DELETE/PUT accidental sobre objetos
+# existentes. Como los exports usan paths con fecha (YYYY-MM-DD), la misma key
+# no se sobreescribe en operación normal — las versiones no-current solo
+# aparecen ante intervención manual, por eso se expiran a los 90 días.
 
 # ── S3: bucket dedicado de backups ────────────────────────────────────────────
 
@@ -38,6 +43,14 @@ resource "aws_s3_bucket_public_access_block" "backups" {
   block_public_policy     = true
   ignore_public_acls      = true
   restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_versioning" "backups" {
+  bucket = aws_s3_bucket.backups.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
 }
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "backups" {
@@ -74,8 +87,33 @@ resource "aws_s3_bucket_lifecycle_configuration" "backups" {
       storage_class = "DEEP_ARCHIVE"
     }
 
-    expiration { days = 3650 }
+    expiration {
+      days                         = 3650
+      expired_object_delete_marker = false
+    }
+
+    noncurrent_version_transition {
+      noncurrent_days = 30
+      storage_class   = "GLACIER"
+    }
+
+    noncurrent_version_expiration {
+      noncurrent_days = 90
+    }
   }
+
+  rule {
+    id     = "expire-orphan-delete-markers"
+    status = "Enabled"
+
+    filter {}
+
+    expiration {
+      expired_object_delete_marker = true
+    }
+  }
+
+  depends_on = [aws_s3_bucket_versioning.backups]
 }
 
 # ── Lambda: backup-dynamodb ───────────────────────────────────────────────────
