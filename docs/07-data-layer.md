@@ -1,29 +1,86 @@
-# 07 — Capa de datos: DynamoDB + Data Lake (S3 + Athena)
+# 07 — Capa de datos: DynamoDB (dos tablas, bounded contexts) + Data Lake (S3 + Athena)
+
+> **Cambio TP4:** la única tabla DynamoDB del TP3 se separó en **dos tablas single-design**, una por bounded context. El esquema de reservas migró a un patrón **PNR-céntrico** (record locator de 6 chars, à la Navitaire/Amadeus), con 3 GSIs en la tabla de negocio.
 
 ---
 
-## DynamoDB — Single Table Design
+## DynamoDB — Dos tablas (Conversations + Business / PSS-like)
 
-### Por qué Single Table Design
+### Por qué dos tablas y no una
 
-En DynamoDB, la práctica recomendada es usar una sola tabla para toda la aplicación. DynamoDB cobra por operación — si una pantalla necesita datos de tres tablas distintas, son tres lecturas. Con Single Table Design, todo lo que necesita una operación está en una sola query.
+El TP3 usaba single-table design para todo el sistema. Al introducir las features de TP4 (derivación a humano, notificaciones proactivas), quedó claro que el dominio tenía **dos contextos lógicos** distintos:
 
-Esto requiere diseñar el esquema **en función de los access patterns**: primero se listan todas las consultas que va a hacer la aplicación, y de ahí se derivan las claves.
+| Contexto | Característica | Datos |
+|---|---|---|
+| **Conversations** | Estado efímero del canal chatbot | Sesiones, mensajes, perfil chat-scoped, escalaciones a humano |
+| **Business (PSS-like)** | Estado persistente del dominio de aerolínea | Vuelos, reservas (PNRs), pasajeros (CRM), reclamos, boarding passes |
+
+Cada contexto tiene **retention, scaling y propiedad** distintas. La tabla de conversations es propiedad del canal "chatbot" — si mañana ese chatbot se reemplaza por otro stack, los datos son portables. La tabla de business es propiedad de la aerolínea — la comparten todos los canales (chatbot, web, app, IVR, call center).
+
+Cada tabla **sí** mantiene single-table design dentro de su contexto — distintas entidades comparten PK/SK con prefijos.
+
+### Beneficios concretos del split
+
+- **Failure isolation**: si la tabla de chat se satura/throttle, no afecta las reservas. Y viceversa.
+- **Retention independiente**: TTL agresivo en conversations (7d msgs, 30d handoffs) vs persistencia en business.
+- **Backup window independiente**: ambas tienen PITR + export diario, pero podrían divergir.
+- **Cost attribution**: cuánto cuesta operar el canal chatbot vs el core de negocio.
+- **Encryption key independiente**: hoy ambas usan SSE-S3, pero podrían usar KMS distintas (compliance segmentation).
+- **Reemplazabilidad del chatbot**: la conversation table es completamente desechable si se reemplaza el canal.
 
 ---
 
-### Entidades y claves
+### Tabla 1 — `jetsmart-prod-conversations`
 
-**Tabla: `jetsmart`**
+Estado efímero del chatbot. PK/SK, **sin GSIs**, TTL en todos los items.
+
+| Entidad | PK | SK | TTL | Descripción |
+|---|---|---|---|---|
+| Mensaje de chat | `SESSION#{session_id}` | `MSG#{ts}#{uuid8}` | 7d | Historial conversacional (igual que TP3) |
+| Perfil chat-scoped | `USER#{user_id}` | `#METADATA` | 30d | Email + last_seen — fuente para el LLM context |
+| **Handoff ticket (TP4)** | `SESSION#{session_id}` | `HANDOFF#{ts}#{handoff_id}` | 30d | Ticket de derivación a humano (status=QUEUED → ACK) |
+| **Handoff pointer (TP4)** | `USER#{user_id}` | `HANDOFF#{handoff_id}` | 30d | Thin pointer para "mis tickets de soporte" |
+
+---
+
+### Tabla 2 — `jetsmart-prod-business` (PSS-like)
+
+Estado persistente del dominio. PK/SK, **3 GSIs**, sin TTL.
 
 | Entidad | PK | SK | Descripción |
 |---|---|---|---|
-| Perfil de usuario | `USER#{userId}` | `#METADATA` | Email y última actividad, escrito en cada chat |
-| Pasajero guardado | `USER#{userId}` | `PASSENGER#{nombre_normalizado}` | Auto-guardado al confirmar una reserva |
-| Reserva de usuario | `USER#{userId}` | `RESERVATION#{reservationId}` | Booking completo creado por la Saga |
-| Reclamo de usuario | `USER#{userId}` | `CLAIM#{claimId}` | Reclamo registrado por el chatbot |
-| Mensaje de chat | `SESSION#{sessionId}` | `MSG#{ISO-timestamp}#{uuid8}` | Historial de conversación con TTL de 7 días |
-| Vuelo disponible (mock) | `FLIGHT#{origen}#{destino}` | `DATE#{fecha}` | Datos de vuelo con contador de asientos |
+| Vuelo (inventario) | `FLIGHT#{origen}#{destino}` | `DATE#{fecha}#FLIGHT#{vuelo_numero}` | Schedule + status + asientos |
+| **PNR canónico (TP4)** | `PNR#{pnr}` | `#METADATA` | Record locator (6 chars, ej `JS7K2P`) con `user_id`, `status`, `total` |
+| **PNR segment (TP4)** | `PNR#{pnr}` | `SEGMENT#{seq}#{vuelo}#{fecha}` | Leg del PNR (incluye `gsi2pk` para "quién está en vuelo X") |
+| **PNR passenger (TP4)** | `PNR#{pnr}` | `PAX#{seq}` | Pasajero del PNR (incluye `gsi3pk` para buscar por DNI) |
+| **PNR boarding pass (TP4)** | `PNR#{pnr}` | `BP#{seq}` | Referencia al BP en S3 (`s3_key`, `bp_url`, `issued_at`) |
+| **User reservation pointer (TP4)** | `USER#{user_id}` | `RESERVATION#{pnr}` | Thin pointer denormalizado para "mis reservas" |
+| **Passenger CRM (TP4)** | `PASSENGER#{dni}` | `#PROFILE` | Frequent flyer canónico (full_name, email, phone, total_bookings) |
+| **Passenger booking history (TP4)** | `PASSENGER#{dni}` | `PNR#{pnr}` | Back-ref histórico |
+| **Claim canónico (TP4)** | `CLAIM#{claim_id}` | `#METADATA` | Reclamo (movido desde USER#) |
+| **User claim pointer (TP4)** | `USER#{user_id}` | `CLAIM#{claim_id}` | Thin pointer "mis reclamos" |
+
+### GSIs de la business table (3)
+
+| GSI | HK (`gsi*pk`) | RK (`gsi*sk`) | Projection | Caller |
+|---|---|---|---|---|
+| **GSI1 `FlightByNumber`** | `vuelo_numero` | `fecha` | INCLUDE (estado_vuelo, puerta, demora, horario_real, origen, destino) | chat_handler para status, `cancel_flight.py` para localizar el FLIGHT a marcar |
+| **GSI2 `ReservationsByFlight`** | `FLIGHT#{vuelo}#{fecha}` | `PNR#{pnr}` | INCLUDE (user_id, email, passenger_name, status) | `proactive_notifications` — "qué pasajeros tengo en el vuelo cancelado" |
+| **GSI3 `ReservationsByPassenger`** | `DNI#{dni}` o `EMAIL#{email}` | `PNR#{pnr}` | KEYS_ONLY | call center / chatbot — buscar PNR por DNI/email del pasajero |
+
+> **El GSI clave de TP4 es GSI2.** Sin él, encontrar "todos los PNRs en el vuelo JA203 del 2026-06-20" requiere Scan O(n) sobre la tabla entera. Con GSI2 es una sola Query O(log n) — el atributo `gsi2pk` se estampa en cada SEGMENT# al crear el booking.
+
+---
+
+### Por qué PNR-céntrico (no `USER#/RESERVATION#`)
+
+El TP3 modelaba la reserva como sub-item del usuario: `USER#{userId}/RESERVATION#{id}`. Funcionaba para "mis reservas" pero rompía el paradigma de un PSS real:
+
+- Una reserva tiene **múltiples segmentos** (ida + vuelta + escala) y **múltiples pasajeros** (ej. una familia). El modelo TP3 no podía expresarlos sin denormalización.
+- El **record locator (PNR)** es la clave canónica en la industria — los agentes lo usan para conversar, las APIs lo aceptan, el papel del boarding pass lo lleva. No es propiedad del usuario, es la entidad central.
+- Para responder "quién está en este vuelo" había que escanear todos los `RESERVATION#` items o mantener una proyección manual.
+
+El modelo TP4 invierte la jerarquía: **el PNR es la entidad canónica**, y `USER#{userId}/RESERVATION#{pnr}` queda como **thin pointer denormalizado** sólo para optimizar el query "mis reservas". El PNR contiene todos sus sub-items (segments, pax, BP) bajo el mismo PK, y se accede por PNR o vía GSI.
 
 ---
 

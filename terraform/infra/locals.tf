@@ -8,4 +8,8 @@ locals {
     Environment = var.environment
     ManagedBy   = "Terraform"
   }
+
+  # Nombres de las dos tablas DynamoDB (bounded contexts)
+  table_conversations = "${local.name_prefix}-conversations"
+  table_business      = "${local.name_prefix}-business"
 }

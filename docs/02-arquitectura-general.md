@@ -18,6 +18,30 @@ El chatbot usa inteligencia artificial (Claude de Anthropic) para entender lengu
 | Validación JWT manual con `python-jose` dentro de `chat-handler` | Cognito Authorizer en API Gateway | Mueve la validación al perímetro, libera código aplicativo, rechaza requests inválidas antes de invocar Lambda |
 | `auth-callback` Lambda como bridge HTTPS | **Idéntica** (workaround invariable) | Frontend está en S3 HTTP; Cognito requiere redirect HTTPS — la Lambda detrás de API GW es el único bridge HTTPS posible |
 
+### Cambios introducidos en TP4 (demostración final, post-presentación)
+
+| Cambio | Razón |
+|---|---|
+| **DynamoDB partida en dos tablas single-design**: `jetsmart-prod-conversations` (chat) + `jetsmart-prod-business` (PSS-like) | Bounded contexts: separa estado efímero del chatbot del dominio de negocio. Failure isolation entre el canal y el core. Retention policies independientes (TTL en chat, persistencia en negocio). Prepara la arquitectura para sumar otros canales que compartirían la business table. |
+| **Reservas migran a esquema PNR-céntrico** (record locator de 6 chars uppercase, à la Navitaire/Amadeus) con sub-items `SEGMENT#`, `PAX#`, `BP#` | Refleja cómo modelaría las reservas un PSS real. Habilita queries útiles ("quién está en este vuelo") via GSI2. |
+| **Implementada derivación a humano**: nueva tool `escalate_to_human` en `chat_handler` → SQS `human-handoff` → Lambda `human_handoff_processor` (mock call center) | Completar la feature de TP1 que no se había implementado. SQS desacopla el chatbot del sistema del call center: si el call center está caído, el pedido queda esperando. |
+| **Implementadas notificaciones proactivas**: trigger `scripts/cancel_flight.py` → SNS `flight-events` → SQS `proactive-notifications` → Lambda → fan-out de emails vía SNS `notifications` | Completar la feature de TP1. El trigger no se dispara en vivo en la demo (queda demostrado offline + diagrama); en producción el disparo sería desde el sistema PSS real de operaciones. |
+| **Boarding pass async vía SQS**: el Saga ya no invoca la Lambda de boarding pass directamente — publica un mensaje a SQS `boarding-pass-generation` y la nueva Lambda `boarding_pass_async` la consume | Desacopla el path sync del Saga del trabajo de generación del PDF. Si el BP falla queda en DLQ sin afectar la reserva ya confirmada. |
+| **3 nuevas SQS + DLQs** y **1 nuevo SNS topic** (`flight-events`) | Patrón consistente con el SQS de analytics: cada cola funcional tiene su DLQ con retención de 14 días y CloudWatch alarm. |
+
+### Bounded contexts: Conversations vs PSS Business
+
+Las dos tablas DynamoDB representan dos **bounded contexts** distintos del DDD:
+
+- **Conversations** = estado efímero del chatbot. Sesiones, mensajes, perfil chat-scoped, escalaciones a humano. TTL de días. Si se borra, no se pierde negocio. Es propiedad del canal "chatbot".
+- **Business (PSS-like)** = estado persistente del negocio. Vuelos, reservas (PNRs), pasajeros (CRM), reclamos, boarding passes. Sin TTL. Es propiedad de la aerolínea, compartido por todos los canales (chatbot, web, app, IVR, call center).
+
+La separación habilita decisiones independientes de:
+- Retention policy y backup window.
+- Encryption key (KMS distinta por contexto, si quisiéramos).
+- Scaling y cost attribution (cuánto cuesta operar el chatbot vs. el core de negocio).
+- Reemplazabilidad del chatbot (si mañana migrás el chatbot a otro stack, la data conversacional es portable independientemente del PSS).
+
 ---
 
 ## Decisiones de arquitectura
@@ -123,27 +147,34 @@ Si S3 falla (caso muy raro), el mensaje vuelve a SQS para reintento. Después de
 | 13 | Lambda — payment-refund | Cómputo | Compensación: revierte el cobro. |
 | 14 | Lambda — payment-cancel | Cómputo | Compensación: cancela la reserva. |
 | 15 | Lambda — payment-release-flight | Cómputo | Compensación: libera los asientos. |
-| 16 | Lambda — boarding-pass | Cómputo | PostBookingActions: genera boarding pass en DynamoDB. |
+| 16 | Lambda — boarding-pass-async | Cómputo | TP4: consume SQS boarding-pass-generation, genera BP en S3 y graba bp_url en PNR. |
 | 17 | Lambda — notification | Cómputo | PostBookingActions + error path: notifica al usuario. |
 | 18 | Lambda — analytics-processor | Cómputo | Consume SQS, escribe S3 JSON Lines. |
 | 19 | Lambda — auth-callback | Cómputo | Bridge HTTPS del workaround. Intercambia code por tokens. |
 | 20 | Lambda — cognito-trigger | Cómputo | Post-registro: asigna grupo `users`. |
-| 20b | Lambda — backup-dynamodb | Cómputo | Disparada por EventBridge cron diario. Llama a `dynamodb:ExportTableToPointInTime` contra el bucket de backups. |
-| 21 | Step Functions | Orquestación | State machine del patrón Saga (reserva y pago). |
+| 20b | Lambda — backup-dynamodb | Cómputo | Disparada por EventBridge cron diario. Exporta ambas tablas (conversations + business) al bucket de backups. |
+| 20c | **Lambda — human-handoff-processor (TP4)** | Cómputo | Consume SQS human-handoff, mock POST al call center, actualiza ticket HANDOFF# y notifica al usuario por email. |
+| 20d | **Lambda — proactive-notifications (TP4)** | Cómputo | Consume SQS proactive-notifications, Query a GSI2 ReservationsByFlight, fan-out de emails vía SNS notifications. |
+| 21 | Step Functions | Orquestación | State machine del patrón Saga. TP4: PostBookingActions Branch B ahora publica a SQS en lugar de invocar Lambda directo. |
 | 21b | EventBridge Rule — backup-dynamodb-daily | Orquestación / Scheduling | Cron `0 3 * * ? *` (03:00 UTC). Único trigger basado en tiempo del sistema. |
-| 22 | SNS — events | Mensajería | Eventos del chat (mensajes, compras) → fan-out a SQS analytics. |
-| 23 | SNS — notifications | Mensajería | Notificaciones al usuario (booking confirmado / fallido). |
+| 22 | SNS — events | Mensajería | Eventos del chat (mensajes, compras, handoffs) → fan-out a SQS analytics. |
+| 23 | SNS — notifications | Mensajería | Notificaciones al usuario (booking confirmado / fallido / handoff ack / cancelación de vuelo). |
+| 23b | **SNS — flight-events (TP4)** | Mensajería | Publicado por sistema de ops (scripts/cancel_flight.py mock) → SQS proactive-notifications. |
 | 24 | SQS — analytics | Mensajería | Buffer de eventos hacia analytics-processor. |
 | 25 | SQS — analytics-dlq | Mensajería | DLQ: eventos que fallaron 3 veces de escritura S3. |
 | 26 | SQS — booking-failed-dlq | Mensajería | DLQ: flujos Saga que no pudieron completarse. |
-| 27 | DynamoDB | Base de datos | Single Table Design: sesiones, reservas, vuelos mock. |
+| 26a | **SQS — human-handoff + DLQ (TP4)** | Mensajería | Chat → call center mock. DLQ retiene 14d para reintento manual. |
+| 26b | **SQS — proactive-notifications + DLQ (TP4)** | Mensajería | SNS flight-events → fan-out de emails. DLQ con CloudWatch alarm. |
+| 26c | **SQS — boarding-pass-generation + DLQ (TP4)** | Mensajería | Saga → boarding pass async. DLQ con alarm. |
+| 27a | **DynamoDB — conversations (TP4)** | Base de datos | Single Table Design: sesiones, mensajes, perfil chat-scoped, handoffs. TTL en todos los items. |
+| 27b | **DynamoDB — business (TP4, PSS-like)** | Base de datos | Single Table Design PNR-céntrico: FLIGHT#, PNR#/SEGMENT#/PAX#/BP#, PASSENGER#, CLAIM#. 3 GSIs (FlightByNumber, ReservationsByFlight, ReservationsByPassenger). |
 | 28 | Glue Catalog Database | Catálogo | Schema descubierto del bucket de eventos. |
 | 29 | Glue Crawler | Catálogo | Corre cada hora, descubre nuevas particiones y campos. |
 | 30 | Athena Workgroup | Consultas | Endpoint SQL para el equipo de business analytics. |
 | 31 | Secrets Manager | Seguridad | API key Anthropic. |
 | 32 | Lambda Layer — anthropic | Cómputo | SDK de Anthropic compilado para Python 3.12. |
 | 33 | IAM — LabRole | Seguridad | Rol preexistente de AWS Academy — compartido por todas las Lambdas. |
-| 34 | CloudWatch (14 log groups) | Observabilidad | Logs de todas las Lambdas con retención de 30 días. 13 vía `for_each` + 1 para `backup-dynamodb`. |
+| 34 | CloudWatch (16 log groups + 4 alarms) | Observabilidad | Logs de las 15 Lambdas con retención 30d. Alarms: analytics-processor errors + 3 DLQ depth alarms (human-handoff, proactive-notifications, boarding-pass-generation). |
 
 ---
 
@@ -232,11 +263,13 @@ Si S3 falla (caso muy raro), el mensaje vuelve a SQS para reintento. Después de
 
 | Funcionalidad | Cómo funciona |
 |---|---|
-| Búsqueda de vuelos | Tool use → `list_flight_dates` + `search_flights` → consulta DynamoDB |
-| Reserva completa | Tool use → `create_reservation` → Step Functions Saga |
-| Check-in | Tool use → `check_in` → UpdateItem en DynamoDB |
-| Boarding pass | Tool use → `get_boarding_pass` → consulta DynamoDB |
-| Mis reservas | Tool use → `list_user_reservations` → Query DynamoDB por usuario |
-| Reclamos | Tool use → `create_claim` → PutItem en DynamoDB |
-| Pasajeros guardados | Tool use → `list_saved_passengers` → Query DynamoDB |
+| Búsqueda de vuelos | Tool use → `list_flight_dates` + `search_flights` → Query business table |
+| Reserva completa | Tool use → `create_reservation` → Step Functions Saga → crea items PNR-céntricos en business + thin pointer en USER# |
+| Check-in | Tool use → `check_in` → UpdateItem PNR + thin pointer |
+| Boarding pass | Tool use → `get_boarding_pass` → lee item PNR/BP#01. Si no existe → mensaje "generándose" (BP es async) |
+| Mis reservas | Tool use → `list_user_reservations` → Query thin pointers USER#/RESERVATION#{pnr} |
+| Reclamos | Tool use → `create_claim` → PutItem CLAIM# canónico + thin pointer en USER# |
+| Pasajeros guardados | Tool use → `list_saved_passengers` → Query reservas y agrupar por nombre |
+| **Derivación a humano (TP4)** | Tool use → `escalate_to_human` → PutItem HANDOFF# en conversations + send a SQS → Lambda mock call center |
+| **Notificación proactiva (TP4, offline)** | `scripts/cancel_flight.py` → SNS flight-events → SQS → Lambda → Query GSI2 → SNS notifications a cada pasajero afectado |
 | Análisis del negocio (offline) | Eventos → S3 → Athena → equipo de business analytics consulta vía SQL |

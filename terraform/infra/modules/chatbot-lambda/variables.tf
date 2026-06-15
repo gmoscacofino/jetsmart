@@ -8,8 +8,18 @@ variable "aws_region" {
   type        = string
 }
 
-variable "dynamodb_table_name" {
-  description = "DynamoDB main table name"
+variable "conversations_table_name" {
+  description = "Nombre de la tabla DynamoDB de conversaciones (sessions, msgs, handoffs)"
+  type        = string
+}
+
+variable "business_table_name" {
+  description = "Nombre de la tabla DynamoDB de negocio (vuelos, PNRs, pasajeros, claims)"
+  type        = string
+}
+
+variable "human_handoff_queue_url" {
+  description = "URL de la SQS de derivación a humano — chat_handler envía mensajes acá"
   type        = string
 }
 

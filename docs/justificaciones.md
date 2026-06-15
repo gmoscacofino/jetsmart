@@ -164,6 +164,82 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 ---
 
+## 13. Dos tablas DynamoDB en TP4 (bounded contexts)
+
+**Decisión:** la única tabla del TP3 se partió en dos single-design: `jetsmart-prod-conversations` (estado del chatbot) + `jetsmart-prod-business` (PSS-like).
+
+**Alternativas:**
+- (a) Mantener single-table con todo (TP3) → mezcla conceptos, dificulta retention y reemplazo del canal.
+- (b) Una tabla por entidad (USERS, FLIGHTS, RESERVATIONS, ...) → rompe single-table design, multiplica RCU/WCU.
+- (c) **Dos tablas, una por bounded context (elegida)** → bounded contexts del DDD, manteniendo single-table dentro de cada uno.
+
+**Trade-off:** dos conexiones de cliente DynamoDB en `chat_handler`, una operación más en `terraform apply`, dos backups diarios. Ganancia: separación clara de responsabilidades, failure isolation, retention policies independientes, reemplazabilidad del canal sin tocar el negocio.
+
+**Por qué es la decisión correcta:** el chatbot y el negocio JetSmart son dominios distintos. Las conversaciones son efímeras (TTL días), las reservas son persistentes (años). Las conversaciones son propiedad del canal, las reservas son propiedad de la aerolínea — si mañana sumás un canal web/mobile/IVR, comparten la business table pero cada uno tiene su propio conversation store.
+
+---
+
+## 14. PNR-céntrico (estilo PSS real) en lugar de USER#/RESERVATION#
+
+**Decisión:** la reserva canónica vive en `PNR#{pnr}/#METADATA` con sub-items SEGMENT#, PAX#, BP#. `USER#{user_id}/RESERVATION#{pnr}` es solo un thin pointer denormalizado.
+
+**Alternativas:**
+- (a) Mantener `USER#/RESERVATION#{id}` como en TP3 → no escala a múltiples segments/pax.
+- (b) **PNR-céntrico (elegida)** → modelo estándar de la industria (Navitaire, Amadeus, Sabre).
+
+**Trade-off:** doble escritura al crear la reserva (canonical + pointer). Aceptable porque la lectura "mis reservas" es la más frecuente y queda O(1) Query del pointer.
+
+**Por qué es correcto:** habilita queries del PSS real:
+- "Quién está en el vuelo X del día Y" → Query GSI2 ReservationsByFlight (clave para notificaciones proactivas).
+- "Encontrar PNR de Juan Pérez" → Query GSI3 ReservationsByPassenger.
+- Pasajero CRM separado (`PASSENGER#{dni}`) con back-refs históricos.
+
+---
+
+## 15. Derivación a humano vía SQS (no llamada directa al call center)
+
+**Decisión:** la tool `escalate_to_human` del chatbot publica a SQS `human-handoff`; la Lambda `human_handoff_processor` consume y simula el POST al call center.
+
+**Alternativas:**
+- (a) `chat_handler` llama directo a la API del call center → acopla disponibilidad y latencia.
+- (b) **SQS intermediario (elegida)** → desacople + reintentos + DLQ.
+
+**Trade-off:** un componente más en el path (SQS). Ganancia: si el call center está caído, el pedido queda esperando 14 días en la cola; reintentos automáticos con DLQ para alarma; trazabilidad de todos los handoffs en conversations table.
+
+**Por qué SQS y no SNS:** un pedido de handoff tiene un único consumer lógico (el sistema del call center). SNS sería over-engineering. Si en el futuro queremos fan-out (analytics + call center + Slack del equipo de soporte), agregamos un SNS por delante; hoy no hay necesidad.
+
+---
+
+## 16. Notificaciones proactivas vs polling
+
+**Decisión:** las cancelaciones de vuelo se notifican proactivamente vía SNS `flight-events` → SQS `proactive-notifications` → Lambda → SNS `notifications` (emails).
+
+**Alternativas:**
+- (a) El usuario consulta periódicamente (polling) → mala UX, carga DynamoDB.
+- (b) Polling desde el sistema PSS hacia DynamoDB → carga GSI innecesariamente.
+- (c) **Event-driven push (elegida)** → el sistema PSS publica un evento, los suscriptores se enteran.
+
+**Por qué GSI2 ReservationsByFlight:** sin él, encontrar los pasajeros afectados requiere Scan de toda la business table — O(n) lineal. Con GSI2, una sola Query devuelve la lista — O(log n). Es **el habilitador técnico** del feature.
+
+**Demo offline:** en producción el evento vendría del sistema interno de ops cuando marca un vuelo como cancelado. En el TP el trigger es un script CLI (`scripts/cancel_flight.py`); el flujo se prueba antes del demo y se muestra el resultado en CloudWatch logs durante la presentación, sin disparar en vivo.
+
+---
+
+## 17. Boarding pass async vía SQS
+
+**Decisión:** el Saga PostBookingActions ya no invoca la Lambda de boarding pass directamente — publica un mensaje a SQS `boarding-pass-generation` y la Lambda `boarding_pass_async` la consume.
+
+**Alternativas:**
+- (a) Mantener sync en el Saga (TP3) → un error en BP frena la confirmación post-pago.
+- (b) `.waitForTaskToken` pattern → el Saga espera al BP. Más complejo en ASL.
+- (c) **Fire-and-forget vía SQS (elegida)** → simple, desacopla, retry automático con DLQ.
+
+**Trade-off:** el BP no está inmediatamente disponible. El usuario consulta y, si todavía no se generó, recibe "tu boarding pass se está generando, intentá en unos segundos". En la práctica el BP está listo en <2 segundos.
+
+**Por qué es correcto:** la reserva confirmada es lo crítico — no debe esperar al BP. Si la generación fallara, hoy queda en DLQ con alarma; antes hubiera dejado el Saga incompleto. Demuestra el patrón de **decoupling fire-and-forget desde Step Functions**.
+
+---
+
 ## 12. Frontend HTTP (no HTTPS)
 
 **Decisión:** el frontend S3 sirve HTTP estático sin CloudFront.

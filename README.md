@@ -23,6 +23,21 @@ JetSmart Chatbot es un asistente conversacional desplegado en AWS con Terraform 
 
 **Mejora adicional no observada por el feedback:** la validación del JWT pasó a hacerse en API Gateway con **Cognito Authorizer**, en lugar del código manual con `python-jose` que tenía la Lambda `chat-handler` en el TP3.
 
+## Cambios introducidos en TP4 (demostración final)
+
+Para llegar al demo presencial del 17/06 incorporamos cinco cambios que cierran las funcionalidades pendientes del TP1 y refinan la separación de dominios:
+
+| Cambio | Detalle |
+|---|---|
+| **DynamoDB partida en dos tablas single-design** | `jetsmart-prod-conversations` (chatbot state) + `jetsmart-prod-business` (PSS-like). Ver `docs/07-data-layer.md` y justificación #13. |
+| **Reservas migran a PNR-céntrico** | PNR de 6 chars alfanumérico (à la Navitaire). Sub-items `SEGMENT#`, `PAX#`, `BP#`. 3 GSIs en business (`FlightByNumber`, `ReservationsByFlight`, `ReservationsByPassenger`). |
+| **Derivación a humano (TP1 feature)** | Nueva tool `escalate_to_human` en `chat_handler` → SQS `human-handoff` → Lambda `human_handoff_processor` (mock call center) → SNS notifications. Ver Flujo 7 en `docs/04-flujos.md`. |
+| **Notificaciones proactivas (TP1 feature)** | Script offline `scripts/cancel_flight.py` → SNS `flight-events` → SQS `proactive-notifications` → Lambda → Query GSI2 → fan-out de emails. Ver Flujo 8 en `docs/04-flujos.md`. **No se dispara en vivo durante la demo** — se ejecuta antes y se muestra en CloudWatch logs. |
+| **Boarding pass async via SQS** | Step Functions PostBookingActions ya no invoca Lambda directo — publica a SQS `boarding-pass-generation`; nueva Lambda `boarding_pass_async` consume y graba `bp_url` en PNR. Fire-and-forget + DLQ. |
+| **3 SQS + DLQs nuevas + 1 SNS nuevo + 3 CloudWatch alarms** | Patrón consistente con el SQS de analytics. Ver `terraform/infra/messaging.tf` y `cloudwatch.tf`. |
+
+Total Lambdas: **13 → 15** (eliminada `boarding-pass`, agregadas `boarding-pass-async`, `human-handoff-processor`, `proactive-notifications`).
+
 ## Requerimientos
 
 ### Cuenta y credenciales AWS
@@ -95,6 +110,41 @@ Ir a **Actions → Terraform → Run workflow**, seleccionar **`destroy`** y eje
 3. Crear cuenta con email + contraseña (mínimo 8 caracteres, una mayúscula y un número).
 4. Confirmar el email con el código recibido.
 5. El browser vuelve al frontend con la sesión activa.
+
+### Smoke tests TP4
+
+**1) Derivación a humano:**
+```
+En el chat: "quiero hablar con un humano"
+→ Claude invoca tool escalate_to_human
+→ Respuesta: "Tu pedido fue derivado al equipo de soporte humano (ticket HO-XXXXXXXX)"
+→ Verificar:
+   - Item HANDOFF# en jetsmart-prod-conversations
+   - CloudWatch logs de /aws/lambda/jetsmart-prod-human-handoff-processor
+     mostrando "MOCK POST https://mock.callcenter.internal/tickets"
+   - Email recibido en la subscription de SNS notifications
+```
+
+**2) Notificaciones proactivas (offline, antes del demo):**
+```bash
+cd terraform/infra
+export BUSINESS_TABLE_NAME=$(terraform output -raw business_table_name)
+export SNS_FLIGHT_EVENTS_ARN=$(terraform output -raw sns_flight_events_arn)
+python3 ../../scripts/cancel_flight.py JA203 2026-06-20 "mal tiempo en Mendoza"
+→ Verificar:
+   - FLIGHTSTATUS actualizado en business table
+   - CloudWatch logs de /aws/lambda/jetsmart-prod-proactive-notifications
+     mostrando "Query GSI2 ... N PNRs afectados"
+   - Emails recibidos por pasajeros con reservas en ese vuelo
+```
+
+**3) Boarding pass async:**
+```
+En el chat: reservar vuelo → check-in → "dame mi boarding pass"
+→ Si BP recién se generó: URL devuelta
+→ Si BP todavía se está generando: "Tu boarding pass se está generando, intentá en unos segundos"
+→ Verificar item PNR#{pnr}/BP#01 en jetsmart-prod-business
+```
 
 ### Chatbot con Claude
 

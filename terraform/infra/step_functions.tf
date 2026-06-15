@@ -92,7 +92,11 @@ resource "aws_sfn_state_machine" "booking" {
         }]
       }
 
-      # Notificación y boarding pass en paralelo (best-effort: fallo aquí no revierte el pago)
+      # Notificación + encolado de boarding pass async (best-effort)
+      # TP4: boarding pass salió del path sync del Saga. PostBookingActions
+      # ahora encola un mensaje a SQS boarding-pass-generation y la Lambda
+      # boarding_pass_async lo consume y genera el BP en background, sin
+      # bloquear la confirmación de la reserva.
       PostBookingActions = {
         Type = "Parallel"
         Next = "BookingConfirmed"
@@ -117,12 +121,16 @@ resource "aws_sfn_state_machine" "booking" {
             }
           },
           {
-            StartAt = "GenerateBoardingPass"
+            StartAt = "EnqueueBoardingPass"
             States = {
-              GenerateBoardingPass = {
+              EnqueueBoardingPass = {
                 Type     = "Task"
-                Resource = aws_lambda_function.boarding_pass.arn
-                End      = true
+                Resource = "arn:aws:states:::sqs:sendMessage"
+                Parameters = {
+                  QueueUrl        = aws_sqs_queue.boarding_pass_generation.url
+                  "MessageBody.$" = "States.JsonToString($)"
+                }
+                End = true
               }
             }
           }

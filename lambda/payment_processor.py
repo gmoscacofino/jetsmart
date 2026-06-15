@@ -10,8 +10,17 @@ Flujo exitoso:
 
 Compensaciones (rollback):
   refund_payment → cancel_booking → release_flight
+
+TP4: las reservas son PNR-céntricas (PSS-like). Cada reserva crea varios items
+en business table:
+  PNR#{pnr}/#METADATA       — record locator canónico
+  PNR#{pnr}/SEGMENT#{seq}   — tramo del PNR (con gsi2pk para "quién está en X")
+  PNR#{pnr}/PAX#{seq}       — pasajero del PNR (con gsi3pk para buscar por DNI)
+  USER#{uid}/RESERVATION#{pnr}  — thin pointer denormalizado
+  PASSENGER#{dni}/#PROFILE  — CRM canónico (upsert)
+  PASSENGER#{dni}/PNR#{pnr} — back-ref histórico
 """
-import os, json, uuid, logging
+import os, json, secrets, logging
 from decimal import Decimal
 from datetime import datetime, timezone
 
@@ -23,7 +32,7 @@ log = logging.getLogger()
 log.setLevel(logging.INFO)
 
 REGION        = os.environ["AWS_REGION_VAR"]
-TABLE_NAME    = os.environ["DYNAMODB_TABLE_NAME"]
+TABLE_NAME    = os.environ["BUSINESS_TABLE_NAME"]
 SNS_EVENTS    = os.environ.get("SNS_EVENTS_ARN", "")
 ASSETS_BUCKET = os.environ.get("ASSETS_BUCKET", "")
 
@@ -32,9 +41,40 @@ table    = dynamodb.Table(TABLE_NAME)
 sns      = boto3.client("sns", region_name=REGION)
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+# Charset PNR estándar de la industria: alfanumérico uppercase, sin caracteres
+# ambiguos (0/O, 1/I) para evitar errores de transcripción humana.
+_PNR_CHARSET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def _generate_pnr() -> str:
+    """6-char alphanumeric uppercase PNR, formato Navitaire/Amadeus."""
+    return "".join(secrets.choice(_PNR_CHARSET) for _ in range(6))
+
+
+def _pnr_from_payment_id(payment_id: str) -> str:
+    """
+    Deriva un PNR estable a partir del payment_id para idempotencia.
+    Si el Saga se reintenta con mismo payment_id, genera el mismo PNR.
+    """
+    # Hash determinístico del payment_id → 6 chars del charset
+    h = abs(hash(payment_id))
+    chars = []
+    for _ in range(6):
+        chars.append(_PNR_CHARSET[h % len(_PNR_CHARSET)])
+        h //= len(_PNR_CHARSET)
+    return "".join(chars)
+
+
+def _passenger_key(name: str) -> str:
+    """Clave del pasajero CRM. Si no hay DNI, derivamos del nombre (best-effort)."""
+    return name.lower().replace(" ", "_")[:40] if name else "anon"
+
+
 # ── Paso 1 ────────────────────────────────────────────────────────────────────
 # Verifica disponibilidad y bloquea el asiento (decremento atómico).
-# Input:  {payment_id, user_id, reservation: {origen, destino, fecha, pasajeros}}
+# Input:  {payment_id, user_id, reservation: {origen, destino, fecha, pasajeros, vuelo_numero}}
 # Output: agrega flight_info al estado
 
 def reserve_flight_handler(event, context):
@@ -45,21 +85,35 @@ def reserve_flight_handler(event, context):
     destino     = reservation["destino"]
     fecha       = reservation["fecha"]
     pasajeros   = int(reservation.get("pasajeros", 1))
+    vuelo_pref  = reservation.get("vuelo_numero", "")
 
-    resp = table.get_item(
-        Key={"PK": f"FLIGHT#{origen}#{destino}", "SK": f"DATE#{fecha}"}
+    # Query — puede haber múltiples frecuencias por ruta/fecha (mañana + tarde)
+    resp = table.query(
+        KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
+        ExpressionAttributeValues={
+            ":pk":     f"FLIGHT#{origen}#{destino}",
+            ":prefix": f"DATE#{fecha}#",
+        },
     )
-    if "Item" not in resp:
+    items = resp.get("Items", [])
+    if not items:
         raise ValueError(f"Sin vuelos disponibles para {origen}-{destino} el {fecha}")
 
-    vuelo       = resp["Item"]
+    # Si el usuario eligió un vuelo específico, filtramos por número
+    if vuelo_pref:
+        items = [i for i in items if i.get("vuelo_numero") == vuelo_pref]
+        if not items:
+            raise ValueError(f"Vuelo {vuelo_pref} no encontrado para {origen}-{destino} {fecha}")
+
+    vuelo = items[0]
     disponibles = int(vuelo.get("asientos_disponibles", 0))
 
     if disponibles < pasajeros:
         raise ValueError(f"Asientos insuficientes: disponibles={disponibles}, solicitados={pasajeros}")
 
+    # Decremento atómico con condición — protege contra oversell concurrente
     table.update_item(
-        Key={"PK": f"FLIGHT#{origen}#{destino}", "SK": f"DATE#{fecha}"},
+        Key={"PK": vuelo["PK"], "SK": vuelo["SK"]},
         UpdateExpression="ADD asientos_disponibles :dec",
         ConditionExpression="asientos_disponibles >= :min",
         ExpressionAttributeValues={":dec": -pasajeros, ":min": pasajeros},
@@ -75,13 +129,19 @@ def reserve_flight_handler(event, context):
             "fecha":                fecha,
             "precio_por_pasajero":  float(vuelo.get("precio", 0)),
             "pasajeros_bloqueados": pasajeros,
+            # Guardamos las claves del item para release_flight (idempotente sin recalcular)
+            "_flight_pk":           vuelo["PK"],
+            "_flight_sk":           vuelo["SK"],
         },
     }
 
 
 # ── Paso 2 ────────────────────────────────────────────────────────────────────
-# Crea la reserva en DynamoDB con estado PENDIENTE.
-# Output: agrega reservation_id al estado
+# Crea la reserva en DynamoDB con estado PENDIENTE — patrón PSS:
+#   PNR#{pnr}/#METADATA, /SEGMENT#01, /PAX#01
+#   USER#{uid}/RESERVATION#{pnr}  thin pointer
+#   PASSENGER#{dni}/#PROFILE + /PNR#{pnr}  back-ref
+# Output: agrega reservation_id (= pnr) al estado
 
 def reserve_booking_handler(event, context):
     log.info("ReserveBooking — payment_id: %s", event.get("payment_id"))
@@ -89,64 +149,134 @@ def reserve_booking_handler(event, context):
     flight_info    = event["flight_info"]
     reservation_r  = event["reservation"]
     pasajeros      = int(reservation_r.get("pasajeros", 1))
-    reservation_id = f"RES-{event['payment_id'].replace('-', '')[:8].upper()}"
-    # Total calculado desde la base de datos — nunca del input del usuario.
+
+    pnr = _pnr_from_payment_id(event["payment_id"])
     total = Decimal(str(flight_info["precio_por_pasajero"])) * pasajeros
 
     passenger_name = reservation_r.get("nombre_pasajero", "")
     email          = reservation_r.get("email_contacto", "")
     phone          = reservation_r.get("telefono", "")
+    dni            = reservation_r.get("dni", "") or _passenger_key(passenger_name)
 
+    now = datetime.now(timezone.utc).isoformat()
+    user_id = event["user_id"]
+    vuelo_n = flight_info.get("vuelo_numero", "")
+    fecha   = flight_info["fecha"]
+
+    # PNR canónico — usamos PutItem con condición para idempotencia (Saga retry-safe)
     try:
         table.put_item(
             Item={
-                "PK":              f"USER#{event['user_id']}",
-                "SK":              f"RESERVATION#{reservation_id}",
-                "reservation_id":  reservation_id,
+                "PK":              f"PNR#{pnr}",
+                "SK":              "#METADATA",
+                "pnr":             pnr,
+                "user_id":         user_id,
                 "status":          "PENDIENTE",
-                "origin":          flight_info["origen"],
-                "destination":     flight_info["destino"],
-                "flight_number":   flight_info.get("vuelo_numero", ""),
-                "flight_date":     flight_info["fecha"],
+                "total":           total,
                 "passenger_count": pasajeros,
                 "tarifa":          reservation_r.get("tarifa", ""),
-                "total":           total,
-                "email":           email,
-                "phone":           phone,
-                "passenger_name":  passenger_name,
-                "created_at":      datetime.now(timezone.utc).isoformat(),
+                "email_contacto":  email,
+                "telefono":        phone,
+                "created_at":      now,
             },
-            ConditionExpression="attribute_not_exists(SK)",
+            ConditionExpression="attribute_not_exists(PK)",
         )
     except ClientError as e:
         if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            log.info("ReserveBooking — reserva ya existe, idempotente: %s", reservation_id)
-            return {**event, "reservation_id": reservation_id}
+            log.info("ReserveBooking — PNR ya existe, idempotente: %s", pnr)
+            return {**event, "reservation_id": pnr, "pnr": pnr}
         raise
 
-    # Auto-save passenger profile for future bookings (upsert: increment reservation count).
+    # SEGMENT — stampa gsi2pk para "quién está en este vuelo/fecha"
+    table.put_item(Item={
+        "PK":           f"PNR#{pnr}",
+        "SK":           f"SEGMENT#01#{vuelo_n}#{fecha}",
+        "pnr":          pnr,
+        "origen":       flight_info["origen"],
+        "destino":      flight_info["destino"],
+        "fecha":        fecha,
+        "vuelo_numero": vuelo_n,
+        "cabin":        "ECONOMY",
+        "fare_class":   reservation_r.get("tarifa", "BASIC"),
+        # GSI2: ReservationsByFlight — proactive_notifications hace Query acá
+        "gsi2pk":         f"FLIGHT#{vuelo_n}#{fecha}",
+        "gsi2sk":         f"PNR#{pnr}",
+        "user_id":        user_id,
+        "email":          email,
+        "passenger_name": passenger_name,
+        "status":         "PENDIENTE",
+    })
+
+    # PAX — stampa gsi3pk para "buscar PNR por DNI/email"
+    pax_item = {
+        "PK":             f"PNR#{pnr}",
+        "SK":             "PAX#01",
+        "pnr":            pnr,
+        "seq":            1,
+        "full_name":      passenger_name,
+        "dni":            dni,
+        "email":          email,
+        "phone":          phone,
+        "seat":           "ALEATORIO",
+        # GSI3: ReservationsByPassenger — KEYS_ONLY, suficiente para resolver PNR
+        "gsi3pk":         f"DNI#{dni}",
+        "gsi3sk":         f"PNR#{pnr}",
+    }
+    table.put_item(Item=pax_item)
+
+    # Si tenemos email distinto a DNI, stampar también un alias por email
+    if email:
+        table.put_item(Item={
+            "PK":     f"PNR#{pnr}",
+            "SK":     "PAX#01#EMAILALIAS",
+            "pnr":    pnr,
+            "gsi3pk": f"EMAIL#{email.lower()}",
+            "gsi3sk": f"PNR#{pnr}",
+        })
+
+    # User thin pointer — denormalizado para "mis reservas" en O(1)
+    table.put_item(Item={
+        "PK":              f"USER#{user_id}",
+        "SK":              f"RESERVATION#{pnr}",
+        "pnr":             pnr,
+        "status":          "PENDIENTE",
+        "origin":          flight_info["origen"],
+        "destination":     flight_info["destino"],
+        "flight_number":   vuelo_n,
+        "flight_date":     fecha,
+        "passenger_count": pasajeros,
+        "tarifa":          reservation_r.get("tarifa", ""),
+        "total":           total,
+        "email":           email,
+        "phone":           phone,
+        "passenger_name":  passenger_name,
+        "created_at":      now,
+    })
+
+    # Passenger CRM — upsert con back-ref
     if passenger_name:
-        passenger_key = passenger_name.lower().replace(" ", "_")[:40]
+        pkey = _passenger_key(passenger_name)
         table.update_item(
-            Key={
-                "PK": f"USER#{event['user_id']}",
-                "SK": f"PASSENGER#{passenger_key}",
-            },
+            Key={"PK": f"PASSENGER#{pkey}", "SK": "#PROFILE"},
             UpdateExpression=(
                 "SET passenger_name = :name, email = :email, phone = :phone, "
-                "last_booking = :now "
-                "ADD reservation_count :one"
+                "last_booking = :now ADD reservation_count :one"
             ),
             ExpressionAttributeValues={
                 ":name":  passenger_name,
                 ":email": email,
                 ":phone": phone,
-                ":now":   datetime.now(timezone.utc).isoformat(),
+                ":now":   now,
                 ":one":   1,
             },
         )
+        table.put_item(Item={
+            "PK":  f"PASSENGER#{pkey}",
+            "SK":  f"PNR#{pnr}",
+            "pnr": pnr,
+        })
 
-    return {**event, "reservation_id": reservation_id}
+    return {**event, "reservation_id": pnr, "pnr": pnr}
 
 
 # ── Paso 3 ────────────────────────────────────────────────────────────────────
@@ -154,8 +284,8 @@ def reserve_booking_handler(event, context):
 # Output: agrega total_pagado y transaction_id
 
 def collect_payment_handler(event, context):
-    log.info("CollectPayment — payment_id: %s, reserva: %s",
-             event.get("payment_id"), event.get("reservation_id"))
+    log.info("CollectPayment — payment_id: %s, PNR: %s",
+             event.get("payment_id"), event.get("pnr"))
 
     flight_info = event["flight_info"]
     reservation = event["reservation"]
@@ -169,26 +299,53 @@ def collect_payment_handler(event, context):
 
 
 # ── Paso 4 ────────────────────────────────────────────────────────────────────
-# Actualiza la reserva a CONFIRMADA y publica evento para analytics.
-# Output: agrega confirmed=True
+# Actualiza el PNR a CONFIRMADA + thin pointer + publica evento analytics.
 
 def confirm_booking_handler(event, context):
-    log.info("ConfirmBooking — payment_id: %s, reserva: %s",
-             event.get("payment_id"), event.get("reservation_id"))
+    pnr = event["pnr"]
+    log.info("ConfirmBooking — payment_id: %s, PNR: %s",
+             event.get("payment_id"), pnr)
 
+    user_id = event["user_id"]
+    total = Decimal(str(event.get("total_pagado", 0)))
+    tx = event.get("transaction_id", "")
+
+    # PNR canónico
     table.update_item(
-        Key={
-            "PK": f"USER#{event['user_id']}",
-            "SK": f"RESERVATION#{event['reservation_id']}",
-        },
+        Key={"PK": f"PNR#{pnr}", "SK": "#METADATA"},
         UpdateExpression="SET #s = :status, #t = :total, transaction_id = :tx",
         ExpressionAttributeNames={"#s": "status", "#t": "total"},
         ExpressionAttributeValues={
             ":status": "CONFIRMADA",
-            ":total":  Decimal(str(event.get("total_pagado", 0))),
-            ":tx":     event.get("transaction_id", ""),
+            ":total":  total,
+            ":tx":     tx,
         },
     )
+
+    # Thin pointer
+    table.update_item(
+        Key={"PK": f"USER#{user_id}", "SK": f"RESERVATION#{pnr}"},
+        UpdateExpression="SET #s = :status, #t = :total, transaction_id = :tx",
+        ExpressionAttributeNames={"#s": "status", "#t": "total"},
+        ExpressionAttributeValues={
+            ":status": "CONFIRMADA",
+            ":total":  total,
+            ":tx":     tx,
+        },
+    )
+
+    # SEGMENT status (consumido por GSI2 — el filtro de proactive_notifications)
+    vuelo_n = event["flight_info"].get("vuelo_numero", "")
+    fecha   = event["flight_info"]["fecha"]
+    try:
+        table.update_item(
+            Key={"PK": f"PNR#{pnr}", "SK": f"SEGMENT#01#{vuelo_n}#{fecha}"},
+            UpdateExpression="SET #s = :status",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":status": "CONFIRMADA"},
+        )
+    except Exception as e:
+        log.warning("No pudo actualizar SEGMENT status: %s", e)
 
     if SNS_EVENTS:
         try:
@@ -196,8 +353,9 @@ def confirm_booking_handler(event, context):
                 TopicArn=SNS_EVENTS,
                 Message=json.dumps({
                     "event_type":     "purchase_complete",
-                    "user_id":        event["user_id"],
-                    "reservation_id": event["reservation_id"],
+                    "user_id":        user_id,
+                    "reservation_id": pnr,
+                    "pnr":            pnr,
                     "ruta":           event["flight_info"]["ruta"],
                     "timestamp":      datetime.now(timezone.utc).isoformat(),
                     "payload":        {"amount": event.get("total_pagado", 0)},
@@ -211,7 +369,6 @@ def confirm_booking_handler(event, context):
 
 
 # ── Compensación: refund ──────────────────────────────────────────────────────
-# Revierte el cobro cuando ConfirmBooking falla.
 
 def refund_payment_handler(event, context):
     tx_id = event.get("transaction_id")
@@ -221,31 +378,43 @@ def refund_payment_handler(event, context):
 
 
 # ── Compensación: cancel booking ─────────────────────────────────────────────
-# Cancela la reserva si fue creada (puede no existir si falló en ReserveFlight).
 
 def cancel_booking_handler(event, context):
-    reservation_id = event.get("reservation_id")
-    if not reservation_id:
-        log.info("CancelBooking — sin reserva que cancelar")
+    pnr = event.get("pnr") or event.get("reservation_id")
+    if not pnr:
+        log.info("CancelBooking — sin PNR que cancelar")
         return {"cancelled": False, "reason": "no_reservation"}
 
-    log.info("CancelBooking — reserva: %s", reservation_id)
+    log.info("CancelBooking — PNR: %s", pnr)
+    user_id = event.get("user_id", "")
 
-    table.update_item(
-        Key={
-            "PK": f"USER#{event['user_id']}",
-            "SK": f"RESERVATION#{reservation_id}",
-        },
-        UpdateExpression="SET #s = :status",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":status": "CANCELADA"},
-    )
+    # PNR canónico
+    try:
+        table.update_item(
+            Key={"PK": f"PNR#{pnr}", "SK": "#METADATA"},
+            UpdateExpression="SET #s = :status",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":status": "CANCELADA"},
+        )
+    except Exception as e:
+        log.warning("Cancel PNR %s falló: %s", pnr, e)
 
-    return {"cancelled": True, "reservation_id": reservation_id}
+    # Thin pointer
+    if user_id:
+        try:
+            table.update_item(
+                Key={"PK": f"USER#{user_id}", "SK": f"RESERVATION#{pnr}"},
+                UpdateExpression="SET #s = :status",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":status": "CANCELADA"},
+            )
+        except Exception as e:
+            log.warning("Cancel pointer USER#%s/RESERVATION#%s falló: %s", user_id, pnr, e)
+
+    return {"cancelled": True, "pnr": pnr}
 
 
 # ── Compensación: release flight ─────────────────────────────────────────────
-# Libera el asiento bloqueado si ReserveFlight llegó a ejecutarse.
 
 def release_flight_handler(event, context):
     flight_info = event.get("flight_info")
@@ -257,19 +426,21 @@ def release_flight_handler(event, context):
     log.info("ReleaseFlight — ruta: %s — pasajeros: %d",
              flight_info.get("ruta"), pasajeros)
 
+    # Usamos las claves guardadas en reserve_flight si están disponibles —
+    # si no, reconstruimos del flight_info (fallback compat)
+    pk = flight_info.get("_flight_pk") or f"FLIGHT#{flight_info['origen']}#{flight_info['destino']}"
+    sk = flight_info.get("_flight_sk") or f"DATE#{flight_info['fecha']}#FLIGHT#{flight_info.get('vuelo_numero','')}"
+
     try:
         table.update_item(
-            Key={
-                "PK": f"FLIGHT#{flight_info['origen']}#{flight_info['destino']}",
-                "SK": f"DATE#{flight_info['fecha']}",
-            },
+            Key={"PK": pk, "SK": sk},
             UpdateExpression="ADD asientos_disponibles :inc",
             ConditionExpression="attribute_exists(PK)",
             ExpressionAttributeValues={":inc": pasajeros},
         )
     except ClientError as e:
         if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            log.warning("ReleaseFlight — vuelo no encontrado en DynamoDB: %s", flight_info.get("ruta"))
+            log.warning("ReleaseFlight — vuelo no encontrado: %s/%s", pk, sk)
             return {"released": False, "reason": "flight_not_found"}
         raise
 

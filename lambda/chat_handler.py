@@ -8,7 +8,10 @@ log = logging.getLogger()
 log.setLevel(logging.INFO)
 
 REGION               = os.environ["AWS_REGION_VAR"]
-TABLE_NAME           = os.environ["DYNAMODB_TABLE_NAME"]
+# TP4: dos tablas — bounded contexts (conversations + business/PSS)
+CONV_TABLE_NAME      = os.environ["CONVERSATIONS_TABLE_NAME"]
+BIZ_TABLE_NAME       = os.environ["BUSINESS_TABLE_NAME"]
+HUMAN_HANDOFF_QUEUE_URL = os.environ.get("HUMAN_HANDOFF_QUEUE_URL", "")
 SNS_TOPIC_ARN        = os.environ["SNS_TOPIC_ARN"]
 SECRET_ARN           = os.environ["ANTHROPIC_SECRET_ARN"]
 SF_ARN               = os.environ.get("STEP_FUNCTIONS_ARN", "")
@@ -16,19 +19,21 @@ SYSTEM_PROMPT_BUCKET = os.environ["SYSTEM_PROMPT_BUCKET"]
 SYSTEM_PROMPT_KEY    = os.environ["SYSTEM_PROMPT_KEY"]
 FRONTEND_URL         = os.environ.get("FRONTEND_URL") or "*"
 
-dynamodb = boto3.resource("dynamodb", region_name=REGION)
-table    = dynamodb.Table(TABLE_NAME)
-sns      = boto3.client("sns", region_name=REGION)
-sm       = boto3.client("secretsmanager", region_name=REGION)
-sf       = boto3.client("stepfunctions", region_name=REGION)
-s3       = boto3.client("s3", region_name=REGION)
+dynamodb   = boto3.resource("dynamodb", region_name=REGION)
+conv_table = dynamodb.Table(CONV_TABLE_NAME)
+biz_table  = dynamodb.Table(BIZ_TABLE_NAME)
+sns        = boto3.client("sns", region_name=REGION)
+sqs        = boto3.client("sqs", region_name=REGION)
+sm         = boto3.client("secretsmanager", region_name=REGION)
+sf         = boto3.client("stepfunctions", region_name=REGION)
+s3         = boto3.client("s3", region_name=REGION)
 
 MAX_HISTORY     = 40
 MSG_TTL_SECONDS = 7 * 24 * 3600
+HANDOFF_TTL_SECONDS = 30 * 24 * 3600
 MAX_TOOL_ROUNDS = 5
 
 # Inicialización eager: ocurre en el cold start, no en el primer request.
-# El contenedor ya tiene el cliente y el prompt listos cuando llega el primer mensaje.
 def _init_anthropic() -> anthropic.Anthropic:
     secret  = sm.get_secret_value(SecretId=SECRET_ARN)
     api_key = json.loads(secret["SecretString"])["api_key"]
@@ -53,10 +58,6 @@ def _build_system_prompt() -> str:
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
-#
-# La validación del JWT se hace en API Gateway con Cognito Authorizer (ver
-# terraform/infra/modules/chatbot-lambda/main.tf). Los claims ya validados llegan
-# en event.requestContext.authorizer.claims — sólo los leemos.
 
 def _get_user(event: dict) -> dict:
     claims = (event.get("requestContext") or {}).get("authorizer", {}).get("claims")
@@ -69,12 +70,12 @@ def _user_id(user: dict) -> str:
     return user.get("sub", "anonymous")
 
 
-# ── DynamoDB ──────────────────────────────────────────────────────────────────
+# ── DynamoDB: conversations table ─────────────────────────────────────────────
 
 def _upsert_user_profile(user: dict):
     user_id = _user_id(user)
     try:
-        table.update_item(
+        conv_table.update_item(
             Key={"PK": f"USER#{user_id}", "SK": "#METADATA"},
             UpdateExpression=(
                 "SET email = if_not_exists(email, :email), "
@@ -90,19 +91,17 @@ def _upsert_user_profile(user: dict):
 
 
 def _get_history(session_id: str, user_id: str = "") -> list:
-    resp = table.query(
+    resp = conv_table.query(
         KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
         ExpressionAttributeValues={
             ":pk":     f"SESSION#{session_id}",
             ":prefix": "MSG#",
         },
-        ScanIndexForward=False,   # más recientes primero para aplicar Limit correctamente
+        ScanIndexForward=False,
         Limit=MAX_HISTORY,
     )
     messages = []
-    for i in reversed(resp.get("Items", [])):  # revertir a orden cronológico
-        # Descartar mensajes de otras sesiones robadas: si el item tiene user_id
-        # y no coincide con el token actual, la sesión no pertenece a este usuario.
+    for i in reversed(resp.get("Items", [])):
         if user_id and i.get("user_id") and i["user_id"] != user_id:
             log.warning("Session %s owned by %s accessed by %s — clearing history",
                         session_id, i["user_id"], user_id)
@@ -112,9 +111,6 @@ def _get_history(session_id: str, user_id: str = "") -> list:
             content = json.loads(content)
         messages.append({"role": i["role"], "content": content})
 
-    # Si un request anterior falló después de guardar el mensaje del usuario pero antes
-    # de guardar la respuesta del asistente, el historial termina con dos "user" seguidos.
-    # La API de Anthropic requiere roles alternados, así que descartamos el final inválido.
     while len(messages) >= 2 and messages[-1]["role"] == messages[-2]["role"]:
         messages.pop()
 
@@ -130,7 +126,7 @@ def _save_message(session_id: str, user_id: str, role: str, content):
     else:
         stored = json.dumps(content, default=str)
         ctype  = "tool"
-    table.put_item(Item={
+    conv_table.put_item(Item={
         "PK":           f"SESSION#{session_id}",
         "SK":           f"MSG#{ts}#{uid}",
         "role":         role,
@@ -178,14 +174,9 @@ def _response(status: int, body: dict) -> dict:
 
 # ── Tool use — capa de datos de JetSmart ──────────────────────────────────────
 #
-# Claude puede invocar estas herramientas para obtener datos reales antes de
-# formular su respuesta. El modelo decide cuándo usarlas según la pregunta.
-#
-# En producción estas funciones llamarían a la API interna de JetSmart:
-#   search_flights  → GET https://api-interna.jetsmart.com/availability
-#   get_reservation → GET https://api-interna.jetsmart.com/reservations/{id}
-#
-# En esta implementación consultan DynamoDB, que actúa como fuente de datos.
+# TP4: las reservas usan PNRs de 6 chars (formato Navitaire/Amadeus).
+# Los datos del PSS (vuelos, PNRs, pasajeros, claims) viven en biz_table.
+# Las conversaciones y handoffs viven en conv_table.
 
 TOOLS = [
     {
@@ -193,21 +184,13 @@ TOOLS = [
         "description": (
             "Lista todas las fechas con vuelos disponibles entre dos ciudades. "
             "Usar PRIMERO cuando el usuario no especifica una fecha concreta y quiere saber "
-            "cuándo puede volar (ej: 'quiero ir a Mendoza', 'qué días hay vuelos a Santiago'). "
-            "Devuelve las fechas disponibles con precio base. "
-            "Luego usar search_flights para el detalle de una fecha específica."
+            "cuándo puede volar."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "origen": {
-                    "type":        "string",
-                    "description": "Código IATA del aeropuerto de origen (ej: AEP, SCL, COR, MDZ)",
-                },
-                "destino": {
-                    "type":        "string",
-                    "description": "Código IATA del aeropuerto de destino",
-                },
+                "origen":  {"type": "string", "description": "IATA origen (AEP, SCL, COR, MDZ, etc.)"},
+                "destino": {"type": "string", "description": "IATA destino"},
             },
             "required": ["origen", "destino"],
         },
@@ -216,77 +199,42 @@ TOOLS = [
         "name": "search_flights",
         "description": (
             "Busca el detalle de un vuelo entre dos ciudades en una fecha concreta. "
-            "Devuelve número de vuelo, horarios, precio por pasajero y asientos disponibles. "
-            "Usar cuando el usuario ya eligió una fecha específica, o para confirmar disponibilidad "
-            "antes de iniciar el flujo de compra."
+            "Devuelve número de vuelo, horarios, precio por pasajero y asientos disponibles."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "origen": {
-                    "type":        "string",
-                    "description": "Código IATA del aeropuerto de origen (ej: AEP, SCL, COR, MDZ, IGR, ANF, LIM)",
-                },
-                "destino": {
-                    "type":        "string",
-                    "description": "Código IATA del aeropuerto de destino",
-                },
-                "fecha": {
-                    "type":        "string",
-                    "description": "Fecha del vuelo en formato YYYY-MM-DD",
-                },
-                "pasajeros": {
-                    "type":        "integer",
-                    "description": "Cantidad de pasajeros (por defecto 1)",
-                },
+                "origen":    {"type": "string", "description": "IATA origen"},
+                "destino":   {"type": "string", "description": "IATA destino"},
+                "fecha":     {"type": "string", "description": "YYYY-MM-DD"},
+                "pasajeros": {"type": "integer", "description": "Cantidad de pasajeros (default 1)"},
             },
             "required": ["origen", "destino", "fecha"],
         },
     },
     {
         "name": "get_reservation",
-        "description": (
-            "Consulta el estado de una reserva existente del usuario. "
-            "Usar cuando el usuario pregunte por el estado, detalles o historial de una reserva."
-        ),
+        "description": "Consulta el estado de una reserva por PNR (record locator de 6 caracteres).",
         "input_schema": {
             "type": "object",
             "properties": {
-                "reservation_id": {
-                    "type":        "string",
-                    "description": "ID de la reserva, formato RES-XXXXXXXX",
-                },
+                "reservation_id": {"type": "string", "description": "PNR de 6 chars (ej: JS7K2P)"},
             },
             "required": ["reservation_id"],
         },
     },
     {
         "name": "list_user_reservations",
-        "description": (
-            "Lista todas las reservas del usuario autenticado. "
-            "Usar cuando el usuario pregunte por sus vuelos, quiera hacer check-in, "
-            "ver el estado de sus reservas, o gestionar un viaje existente. "
-            "No requiere ningún parámetro."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        },
+        "description": "Lista todas las reservas del usuario autenticado.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "check_in",
-        "description": (
-            "Realiza el check-in de una reserva confirmada. "
-            "Usar cuando el usuario quiera hacer check-in para su vuelo."
-        ),
+        "description": "Realiza el check-in de una reserva confirmada (24h antes del vuelo).",
         "input_schema": {
             "type": "object",
             "properties": {
-                "reservation_id": {
-                    "type": "string",
-                    "description": "Código de reserva formato RES-XXXXXXXX",
-                },
+                "reservation_id": {"type": "string", "description": "PNR de 6 chars"},
             },
             "required": ["reservation_id"],
         },
@@ -295,129 +243,94 @@ TOOLS = [
         "name": "get_boarding_pass",
         "description": (
             "Obtiene el boarding pass de una reserva con check-in realizado. "
-            "Usar cuando el usuario pida su tarjeta de embarque."
+            "El BP se genera de forma asincrónica tras la confirmación de la reserva; "
+            "si todavía está procesándose, devuelve un mensaje indicándolo."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "reservation_id": {
-                    "type": "string",
-                    "description": "Código de reserva formato RES-XXXXXXXX",
-                },
+                "reservation_id": {"type": "string", "description": "PNR de 6 chars"},
             },
             "required": ["reservation_id"],
         },
     },
     {
         "name": "create_claim",
-        "description": (
-            "Registra un reclamo sobre un vuelo o reserva. "
-            "Usar para equipaje perdido/dañado, vuelo demorado/cancelado, reembolsos u otros problemas."
-        ),
+        "description": "Registra un reclamo sobre un vuelo o reserva.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "reservation_id": {
-                    "type": "string",
-                    "description": "Código de reserva relacionado (opcional)",
-                },
-                "tipo": {
-                    "type": "string",
-                    "description": "Tipo de reclamo: equipaje_perdido | equipaje_daniado | vuelo_demorado | vuelo_cancelado | reembolso | otro",
-                },
-                "descripcion": {
-                    "type": "string",
-                    "description": "Descripción detallada del problema",
-                },
+                "reservation_id": {"type": "string", "description": "PNR relacionado (opcional)"},
+                "tipo":           {"type": "string", "description": "equipaje_perdido | equipaje_daniado | vuelo_demorado | vuelo_cancelado | reembolso | otro"},
+                "descripcion":    {"type": "string", "description": "Descripción del problema"},
             },
             "required": ["tipo", "descripcion"],
         },
     },
     {
         "name": "list_saved_passengers",
-        "description": (
-            "Lista los pasajeros guardados del usuario a partir de reservas anteriores. "
-            "Usar cuando el usuario quiera usar un pasajero ya registrado para una nueva reserva, "
-            "o cuando pregunte si tiene pasajeros guardados."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        },
+        "description": "Lista los pasajeros guardados del usuario a partir de reservas anteriores.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "create_reservation",
         "description": (
-            "Crea una reserva real en el sistema y dispara el proceso de pago. "
-            "Llamar ÚNICAMENTE cuando el usuario haya completado TODOS los pasos del flujo de compra "
-            "y haya confirmado explícitamente que quiere proceder. "
-            "Esta herramienta genera la reserva real — no inventar IDs de reserva manualmente."
+            "Crea una reserva real e inicia el flujo de pago (Saga). "
+            "Llamar SÓLO cuando el usuario confirmó explícitamente todos los detalles."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "origen": {
-                    "type": "string",
-                    "description": "Código IATA del aeropuerto de origen (ej: AEP)",
-                },
-                "destino": {
-                    "type": "string",
-                    "description": "Código IATA del aeropuerto de destino (ej: MDZ)",
-                },
-                "fecha": {
-                    "type": "string",
-                    "description": "Fecha del vuelo en formato YYYY-MM-DD",
-                },
-                "pasajeros": {
-                    "type": "integer",
-                    "description": "Cantidad de pasajeros",
-                },
-                "tarifa": {
-                    "type": "string",
-                    "description": "Tarifa elegida: BASIC, LIGHT, SMART o FULL FLEX",
-                },
-                "total": {
-                    "type": "number",
-                    "description": "Precio total de la reserva en USD",
-                },
-                "email_contacto": {
-                    "type": "string",
-                    "description": "Email de contacto del pasajero",
-                },
-                "telefono": {
-                    "type": "string",
-                    "description": "Teléfono de contacto del pasajero",
-                },
-                "nombre_pasajero": {
-                    "type": "string",
-                    "description": "Nombre completo del pasajero principal (nombre + apellido)",
-                },
-                "vuelo_numero": {
-                    "type": "string",
-                    "description": "Número de vuelo elegido (ej: JA203). Obligatorio si hay más de una frecuencia disponible en la fecha.",
-                },
+                "origen":          {"type": "string"},
+                "destino":         {"type": "string"},
+                "fecha":           {"type": "string", "description": "YYYY-MM-DD"},
+                "pasajeros":       {"type": "integer"},
+                "tarifa":          {"type": "string", "description": "BASIC, LIGHT, SMART, FULL FLEX"},
+                "total":           {"type": "number"},
+                "email_contacto":  {"type": "string"},
+                "telefono":        {"type": "string"},
+                "nombre_pasajero": {"type": "string"},
+                "dni":             {"type": "string", "description": "DNI del pasajero principal (sin puntos)"},
+                "vuelo_numero":    {"type": "string", "description": "Número de vuelo (JA203, etc.)"},
             },
             "required": ["origen", "destino", "fecha", "pasajeros", "tarifa", "total", "email_contacto"],
+        },
+    },
+    {
+        "name": "escalate_to_human",
+        "description": (
+            "Deriva la conversación a un agente humano del call center cuando el usuario "
+            "lo solicita explícitamente, cuando muestra frustración significativa, o cuando "
+            "el problema está fuera del alcance del chatbot (legal, médico, seguridad, "
+            "casos complejos que ninguna otra herramienta puede resolver). "
+            "NO usar para preguntas que podés contestar con otras tools. "
+            "Devuelve un ticket_id que el agente humano usará para retomar el contexto."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reason":  {
+                    "type": "string",
+                    "description": "Motivo breve (ej: 'usuario solicita hablar con un humano', 'reclamo complejo de equipaje', 'consulta legal')",
+                },
+                "urgency": {
+                    "type": "string",
+                    "enum":  ["low", "medium", "high"],
+                    "description": "Urgencia. 'high' si vuelo en <24h o problema en curso.",
+                },
+            },
+            "required": ["reason", "urgency"],
         },
     },
 ]
 
 
-def _execute_tool(name: str, inputs: dict, user_id: str) -> str:
-    """
-    Ejecuta la herramienta solicitada por Claude y devuelve el resultado como JSON string.
-
-    Punto de extensión: para integrar la API real de JetSmart, reemplazar las
-    consultas a DynamoDB por llamadas HTTP a la API interna con su token de auth.
-    """
+def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "") -> str:
     if name == "list_flight_dates":
         origen  = inputs["origen"].upper()
         destino = inputs["destino"].upper()
-
         log.info("list_flight_dates: %s→%s", origen, destino)
-
-        resp = table.query(
+        resp = biz_table.query(
             KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
             ExpressionAttributeValues={
                 ":pk":     f"FLIGHT#{origen}#{destino}",
@@ -426,14 +339,8 @@ def _execute_tool(name: str, inputs: dict, user_id: str) -> str:
             ScanIndexForward=True,
         )
         items = resp.get("Items", [])
-
         if not items:
-            return json.dumps({
-                "disponible": False,
-                "mensaje":    f"No hay vuelos disponibles de {origen} a {destino}.",
-            })
-
-        # SK format: DATE#2026-05-20#FLIGHT#JA203
+            return json.dumps({"disponible": False, "mensaje": f"No hay vuelos de {origen} a {destino}."})
         fechas = []
         for i in items:
             if int(i.get("asientos_disponibles", 0)) > 0:
@@ -445,24 +352,15 @@ def _execute_tool(name: str, inputs: dict, user_id: str) -> str:
                     "precio_desde":         float(i.get("precio", 0)),
                     "asientos_disponibles": int(i.get("asientos_disponibles", 0)),
                 })
-
-        return json.dumps({
-            "origen":  origen,
-            "destino": destino,
-            "fechas":  fechas,
-        })
+        return json.dumps({"origen": origen, "destino": destino, "fechas": fechas})
 
     if name == "search_flights":
         origen    = inputs["origen"].upper()
         destino   = inputs["destino"].upper()
         fecha     = inputs["fecha"]
         pasajeros = int(inputs.get("pasajeros", 1))
-
         log.info("search_flights: %s→%s %s (%d pax)", origen, destino, fecha, pasajeros)
-
-        # Query en lugar de get_item: puede haber más de un vuelo por ruta/fecha
-        # (ej: JA201 07:30 y JA203 17:00). SK format: DATE#fecha#FLIGHT#vuelo
-        resp = table.query(
+        resp = biz_table.query(
             KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
             ExpressionAttributeValues={
                 ":pk":     f"FLIGHT#{origen}#{destino}",
@@ -471,13 +369,8 @@ def _execute_tool(name: str, inputs: dict, user_id: str) -> str:
             ScanIndexForward=True,
         )
         found = resp.get("Items", [])
-
         if not found:
-            return json.dumps({
-                "disponible": False,
-                "mensaje":    f"No hay vuelos de {origen} a {destino} el {fecha}.",
-            })
-
+            return json.dumps({"disponible": False, "mensaje": f"No hay vuelos de {origen} a {destino} el {fecha}."})
         vuelos = []
         for item in found:
             asientos = int(item.get("asientos_disponibles", 0))
@@ -491,53 +384,38 @@ def _execute_tool(name: str, inputs: dict, user_id: str) -> str:
                     "precio_total":         float(item["precio"]) * pasajeros,
                     "asientos_disponibles": asientos,
                     "aerolinea":            item.get("aerolinea", "JetSmart"),
+                    "estado_vuelo":         item.get("estado_vuelo", "EN_HORARIO"),
                 })
-
         if not vuelos:
             total = sum(int(i.get("asientos_disponibles", 0)) for i in found)
             return json.dumps({
                 "disponible": False,
                 "mensaje": (
-                    f"Hay vuelo(s) de {origen} a {destino} el {fecha} pero sin asientos "
-                    f"suficientes para {pasajeros} pasajero(s) (máx. disponible: {total})."
+                    f"Hay vuelo(s) {origen}-{destino} {fecha} sin asientos suficientes "
+                    f"para {pasajeros} pax (máx disponible: {total})."
                 ),
             })
-
         _emit_event("busqueda_vuelo", {
-            "origen":    origen,
-            "destino":   destino,
-            "fecha":     fecha,
-            "pasajeros": pasajeros,
-            "ruta":      f"{origen}-{destino}",
+            "origen": origen, "destino": destino, "fecha": fecha,
+            "pasajeros": pasajeros, "ruta": f"{origen}-{destino}",
         }, user_id)
-
         return json.dumps({
-            "disponible": True,
-            "origen":     origen,
-            "destino":    destino,
-            "fecha":      fecha,
-            "pasajeros":  pasajeros,
-            "vuelos":     vuelos,
+            "disponible": True, "origen": origen, "destino": destino,
+            "fecha": fecha, "pasajeros": pasajeros, "vuelos": vuelos,
         })
 
     if name == "get_reservation":
-        reservation_id = inputs["reservation_id"]
-        log.info("get_reservation: %s (user: %s)", reservation_id, user_id)
-
-        resp = table.get_item(
-            Key={"PK": f"USER#{user_id}", "SK": f"RESERVATION#{reservation_id}"}
-        )
+        pnr = inputs["reservation_id"].upper()
+        log.info("get_reservation: %s user=%s", pnr, user_id)
+        # Leemos el thin pointer del user para verificar ownership
+        resp = biz_table.get_item(Key={"PK": f"USER#{user_id}", "SK": f"RESERVATION#{pnr}"})
         item = resp.get("Item")
-
         if not item:
-            return json.dumps({
-                "encontrada": False,
-                "mensaje":    f"No se encontró la reserva {reservation_id}.",
-            })
-
+            return json.dumps({"encontrada": False, "mensaje": f"No se encontró la reserva {pnr}."})
         return json.dumps({
             "encontrada":     True,
-            "reservation_id": reservation_id,
+            "reservation_id": pnr,
+            "pnr":            pnr,
             "origen":         item.get("origin"),
             "destino":        item.get("destination"),
             "fecha":          item.get("flight_date"),
@@ -548,7 +426,7 @@ def _execute_tool(name: str, inputs: dict, user_id: str) -> str:
 
     if name == "list_user_reservations":
         log.info("list_user_reservations: user=%s", user_id)
-        resp = table.query(
+        resp = biz_table.query(
             KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
             ExpressionAttributeValues={
                 ":pk":     f"USER#{user_id}",
@@ -562,7 +440,8 @@ def _execute_tool(name: str, inputs: dict, user_id: str) -> str:
             return json.dumps({"reservas": [], "mensaje": "No tenés reservas registradas."})
         reservas = [
             {
-                "reservation_id": i.get("reservation_id"),
+                "reservation_id": i.get("pnr"),
+                "pnr":            i.get("pnr"),
                 "vuelo":          i.get("flight_number", "—"),
                 "origen":         i.get("origin", "—"),
                 "destino":        i.get("destination", "—"),
@@ -577,14 +456,12 @@ def _execute_tool(name: str, inputs: dict, user_id: str) -> str:
         return json.dumps({"reservas": reservas}, default=str)
 
     if name == "check_in":
-        reservation_id = inputs["reservation_id"]
-        log.info("check_in: %s user=%s", reservation_id, user_id)
-        resp = table.get_item(
-            Key={"PK": f"USER#{user_id}", "SK": f"RESERVATION#{reservation_id}"}
-        )
+        pnr = inputs["reservation_id"].upper()
+        log.info("check_in: %s user=%s", pnr, user_id)
+        resp = biz_table.get_item(Key={"PK": f"USER#{user_id}", "SK": f"RESERVATION#{pnr}"})
         item = resp.get("Item")
         if not item:
-            return json.dumps({"ok": False, "mensaje": f"No se encontró la reserva {reservation_id}."})
+            return json.dumps({"ok": False, "mensaje": f"No se encontró la reserva {pnr}."})
         if item.get("status") == "CHECK-IN":
             return json.dumps({"ok": True, "ya_realizado": True, "mensaje": "Ya tenés check-in realizado para esta reserva."})
         if item.get("status") not in ("CONFIRMADA",):
@@ -595,50 +472,65 @@ def _execute_tool(name: str, inputs: dict, user_id: str) -> str:
             return json.dumps({"ok": False, "mensaje": "No podés hacer check-in para un vuelo que ya pasó."})
         if flight_dt > today + timedelta(days=1):
             return json.dumps({"ok": False, "mensaje": f"El check-in abre 24 horas antes del vuelo. Tu vuelo es el {item['flight_date']}."})
-        table.update_item(
-            Key={"PK": f"USER#{user_id}", "SK": f"RESERVATION#{reservation_id}"},
+        # Update thin pointer + PNR canonical
+        biz_table.update_item(
+            Key={"PK": f"USER#{user_id}", "SK": f"RESERVATION#{pnr}"},
+            UpdateExpression="SET #s = :status",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":status": "CHECK-IN"},
+        )
+        biz_table.update_item(
+            Key={"PK": f"PNR#{pnr}", "SK": "#METADATA"},
             UpdateExpression="SET #s = :status",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={":status": "CHECK-IN"},
         )
         _emit_event("checkin_realizado", {
-            "reservation_id": reservation_id,
+            "reservation_id": pnr, "pnr": pnr,
             "flight_number":  item.get("flight_number", ""),
             "origin":         item.get("origin", ""),
             "destination":    item.get("destination", ""),
             "flight_date":    item.get("flight_date", ""),
         }, user_id)
         return json.dumps({
-            "ok":             True,
-            "reservation_id": reservation_id,
-            "vuelo":          item.get("flight_number", "—"),
-            "origen":         item.get("origin", "—"),
-            "destino":        item.get("destination", "—"),
-            "fecha":          item.get("flight_date", "—"),
-            "mensaje":        "Check-in realizado correctamente. Ya podés obtener tu boarding pass.",
+            "ok": True, "reservation_id": pnr,
+            "vuelo":  item.get("flight_number", "—"),
+            "origen": item.get("origin", "—"),
+            "destino": item.get("destination", "—"),
+            "fecha":  item.get("flight_date", "—"),
+            "mensaje": "Check-in realizado correctamente. Ya podés obtener tu boarding pass.",
         })
 
     if name == "get_boarding_pass":
-        reservation_id = inputs["reservation_id"]
-        log.info("get_boarding_pass: %s user=%s", reservation_id, user_id)
-        resp = table.get_item(
-            Key={"PK": f"USER#{user_id}", "SK": f"RESERVATION#{reservation_id}"}
-        )
+        pnr = inputs["reservation_id"].upper()
+        log.info("get_boarding_pass: %s user=%s", pnr, user_id)
+        # Verificamos ownership vía thin pointer
+        resp = biz_table.get_item(Key={"PK": f"USER#{user_id}", "SK": f"RESERVATION#{pnr}"})
         item = resp.get("Item")
         if not item:
-            return json.dumps({"ok": False, "mensaje": f"No se encontró la reserva {reservation_id}."})
+            return json.dumps({"ok": False, "mensaje": f"No se encontró la reserva {pnr}."})
         if item.get("status") not in ("CHECK-IN",):
             return json.dumps({"ok": False, "mensaje": "Necesitás hacer check-in antes de obtener el boarding pass."})
+        # Buscamos el BP en el PNR canonical
+        bp_resp = biz_table.get_item(Key={"PK": f"PNR#{pnr}", "SK": "BP#01"})
+        bp = bp_resp.get("Item")
+        if not bp or not bp.get("bp_url"):
+            return json.dumps({
+                "ok": True,
+                "procesando": True,
+                "mensaje": "Tu boarding pass se está generando, intentá en unos segundos.",
+            })
         return json.dumps({
             "ok":             True,
             "boarding_pass": {
-                "reservation_id": reservation_id,
+                "reservation_id": pnr,
                 "pasajero":       item.get("passenger_name", "Pasajero"),
                 "vuelo":          item.get("flight_number", "—"),
                 "origen":         item.get("origin", "—"),
                 "destino":        item.get("destination", "—"),
                 "fecha":          item.get("flight_date", "—"),
                 "asiento":        item.get("seat", "ALEATORIO"),
+                "url":            bp.get("bp_url"),
                 "grupo":          "B",
                 "puerta":         "12",
                 "embarque":       "45 min antes de la salida",
@@ -648,54 +540,68 @@ def _execute_tool(name: str, inputs: dict, user_id: str) -> str:
     if name == "create_claim":
         tipo        = inputs["tipo"]
         descripcion = inputs["descripcion"]
-        res_id      = inputs.get("reservation_id", "")
+        pnr         = inputs.get("reservation_id", "").upper()
         claim_id    = f"CLM-{str(uuid.uuid4())[:8].upper()}"
         log.info("create_claim: %s tipo=%s user=%s", claim_id, tipo, user_id)
-        from datetime import datetime, timezone as tz
-        table.put_item(Item={
-            "PK":             f"USER#{user_id}",
-            "SK":             f"CLAIM#{claim_id}",
-            "claim_id":       claim_id,
-            "tipo":           tipo,
-            "descripcion":    descripcion,
-            "reservation_id": res_id,
-            "status":         "RECIBIDO",
-            "created_at":     datetime.now(tz.utc).isoformat(),
+        now = datetime.now(timezone.utc).isoformat()
+        # CLAIM canónico en su propio namespace
+        biz_table.put_item(Item={
+            "PK":          f"CLAIM#{claim_id}",
+            "SK":          "#METADATA",
+            "claim_id":    claim_id,
+            "user_id":     user_id,
+            "tipo":        tipo,
+            "descripcion": descripcion,
+            "pnr":         pnr,
+            "status":      "RECIBIDO",
+            "created_at":  now,
         })
-        _emit_event("reclamo_iniciado", {
-            "claim_id":       claim_id,
-            "tipo":           tipo,
-            "reservation_id": res_id,
-        }, user_id)
+        # Thin pointer en USER#
+        biz_table.put_item(Item={
+            "PK":          f"USER#{user_id}",
+            "SK":          f"CLAIM#{claim_id}",
+            "claim_id":    claim_id,
+            "tipo":        tipo,
+            "status":      "RECIBIDO",
+            "pnr":         pnr,
+            "created_at":  now,
+        })
+        _emit_event("reclamo_iniciado", {"claim_id": claim_id, "tipo": tipo, "pnr": pnr}, user_id)
         return json.dumps({
-            "ok":       True,
-            "claim_id": claim_id,
-            "mensaje":  f"Reclamo registrado con código {claim_id}. Te contactaremos en 48-72 horas hábiles.",
+            "ok": True, "claim_id": claim_id,
+            "mensaje": f"Reclamo registrado con código {claim_id}. Te contactaremos en 48-72 horas hábiles.",
         })
 
     if name == "list_saved_passengers":
         log.info("list_saved_passengers: user=%s", user_id)
-        resp = table.query(
+        # Ahora los pasajeros guardados se buscan via las reservas del user (PASSENGER CRM
+        # vive en su propio namespace y se accede vía DNI/email; el chat sólo expone los
+        # nombres derivados de las reservas pasadas).
+        resp = biz_table.query(
             KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
             ExpressionAttributeValues={
                 ":pk":     f"USER#{user_id}",
-                ":prefix": "PASSENGER#",
+                ":prefix": "RESERVATION#",
             },
+            Limit=20,
         )
-        items = resp.get("Items", [])
-        if not items:
+        names_seen = {}
+        for r in resp.get("Items", []):
+            n = r.get("passenger_name") or ""
+            if not n:
+                continue
+            if n in names_seen:
+                names_seen[n] += 1
+            else:
+                names_seen[n] = 1
+        if not names_seen:
             return json.dumps({
                 "pasajeros": [],
                 "mensaje":   "No tenés pasajeros guardados. Al completar una reserva, el pasajero se guarda automáticamente.",
             })
         pasajeros = [
-            {
-                "passenger_name": i.get("passenger_name", ""),
-                "email":          i.get("email", ""),
-                "phone":          i.get("phone", ""),
-                "reservas":       int(i.get("reservation_count", 1)),
-            }
-            for i in items
+            {"passenger_name": n, "reservas": c}
+            for n, c in sorted(names_seen.items(), key=lambda x: -x[1])
         ]
         return json.dumps({"pasajeros": pasajeros})
 
@@ -705,16 +611,17 @@ def _execute_tool(name: str, inputs: dict, user_id: str) -> str:
 
         payment_id = str(uuid.uuid4())
         reservation_data = {
-            "origen":           inputs["origen"].upper(),
-            "destino":          inputs["destino"].upper(),
-            "fecha":            inputs["fecha"],
-            "pasajeros":        int(inputs.get("pasajeros", 1)),
-            "tarifa":           inputs.get("tarifa", "BASIC"),
-            "total":            float(inputs.get("total", 0)),
-            "email_contacto":   inputs.get("email_contacto", ""),
-            "telefono":         inputs.get("telefono", ""),
-            "nombre_pasajero":  inputs.get("nombre_pasajero", ""),
-            "vuelo_numero":     inputs.get("vuelo_numero", ""),
+            "origen":          inputs["origen"].upper(),
+            "destino":         inputs["destino"].upper(),
+            "fecha":           inputs["fecha"],
+            "pasajeros":       int(inputs.get("pasajeros", 1)),
+            "tarifa":          inputs.get("tarifa", "BASIC"),
+            "total":           float(inputs.get("total", 0)),
+            "email_contacto":  inputs.get("email_contacto", ""),
+            "telefono":        inputs.get("telefono", ""),
+            "nombre_pasajero": inputs.get("nombre_pasajero", ""),
+            "dni":             inputs.get("dni", ""),
+            "vuelo_numero":    inputs.get("vuelo_numero", ""),
         }
 
         log.info("create_reservation: %s→%s %s user=%s",
@@ -737,8 +644,81 @@ def _execute_tool(name: str, inputs: dict, user_id: str) -> str:
                 "mensaje":    "La reserva está siendo procesada. Aparecerá en 'Mis Reservas' en unos segundos.",
             })
         except Exception as e:
-            log.error("Error iniciando Step Functions desde create_reservation: %s", e)
+            log.error("Error iniciando Step Functions: %s", e)
             return json.dumps({"error": f"No se pudo procesar la reserva: {str(e)}"})
+
+    if name == "escalate_to_human":
+        reason  = inputs.get("reason", "sin motivo especificado")
+        urgency = inputs.get("urgency", "medium")
+        handoff_id = f"HO-{uuid.uuid4().hex[:8].upper()}"
+        now = datetime.now(timezone.utc).isoformat()
+        ttl = int(time.time()) + HANDOFF_TTL_SECONDS
+
+        log.info("escalate_to_human: handoff=%s urgency=%s user=%s", handoff_id, urgency, user_id)
+
+        # Item del ticket (conversation-scoped)
+        conv_table.put_item(Item={
+            "PK":          f"SESSION#{session_id}",
+            "SK":          f"HANDOFF#{now}#{handoff_id}",
+            "handoff_id":  handoff_id,
+            "session_id":  session_id,
+            "user_id":     user_id,
+            "reason":      reason,
+            "urgency":     urgency,
+            "status":      "QUEUED",
+            "created_at":  now,
+            "ttl":         ttl,
+        })
+        # Thin pointer por user
+        conv_table.put_item(Item={
+            "PK":          f"USER#{user_id}",
+            "SK":          f"HANDOFF#{handoff_id}",
+            "handoff_id":  handoff_id,
+            "session_id":  session_id,
+            "status":      "QUEUED",
+            "urgency":     urgency,
+            "created_at":  now,
+            "ttl":         ttl,
+        })
+
+        # Encolamos a la SQS — si el call center está caído, queda esperando
+        if HUMAN_HANDOFF_QUEUE_URL:
+            try:
+                sqs.send_message(
+                    QueueUrl=HUMAN_HANDOFF_QUEUE_URL,
+                    MessageBody=json.dumps({
+                        "handoff_id": handoff_id,
+                        "session_id": session_id,
+                        "user_id":    user_id,
+                        "reason":     reason,
+                        "urgency":    urgency,
+                        "created_at": now,
+                    }),
+                )
+            except Exception as e:
+                log.error("SQS send_message human-handoff falló: %s", e)
+                return json.dumps({
+                    "ok": False,
+                    "ticket_id": handoff_id,
+                    "mensaje": "Registramos tu pedido pero hubo un problema enviándolo al call center. Te contactaremos lo antes posible.",
+                })
+        else:
+            log.warning("HUMAN_HANDOFF_QUEUE_URL no configurado — handoff sólo persistido en DB")
+
+        _emit_event("handoff_escalated", {
+            "handoff_id": handoff_id,
+            "urgency":    urgency,
+            "reason":     reason,
+        }, user_id)
+
+        return json.dumps({
+            "ok":        True,
+            "ticket_id": handoff_id,
+            "mensaje": (
+                f"Tu pedido fue derivado al equipo de soporte humano (ticket {handoff_id}). "
+                f"Te van a contactar al email registrado según prioridad ({urgency})."
+            ),
+        })
 
     return json.dumps({"error": f"Tool desconocida: {name}"})
 
@@ -765,9 +745,6 @@ def _handle_chat(event: dict, user: dict) -> dict:
     messages = history + [{"role": "user", "content": message}]
 
     try:
-        # Bucle de tool use: Claude puede consultar datos reales antes de responder.
-        # Cada iteración: Claude responde con tool_use → ejecutamos → devolvemos resultado.
-        # El bucle termina cuando Claude devuelve texto (stop_reason != "tool_use").
         for _ in range(MAX_TOOL_ROUNDS):
             resp = _anthropic_client.messages.create(
                 model      = "claude-haiku-4-5-20251001",
@@ -780,7 +757,6 @@ def _handle_chat(event: dict, user: dict) -> dict:
             if resp.stop_reason != "tool_use":
                 break
 
-            # Iterar una sola vez: clasificar bloques del asistente y preparar tool calls
             tool_calls   = []
             content_list = []
             tool_results = []
@@ -792,7 +768,7 @@ def _handle_chat(event: dict, user: dict) -> dict:
                     content_list.append({"type": "text", "text": b.text})
 
             for tc in tool_calls:
-                result = _execute_tool(tc.name, tc.input, user_id)
+                result = _execute_tool(tc.name, tc.input, user_id, session_id)
                 log.info("Tool %s → %s", tc.name, result[:120])
                 tool_results.append({
                     "type":        "tool_result",
@@ -800,15 +776,12 @@ def _handle_chat(event: dict, user: dict) -> dict:
                     "content":     result,
                 })
 
-            # Persistir la ronda de tool use en DynamoDB (evita pérdida de contexto)
             _save_message(session_id, user_id, "assistant", content_list)
             _save_message(session_id, user_id, "user", tool_results)
 
-            # Agregar al historial en memoria: turno asistente + resultados
             messages.append({"role": "assistant", "content": content_list})
             messages.append({"role": "user",      "content": tool_results})
 
-        # Extraer texto final; default si Claude agotó las rondas de tool use sin responder
         assistant_text = next(
             (b.text for b in resp.content if hasattr(b, "text")),
             "Lo siento, no pude completar la consulta en este momento. Por favor intentá de nuevo."
@@ -820,7 +793,6 @@ def _handle_chat(event: dict, user: dict) -> dict:
         log.error("Error Anthropic API: %s", e)
         return _response(502, {"error": "Servicio de IA no disponible"})
 
-    # Extraer opciones estructuradas del response antes de guardarlo
     options = []
     match = re.search(r'\[OPCIONES:\s*([^\]]+)\]', assistant_text, re.IGNORECASE)
     if match:
@@ -835,7 +807,7 @@ def _handle_chat(event: dict, user: dict) -> dict:
 
 def _handle_reservations(user: dict) -> dict:
     user_id = _user_id(user)
-    resp    = table.query(
+    resp    = biz_table.query(
         KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
         ExpressionAttributeValues={
             ":pk":     f"USER#{user_id}",
@@ -846,7 +818,8 @@ def _handle_reservations(user: dict) -> dict:
     )
     reservations = [
         {
-            "reservation_id": i.get("reservation_id"),
+            "reservation_id": i.get("pnr"),
+            "pnr":            i.get("pnr"),
             "flight_number":  i.get("flight_number", "—"),
             "origin":         i.get("origin", "—"),
             "destination":    i.get("destination", "—"),

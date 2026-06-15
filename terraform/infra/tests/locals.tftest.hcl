@@ -55,3 +55,28 @@ run "common_tags_contiene_managed_by_terraform" {
     error_message = "El tag Environment debe propagar el valor de var.environment"
   }
 }
+
+run "table_names_son_distintos_y_bien_formados" {
+  command = plan
+
+  variables {
+    anthropic_api_key   = "sk-ant-test-key"
+    state_bucket_suffix = "test"
+    environment         = "prod"
+  }
+
+  assert {
+    condition     = local.table_conversations != local.table_business
+    error_message = "Las dos tablas deben tener nombres distintos para no colisionar en DynamoDB"
+  }
+
+  assert {
+    condition     = local.table_conversations == "jetsmart-prod-conversations"
+    error_message = "La tabla de conversations debe ser 'jetsmart-prod-conversations'"
+  }
+
+  assert {
+    condition     = local.table_business == "jetsmart-prod-business"
+    error_message = "La tabla de business (PSS-like) debe ser 'jetsmart-prod-business'"
+  }
+}

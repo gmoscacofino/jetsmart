@@ -22,16 +22,18 @@ resource "aws_lambda_function" "chat_handler" {
 
   environment {
     variables = {
-      AWS_REGION_VAR       = var.aws_region
-      DYNAMODB_TABLE_NAME  = var.dynamodb_table_name
-      SNS_TOPIC_ARN        = var.sns_topic_arn
-      ANTHROPIC_SECRET_ARN = var.anthropic_secret_arn
-      SYSTEM_PROMPT_BUCKET = var.system_prompt_bucket
-      SYSTEM_PROMPT_KEY    = var.system_prompt_key
-      SYSTEM_PROMPT_ETAG   = var.system_prompt_etag
-      STEP_FUNCTIONS_ARN   = var.step_functions_arn
-      FRONTEND_URL         = var.frontend_url
-      COGNITO_USER_POOL_ID = var.cognito_user_pool_id
+      AWS_REGION_VAR           = var.aws_region
+      CONVERSATIONS_TABLE_NAME = var.conversations_table_name
+      BUSINESS_TABLE_NAME      = var.business_table_name
+      HUMAN_HANDOFF_QUEUE_URL  = var.human_handoff_queue_url
+      SNS_TOPIC_ARN            = var.sns_topic_arn
+      ANTHROPIC_SECRET_ARN     = var.anthropic_secret_arn
+      SYSTEM_PROMPT_BUCKET     = var.system_prompt_bucket
+      SYSTEM_PROMPT_KEY        = var.system_prompt_key
+      SYSTEM_PROMPT_ETAG       = var.system_prompt_etag
+      STEP_FUNCTIONS_ARN       = var.step_functions_arn
+      FRONTEND_URL             = var.frontend_url
+      COGNITO_USER_POOL_ID     = var.cognito_user_pool_id
     }
   }
 

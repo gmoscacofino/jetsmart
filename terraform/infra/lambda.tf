@@ -80,7 +80,7 @@ resource "aws_lambda_function" "payment" {
   environment {
     variables = {
       AWS_REGION_VAR      = var.aws_region
-      DYNAMODB_TABLE_NAME = aws_dynamodb_table.main.name
+      BUSINESS_TABLE_NAME = aws_dynamodb_table.business.name
       SNS_EVENTS_ARN      = aws_sns_topic.events.arn
       ASSETS_BUCKET       = aws_s3_bucket.assets.bucket
     }
@@ -91,33 +91,117 @@ resource "aws_lambda_function" "payment" {
   }
 }
 
-# ── Lambda: Boarding Pass ─────────────────────────────────────────────────────
+# ── Lambda: Boarding Pass Async ───────────────────────────────────────────────
 #
-# Invocada directamente por Step Functions (Parallel branch PostBookingActions).
-# Recibe el estado de la reserva confirmada y genera el boarding pass en S3.
+# TP4: la generación del boarding pass se desacopló del Saga. Step Functions
+# publica un mensaje a SQS boarding-pass-generation (SDK sqs:sendMessage), y
+# esta Lambda lo consume async. Si la generación falla N veces, el mensaje
+# termina en la DLQ. La reserva ya está confirmada en este punto, así que un
+# fallo aquí no revierte el pago — sólo deja el BP pendiente de regenerar.
 
-data "archive_file" "boarding_pass" {
+data "archive_file" "boarding_pass_async" {
   type        = "zip"
-  source_file = "${path.module}/../../lambda/boarding_pass.py"
-  output_path = "${path.module}/builds/boarding_pass.zip"
+  source_file = "${path.module}/../../lambda/boarding_pass_async.py"
+  output_path = "${path.module}/builds/boarding_pass_async.zip"
 }
 
-resource "aws_lambda_function" "boarding_pass" {
-  function_name    = "${local.name_prefix}-boarding-pass"
-  filename         = data.archive_file.boarding_pass.output_path
-  source_code_hash = data.archive_file.boarding_pass.output_base64sha256
+resource "aws_lambda_function" "boarding_pass_async" {
+  function_name    = "${local.name_prefix}-boarding-pass-async"
+  filename         = data.archive_file.boarding_pass_async.output_path
+  source_code_hash = data.archive_file.boarding_pass_async.output_base64sha256
   runtime          = "python3.12"
-  handler          = "boarding_pass.handler"
+  handler          = "boarding_pass_async.handler"
   role             = data.aws_iam_role.lab_role.arn
   timeout          = var.lambda_timeout
 
   environment {
     variables = {
       AWS_REGION_VAR      = var.aws_region
-      DYNAMODB_TABLE_NAME = aws_dynamodb_table.main.name
+      BUSINESS_TABLE_NAME = aws_dynamodb_table.business.name
       ASSETS_BUCKET       = aws_s3_bucket.assets.bucket
     }
   }
+}
+
+resource "aws_lambda_event_source_mapping" "boarding_pass_async_sqs" {
+  event_source_arn = aws_sqs_queue.boarding_pass_generation.arn
+  function_name    = aws_lambda_function.boarding_pass_async.arn
+  batch_size       = 1
+}
+
+# ── Lambda: Human Handoff Processor ───────────────────────────────────────────
+#
+# Consume mensajes de la cola human-handoff cuando el chatbot deriva al usuario
+# a un agente humano. Hace un mock del POST al sistema del call center y
+# actualiza el ticket HANDOFF# en conversations table a status=ACK.
+
+data "archive_file" "human_handoff_processor" {
+  type        = "zip"
+  source_file = "${path.module}/../../lambda/human_handoff_processor.py"
+  output_path = "${path.module}/builds/human_handoff_processor.zip"
+}
+
+resource "aws_lambda_function" "human_handoff_processor" {
+  function_name    = "${local.name_prefix}-human-handoff-processor"
+  filename         = data.archive_file.human_handoff_processor.output_path
+  source_code_hash = data.archive_file.human_handoff_processor.output_base64sha256
+  runtime          = "python3.12"
+  handler          = "human_handoff_processor.handler"
+  role             = data.aws_iam_role.lab_role.arn
+  timeout          = var.lambda_timeout
+
+  environment {
+    variables = {
+      AWS_REGION_VAR           = var.aws_region
+      CONVERSATIONS_TABLE_NAME = aws_dynamodb_table.conversations.name
+      SNS_NOTIFICATIONS_ARN    = aws_sns_topic.notifications.arn
+    }
+  }
+}
+
+resource "aws_lambda_event_source_mapping" "human_handoff_sqs" {
+  event_source_arn = aws_sqs_queue.human_handoff.arn
+  function_name    = aws_lambda_function.human_handoff_processor.arn
+  batch_size       = 5
+}
+
+# ── Lambda: Proactive Notifications ───────────────────────────────────────────
+#
+# Consume mensajes de la cola proactive-notifications cuando el sistema de
+# operaciones publica un evento de cancelación/cambio de vuelo a SNS
+# flight-events. Hace Query a GSI2 ReservationsByFlight para encontrar todos
+# los PNRs afectados y publica un email personalizado por usuario via SNS
+# notifications.
+
+data "archive_file" "proactive_notifications" {
+  type        = "zip"
+  source_file = "${path.module}/../../lambda/proactive_notifications.py"
+  output_path = "${path.module}/builds/proactive_notifications.zip"
+}
+
+resource "aws_lambda_function" "proactive_notifications" {
+  function_name    = "${local.name_prefix}-proactive-notifications"
+  filename         = data.archive_file.proactive_notifications.output_path
+  source_code_hash = data.archive_file.proactive_notifications.output_base64sha256
+  runtime          = "python3.12"
+  handler          = "proactive_notifications.handler"
+  role             = data.aws_iam_role.lab_role.arn
+  timeout          = var.lambda_timeout
+
+  environment {
+    variables = {
+      AWS_REGION_VAR        = var.aws_region
+      BUSINESS_TABLE_NAME   = aws_dynamodb_table.business.name
+      SNS_NOTIFICATIONS_ARN = aws_sns_topic.notifications.arn
+      SNS_EVENTS_ARN        = aws_sns_topic.events.arn
+    }
+  }
+}
+
+resource "aws_lambda_event_source_mapping" "proactive_notifications_sqs" {
+  event_source_arn = aws_sqs_queue.proactive_notifications.arn
+  function_name    = aws_lambda_function.proactive_notifications.arn
+  batch_size       = 5
 }
 
 # ── Lambda: Notification ──────────────────────────────────────────────────────

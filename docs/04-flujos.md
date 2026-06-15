@@ -147,13 +147,17 @@ ConfirmBooking  (Lambda payment-confirm-booking)
   Publica evento en SNS `events`
         ↓
 PostBookingActions  (estado Parallel)
-  ├── BoardingPass   (Lambda boarding-pass)
-  │       Genera boarding pass, sube a S3, pre-signed URL 15 min
+  ├── EnqueueBoardingPass   (SDK integration sqs:sendMessage — TP4)
+  │       Publica el state actual a SQS boarding-pass-generation.
+  │       La Lambda boarding_pass_async lo consume async y genera el BP
+  │       en S3 + bp_url en business table. No bloquea la confirmación.
   └── Notification   (Lambda notification)
           Envía notificación de éxito al usuario
         ↓
 BookingConfirmed ✓
 ```
+
+> **Cambio TP4:** boarding pass salió del path sync del Saga. Si la generación falla, queda en DLQ sin afectar la reserva ya confirmada. El usuario consulta el BP con `get_boarding_pass` y, si todavía no se generó, recibe "tu boarding pass se está generando, intentá en unos segundos".
 
 ### Compensaciones automáticas
 
@@ -188,30 +192,148 @@ Step Functions centraliza la orquestación en la ASL. Las Lambdas sólo hacen su
 
 ---
 
-## Flujo 4 — Boarding pass
+## Flujo 4 — Boarding pass (async via SQS — TP4)
 
-Corre como una rama del estado `Parallel` `PostBookingActions` dentro de la Saga.
+TP4: el boarding pass se desacopló del path sync del Saga. Ahora corre como un fire-and-forget desde Step Functions.
 
 ```
-Step Functions invoca Lambda `boarding-pass` con el contexto de la reserva
+Step Functions PostBookingActions Branch B (TP4)
+  estado "EnqueueBoardingPass" — SDK integration arn:aws:states:::sqs:sendMessage
         ↓
-Lambda lee la reserva y los pasajeros desde DynamoDB
+Publica el state completo (JSON serializado con States.JsonToString) a:
+  SQS boarding-pass-generation
+        ↓ trigger event_source_mapping (batch_size=1)
+Lambda boarding_pass_async
         ↓
-Lambda genera el contenido del boarding pass (texto)
+Lambda parsea el estado, genera el contenido del boarding pass (texto)
         ↓
-Lambda sube el archivo al bucket S3 `jetsmart-prod-<account-id>-assets`:
-  ruta: boarding-passes/{reserva_id}/{pasajero_id}.txt
+Lambda sube el archivo al bucket S3 jetsmart-prod-<account-id>-assets:
+  ruta: boarding-passes/{user_id}/{pnr}.txt
   SSE-S3, public access block activo
         ↓
 Lambda genera pre-signed URL (válida 15 min, sólo para este objeto)
         ↓
-Lambda devuelve la URL a Step Functions → entra en el resultado de PostBookingActions
+Lambda hace PutItem en business table:
+  PNR#{pnr}/BP#01  con  s3_key + bp_url + issued_at
         ↓
-Cuando el usuario consulta `get_boarding_pass` en el chat,
-chat-handler devuelve la URL pre-firmada
+[Async] Cuando el usuario consulta `get_boarding_pass` en el chat,
+chat-handler hace GetItem PNR#/BP#01:
+  - Si existe → devuelve la pre-signed URL
+  - Si todavía no existe → devuelve "tu boarding pass se está generando, intentá en unos segundos"
 ```
 
+### Por qué async
+
+Si la generación del BP fallara, antes detenía toda la confirmación de la reserva (el usuario podía no ver su PNR confirmado por un error post-pago). Con esta arquitectura:
+
+- La reserva queda confirmada de inmediato; el BP no es bloqueante.
+- Si la Lambda `boarding_pass_async` falla N veces, el mensaje cae a la **DLQ boarding-pass-generation-dlq** (retención 14d) y dispara la alarma CloudWatch. El usuario igualmente puede consultar su BP más tarde — se puede reintentar manualmente reenqueueando.
+- Demostramos el patrón de **decoupling fire-and-forget** desde Step Functions hacia SQS, que es lo que se vería en una arquitectura productiva.
+
 El bucket es privado — la pre-signed URL es el único modo de descarga.
+
+---
+
+## Flujo 7 — Derivación a humano (TP4)
+
+Permite al usuario hablar con un agente humano cuando el chatbot no puede resolver su problema. Detrás de escena, decopla el chatbot del sistema del call center.
+
+```
+Usuario escribe: "quiero hablar con un humano"
+        ↓
+chat_handler invoca el modelo Claude
+        ↓
+Claude evalúa el intent y decide invocar la tool `escalate_to_human`
+con parámetros: { reason, urgency }
+        ↓
+chat_handler:
+  1. Genera handoff_id (HO-XXXXXXXX)
+  2. Pone Item en conversations table:
+       SESSION#{session_id} / HANDOFF#{ts}#{handoff_id}  (status=QUEUED, TTL 30d)
+     Y thin pointer:
+       USER#{user_id} / HANDOFF#{handoff_id}             (status=QUEUED, TTL 30d)
+  3. Envía mensaje a SQS human-handoff:
+       { handoff_id, session_id, user_id, reason, urgency, created_at }
+  4. Publica evento "handoff_escalated" a SNS events (analytics)
+  5. Responde al usuario: "Tu pedido fue derivado al equipo de soporte humano
+     (ticket HO-XXXXXXXX). Te van a contactar al email registrado según prioridad."
+        ↓ trigger event_source_mapping (batch_size=5)
+Lambda human_handoff_processor
+        ↓
+  1. MOCK POST https://mock.callcenter.internal/tickets
+     (en producción: HTTP real al CRM del call center)
+  2. Recibe call_center_ticket (CC-XXXXXXXX) del sistema externo
+  3. UpdateItem HANDOFF# en conversations:
+       status=ACK, call_center_ticket=CC-XXXX, acked_at=now
+  4. Publica email vía SNS notifications:
+       Subject: "Tu solicitud de soporte fue derivada — HO-XXXX"
+       Body:    ticket id, prioridad, motivo, "un agente te va a contactar"
+```
+
+### Por qué SQS y no llamada directa al call center
+
+- **Decopla disponibilidad:** si el call center está caído, el chatbot sigue respondiendo. El pedido queda esperando en la cola.
+- **Reintentos automáticos con DLQ:** si la Lambda `human_handoff_processor` falla, SQS reintenta hasta 3 veces. Después cae a `human-handoff-dlq` (retención 14d) y dispara alarma CloudWatch.
+- **Trazabilidad:** todos los handoffs quedan registrados en conversations table con TTL de 30d para auditoría.
+
+### Mock del call center
+
+En este TP el "POST al call center" se loguea en CloudWatch como `MOCK POST https://mock.callcenter.internal/tickets`. En producción sería una llamada HTTP real a un sistema externo (Salesforce Service Cloud, Genesys, Zendesk Talk, etc.).
+
+---
+
+## Flujo 8 — Notificaciones proactivas (TP4)
+
+Cuando un vuelo se cancela en el sistema de operaciones, todos los pasajeros afectados reciben automáticamente una notificación por email. Habilita el caso de uso "tormenta cancela vuelo → 5000 pasajeros enterados antes de llegar al aeropuerto".
+
+> **Nota del demo:** este flujo NO se dispara en vivo durante la presentación. El disparador (`scripts/cancel_flight.py`) se ejecuta offline antes de la demo para validar que funcione, y en la defensa se muestra el diagrama + los logs en CloudWatch de la corrida previa.
+
+```
+[Disparador — en producción sería el sistema PSS de ops; en TP es un script]
+$ python3 scripts/cancel_flight.py JA203 2026-06-20 "mal tiempo en Mendoza"
+        ↓
+Script:
+  1. Query GSI1 FlightByNumber (HK=JA203, RK=2026-06-20) → encuentra
+     el item FLIGHT#AEP#MDZ/DATE#2026-06-20#FLIGHT#JA203
+  2. UpdateItem: estado_vuelo=CANCELADO, cancellation_reason, cancellation_at
+  3. Publica evento a SNS flight-events:
+     { event_type: "flight_cancelled", vuelo_numero: "JA203", fecha: "2026-06-20", reason: "..." }
+        ↓ fan-out (subscription sqs)
+SQS proactive-notifications  (+ DLQ)
+        ↓ trigger event_source_mapping (batch_size=5)
+Lambda proactive_notifications
+        ↓
+  1. Parsea body (SNS-wrapped: extrae .Message del envelope)
+  2. Query GSI2 ReservationsByFlight con HK=FLIGHT#JA203#2026-06-20
+     → devuelve TODOS los items SEGMENT# del vuelo (1 query, no scan)
+     → cada uno tiene user_id, email, passenger_name, pnr
+  3. Para cada PNR:
+     UpdateItem PNR#{pnr}/#METADATA  set status=AFFECTED_BY_CANCELLATION
+                                          cancellation_reason
+                                          cancellation_notified_at
+  4. Dedup emails únicos (un user con varios PNRs en el mismo vuelo no recibe duplicados)
+  5. Para cada email único:
+     SNS publish a notifications:
+       Subject: "Cancelación de vuelo JA203 — 2026-06-20"
+       Body:    PNR, motivo, instrucciones de reprogramación
+  6. Publica evento "flight_cancellation_notified" a SNS events (analytics)
+```
+
+### Por qué GSI2 ReservationsByFlight
+
+Sin este índice, encontrar "qué pasajeros están en el vuelo X del día Y" requiere un Scan de toda la tabla business — O(n) lineal sobre todas las reservas históricas. Con GSI2, una sola Query devuelve el resultado en O(log n) — el atributo `gsi2pk = FLIGHT#{vuelo}#{fecha}` se estampa en cada item SEGMENT# en el momento del booking.
+
+**Es el GSI clave del TP4** — habilita el caso de uso "ops cancela un vuelo, el sistema notifica automáticamente a todos los afectados".
+
+### Por qué SNS → SQS → Lambda
+
+- **SNS flight-events**: punto de fan-out. Mañana podríamos sumar otros suscriptores (sistema de reembolsos automáticos, dashboard ops, etc.) sin tocar al publisher.
+- **SQS**: buffer ante picos (durante una tormenta se cancelan 20 vuelos en 5 minutos → 20 mensajes que la Lambda procesa con batching).
+- **DLQ con alarma**: si la Lambda falla, los mensajes no se pierden — quedan 14 días en `proactive-notifications-dlq` y CloudWatch dispara alarma.
+
+### Por qué offline en el demo y no en vivo
+
+El demo en vivo se concentra en el flujo end-to-end del chatbot (login → search → reserva → check-in → BP async → derivación a humano). Disparar la cancelación en vivo agregaría riesgo (depender de CLI + creds + email subscription) y no demuestra nada distinto a lo que muestran los CloudWatch logs de una corrida previa. La cancelación se ejecuta antes de la presentación; durante la defensa se muestra el diagrama, los logs persistidos, y la respuesta de la pregunta "¿cómo se dispararía en producción?".
 
 ---
 

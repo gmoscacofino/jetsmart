@@ -43,9 +43,24 @@ output "sns_events_arn" {
   value       = aws_sns_topic.events.arn
 }
 
-output "dynamodb_table_name" {
-  description = "Nombre de la tabla DynamoDB"
-  value       = aws_dynamodb_table.main.name
+output "conversations_table_name" {
+  description = "Nombre de la tabla DynamoDB de conversaciones (chatbot state)"
+  value       = aws_dynamodb_table.conversations.name
+}
+
+output "business_table_name" {
+  description = "Nombre de la tabla DynamoDB de negocio (PSS-like: vuelos, PNRs, pasajeros)"
+  value       = aws_dynamodb_table.business.name
+}
+
+output "conversations_table_arn" {
+  description = "ARN de la tabla DynamoDB de conversaciones"
+  value       = aws_dynamodb_table.conversations.arn
+}
+
+output "business_table_arn" {
+  description = "ARN de la tabla DynamoDB de negocio"
+  value       = aws_dynamodb_table.business.arn
 }
 
 output "sqs_analytics_url" {
@@ -56,6 +71,41 @@ output "sqs_analytics_url" {
 output "sqs_booking_failed_dlq_url" {
   description = "URL de la DLQ de reservas fallidas"
   value       = aws_sqs_queue.booking_failed_dlq.url
+}
+
+output "sqs_human_handoff_url" {
+  description = "URL de la cola SQS de derivación a humano"
+  value       = aws_sqs_queue.human_handoff.url
+}
+
+output "sqs_human_handoff_dlq_url" {
+  description = "URL de la DLQ de derivación a humano"
+  value       = aws_sqs_queue.human_handoff_dlq.url
+}
+
+output "sqs_proactive_notifications_url" {
+  description = "URL de la cola SQS de notificaciones proactivas"
+  value       = aws_sqs_queue.proactive_notifications.url
+}
+
+output "sqs_proactive_notifications_dlq_url" {
+  description = "URL de la DLQ de notificaciones proactivas"
+  value       = aws_sqs_queue.proactive_notifications_dlq.url
+}
+
+output "sqs_boarding_pass_generation_url" {
+  description = "URL de la cola SQS de generación async de boarding pass"
+  value       = aws_sqs_queue.boarding_pass_generation.url
+}
+
+output "sqs_boarding_pass_generation_dlq_url" {
+  description = "URL de la DLQ de boarding pass generation"
+  value       = aws_sqs_queue.boarding_pass_generation_dlq.url
+}
+
+output "sns_flight_events_arn" {
+  description = "ARN del topic SNS de eventos de operaciones (cancelaciones, demoras)"
+  value       = aws_sns_topic.flight_events.arn
 }
 
 output "analytics_processor_function_name" {

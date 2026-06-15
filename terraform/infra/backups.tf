@@ -81,9 +81,10 @@ resource "aws_lambda_function" "backup_dynamodb" {
 
   environment {
     variables = {
-      AWS_REGION_VAR = var.aws_region
-      TABLE_ARN      = aws_dynamodb_table.main.arn
-      BACKUP_BUCKET  = aws_s3_bucket.backups.bucket
+      AWS_REGION_VAR          = var.aws_region
+      CONVERSATIONS_TABLE_ARN = aws_dynamodb_table.conversations.arn
+      BUSINESS_TABLE_ARN      = aws_dynamodb_table.business.arn
+      BACKUP_BUCKET           = aws_s3_bucket.backups.bucket
     }
   }
 
