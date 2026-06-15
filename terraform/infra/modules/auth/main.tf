@@ -204,6 +204,21 @@ resource "aws_api_gateway_stage" "prod" {
   stage_name    = var.environment
 }
 
+# Throttling — limita el ratio de codes intercambiados / logouts. Sin esto, un
+# atacante podría martillear /callback con codes aleatorios consumiendo invokes
+# de la Lambda (y costo). Más conservador que chatbot-api (5/10 vs 10/20) porque
+# el flujo de auth es raro por usuario (login + logout cada algunas horas).
+resource "aws_api_gateway_method_settings" "all" {
+  rest_api_id = aws_api_gateway_rest_api.auth.id
+  stage_name  = aws_api_gateway_stage.prod.stage_name
+  method_path = "*/*"
+
+  settings {
+    throttling_burst_limit = 10
+    throttling_rate_limit  = 5
+  }
+}
+
 resource "aws_lambda_permission" "api_gateway_callback" {
   statement_id  = "AllowAPIGatewayInvoke"
   action        = "lambda:InvokeFunction"

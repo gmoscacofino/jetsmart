@@ -3,6 +3,15 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!--
+    Content Security Policy — defensa en profundidad contra XSS.
+    'unsafe-inline' en script-src/style-src es necesario por inline onclick
+    y <script> embebido en este archivo; en prod se removería refactorizando
+    a addEventListener + scripts externos. connect-src restringe AJAX al
+    chatbot-api y al token endpoint de Cognito, bloqueando exfiltración de
+    tokens hacia dominios atacantes incluso si se inyectara JS malicioso.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https://*.execute-api.us-east-1.amazonaws.com https://*.auth.us-east-1.amazoncognito.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://*.auth.us-east-1.amazoncognito.com" />
   <title>JetSmart — Asistente Virtual</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
