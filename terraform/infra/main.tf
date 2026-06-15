@@ -23,15 +23,15 @@ module "chatbot_lambda" {
   human_handoff_queue_url  = aws_sqs_queue.human_handoff.url
   sns_topic_arn            = aws_sns_topic.events.arn
   anthropic_secret_arn     = aws_secretsmanager_secret.anthropic_key.arn
-  system_prompt_bucket     = aws_s3_bucket.assets.id
-  system_prompt_key        = aws_s3_object.system_prompt.key
-  system_prompt_etag       = aws_s3_object.system_prompt.etag
   step_functions_arn       = aws_sfn_state_machine.booking.arn
-  layer_arns               = [aws_lambda_layer_version.anthropic.arn]
-  environment              = var.environment
-  frontend_url             = "http://${aws_s3_bucket_website_configuration.frontend.website_endpoint}"
-  cognito_user_pool_id     = module.auth.user_pool_id
-  cognito_user_pool_arn    = module.auth.user_pool_arn
+  layer_arns = [
+    aws_lambda_layer_version.anthropic.arn,
+    aws_lambda_layer_version.system_prompt.arn,
+  ]
+  environment           = var.environment
+  frontend_url          = "http://${aws_s3_bucket_website_configuration.frontend.website_endpoint}"
+  cognito_user_pool_id  = module.auth.user_pool_id
+  cognito_user_pool_arn = module.auth.user_pool_arn
 
   depends_on = [
     aws_dynamodb_table.conversations,
@@ -40,7 +40,7 @@ module "chatbot_lambda" {
     aws_sns_topic.events,
     aws_sfn_state_machine.booking,
     aws_secretsmanager_secret_version.anthropic_key,
-    aws_s3_object.system_prompt,
+    aws_lambda_layer_version.system_prompt,
     module.auth,
   ]
 }

@@ -38,28 +38,22 @@ resource "aws_s3_bucket_policy" "frontend" {
   depends_on = [aws_s3_bucket_public_access_block.frontend]
 }
 
-# ── S3: System prompt del chatbot ────────────────────────────────────────────
+# ── S3: Boarding passes ───────────────────────────────────────────────────────
 #
-# Almacenado en S3 para evitar el límite de 4KB de env vars de Lambda.
-# La Lambda lo lee desde S3 en el cold start — sin restricción de tamaño.
+# Bucket privado donde la Lambda boarding-pass-async escribe los BP de cada PNR.
+# El contenido es write-once por PNR (no hay overwrites) y se accede vía
+# presigned URL desde el chatbot.
+#
+# Renombrado desde "assets" en TP4: cuando el system prompt se movió a Lambda
+# Layer, el bucket pasó a contener únicamente boarding passes.
 
-resource "aws_s3_object" "system_prompt" {
-  bucket       = aws_s3_bucket.assets.id
-  key          = "config/system_prompt.txt"
-  source       = "${path.module}/templates/system_prompt.tpl"
-  content_type = "text/plain"
-  etag         = filemd5("${path.module}/templates/system_prompt.tpl")
-}
-
-# ── S3: Assets privados (boarding passes, backups) ────────────────────────────
-
-resource "aws_s3_bucket" "assets" {
-  bucket        = "${local.name_prefix}-${data.aws_caller_identity.current.account_id}-assets"
+resource "aws_s3_bucket" "boarding_passes" {
+  bucket        = "${local.name_prefix}-${data.aws_caller_identity.current.account_id}-boarding-passes"
   force_destroy = true
 }
 
-resource "aws_s3_bucket_public_access_block" "assets" {
-  bucket = aws_s3_bucket.assets.id
+resource "aws_s3_bucket_public_access_block" "boarding_passes" {
+  bucket = aws_s3_bucket.boarding_passes.id
 
   block_public_acls       = true
   block_public_policy     = true
@@ -67,8 +61,8 @@ resource "aws_s3_bucket_public_access_block" "assets" {
   restrict_public_buckets = true
 }
 
-resource "aws_s3_bucket_server_side_encryption_configuration" "assets" {
-  bucket = aws_s3_bucket.assets.id
+resource "aws_s3_bucket_server_side_encryption_configuration" "boarding_passes" {
+  bucket = aws_s3_bucket.boarding_passes.id
 
   rule {
     apply_server_side_encryption_by_default {
@@ -77,27 +71,33 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "assets" {
   }
 }
 
-resource "aws_s3_bucket_lifecycle_configuration" "assets" {
-  bucket = aws_s3_bucket.assets.id
+# Versionado ON — protege contra delete accidental (feedback de Faustino en TP2).
+# Los BP son write-once por PNR; el riesgo real es DELETE, no overwrite. El
+# noncurrent_version_expiration evita acumulación infinita de versiones huérfanas
+# después de que la regla de expiración corre.
+resource "aws_s3_bucket_versioning" "boarding_passes" {
+  bucket = aws_s3_bucket.boarding_passes.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "boarding_passes" {
+  bucket = aws_s3_bucket.boarding_passes.id
 
   rule {
     id     = "expire-boarding-passes"
     status = "Enabled"
 
-    filter { prefix = "boarding-passes/" }
+    filter {}
 
     expiration { days = 90 }
-  }
 
-  rule {
-    id     = "archive-backups"
-    status = "Enabled"
-
-    filter { prefix = "backups/" }
-
-    transition {
-      days          = 30
-      storage_class = "STANDARD_IA"
+    noncurrent_version_expiration {
+      noncurrent_days = 30
     }
   }
+
+  depends_on = [aws_s3_bucket_versioning.boarding_passes]
 }

@@ -44,12 +44,13 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      # ZIP placeholder para que filebase64sha256() no falle en validate/test.
-      # No contiene código real — el deploy job construye el layer real.
-      - name: Create placeholder layer ZIP
+      # ZIPs placeholder para que filebase64sha256() no falle en validate/test.
+      # No contienen contenido real — el deploy job construye los layers reales.
+      - name: Create placeholder layer ZIPs
         run: |
           mkdir -p builds
           python3 -c "import zipfile; zipfile.ZipFile('builds/anthropic-layer.zip', 'w').close()"
+          python3 -c "import zipfile; zipfile.ZipFile('builds/system-prompt-layer.zip', 'w').close()"
 
       # -backend=false evita conectarse a S3 — solo inicializa providers
       - name: Terraform Init (sin backend)
@@ -270,11 +271,12 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      # Para destroy solo se necesita el ZIP — no hace falta compilar el layer real
-      - name: Create placeholder layer ZIP
+      # Para destroy solo se necesitan los ZIPs — no hace falta compilar los layers reales
+      - name: Create placeholder layer ZIPs
         run: |
           mkdir -p builds
           python3 -c "import zipfile; zipfile.ZipFile('builds/anthropic-layer.zip', 'w').close()"
+          python3 -c "import zipfile; zipfile.ZipFile('builds/system-prompt-layer.zip', 'w').close()"
 
       - name: Terraform Init
         run: |
@@ -285,14 +287,19 @@ jobs:
             -backend-config="use_lockfile=true" \
             -backend-config="encrypt=true"
 
+      # Pre-vaciado de buckets para acelerar terraform destroy. force_destroy=true
+      # está en todos los buckets — Terraform también maneja versiones y delete markers
+      # del bucket boarding-passes (con versioning habilitado).
       - name: Vaciar buckets S3 antes de destruir
         run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           for BUCKET in \
-            "jetsmart-prod-$(aws sts get-caller-identity --query Account --output text)-frontend" \
-            "jetsmart-prod-$(aws sts get-caller-identity --query Account --output text)-assets" \
-            "jetsmart-prod-$(aws sts get-caller-identity --query Account --output text)-analytics"; do
-            echo "Vaciando s3://$BUCKET ..."
-            aws s3 rm "s3://$BUCKET" --recursive --region ${{ env.AWS_REGION }} 2>/dev/null || true
+            "jetsmart-prod-${ACCOUNT_ID}-frontend" \
+            "jetsmart-prod-${ACCOUNT_ID}-boarding-passes" \
+            "jetsmart-prod-${ACCOUNT_ID}-analytics" \
+            "jetsmart-prod-${ACCOUNT_ID}-backups"; do
+            echo "Vaciando s3://${BUCKET} ..."
+            aws s3 rm "s3://${BUCKET}" --recursive --region "${{ env.AWS_REGION }}" 2>/dev/null || true
           done
 
       - name: Terraform Destroy

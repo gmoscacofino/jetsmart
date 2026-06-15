@@ -33,21 +33,6 @@ variable "anthropic_secret_arn" {
   type        = string
 }
 
-variable "system_prompt_bucket" {
-  description = "S3 bucket que contiene el system prompt"
-  type        = string
-}
-
-variable "system_prompt_key" {
-  description = "S3 key del archivo con el system prompt"
-  type        = string
-}
-
-variable "system_prompt_etag" {
-  description = "MD5 del system prompt — fuerza un redeploy de Lambda cuando el prompt cambia"
-  type        = string
-}
-
 variable "step_functions_arn" {
   description = "ARN del state machine de Step Functions — chat handler arranca una ejecución para iniciar el flujo de pago"
   type        = string

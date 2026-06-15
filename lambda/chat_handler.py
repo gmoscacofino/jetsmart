@@ -15,9 +15,9 @@ HUMAN_HANDOFF_QUEUE_URL = os.environ.get("HUMAN_HANDOFF_QUEUE_URL", "")
 SNS_TOPIC_ARN        = os.environ["SNS_TOPIC_ARN"]
 SECRET_ARN           = os.environ["ANTHROPIC_SECRET_ARN"]
 SF_ARN               = os.environ.get("STEP_FUNCTIONS_ARN", "")
-SYSTEM_PROMPT_BUCKET = os.environ["SYSTEM_PROMPT_BUCKET"]
-SYSTEM_PROMPT_KEY    = os.environ["SYSTEM_PROMPT_KEY"]
 FRONTEND_URL         = os.environ.get("FRONTEND_URL") or "*"
+
+SYSTEM_PROMPT_PATH   = "/opt/system_prompt.txt"
 
 dynamodb   = boto3.resource("dynamodb", region_name=REGION)
 conv_table = dynamodb.Table(CONV_TABLE_NAME)
@@ -26,7 +26,6 @@ sns        = boto3.client("sns", region_name=REGION)
 sqs        = boto3.client("sqs", region_name=REGION)
 sm         = boto3.client("secretsmanager", region_name=REGION)
 sf         = boto3.client("stepfunctions", region_name=REGION)
-s3         = boto3.client("s3", region_name=REGION)
 
 MAX_HISTORY     = 40
 MSG_TTL_SECONDS = 7 * 24 * 3600
@@ -40,8 +39,8 @@ def _init_anthropic() -> anthropic.Anthropic:
     return anthropic.Anthropic(api_key=api_key)
 
 def _load_system_prompt() -> str:
-    obj = s3.get_object(Bucket=SYSTEM_PROMPT_BUCKET, Key=SYSTEM_PROMPT_KEY)
-    return obj["Body"].read().decode("utf-8")
+    with open(SYSTEM_PROMPT_PATH, "r", encoding="utf-8") as f:
+        return f.read()
 
 _anthropic_client  = _init_anthropic()
 _raw_system_prompt = _load_system_prompt()

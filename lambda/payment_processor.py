@@ -34,7 +34,6 @@ log.setLevel(logging.INFO)
 REGION        = os.environ["AWS_REGION_VAR"]
 TABLE_NAME    = os.environ["BUSINESS_TABLE_NAME"]
 SNS_EVENTS    = os.environ.get("SNS_EVENTS_ARN", "")
-ASSETS_BUCKET = os.environ.get("ASSETS_BUCKET", "")
 
 dynamodb = boto3.resource("dynamodb", region_name=REGION)
 table    = dynamodb.Table(TABLE_NAME)

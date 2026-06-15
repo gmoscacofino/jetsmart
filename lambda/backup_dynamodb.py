@@ -2,12 +2,15 @@
 Lambda: DynamoDB on-demand export to S3.
 
 Triggered by EventBridge on a daily cron. Fires a DynamoDB
-ExportTableToPointInTime against BOTH tables (conversations + business)
-— DynamoDB processes the exports asynchronously in the background and
-writes the results to the backups bucket under
-dynamodb/{table_name}/YYYY-MM-DD/.
+ExportTableToPointInTime against the BUSINESS table only — DynamoDB
+processes the export asynchronously in the background and writes the
+result to the backups bucket under dynamodb/business/YYYY-MM-DD/.
 
-Requires Point-in-Time Recovery enabled on the source tables (it is —
+`conversations` no se exporta: la tabla es efímera por diseño (TTL),
+los eventos de negocio relevantes ya viajan al data lake `analytics/events/`
+y PITR cubre el escenario de delete accidental dentro de los últimos 35 días.
+
+Requires Point-in-Time Recovery enabled on the business table (it is —
 see terraform/infra/database.tf).
 """
 import datetime as dt
@@ -21,9 +24,8 @@ log.setLevel(logging.INFO)
 
 dynamodb = boto3.client("dynamodb")
 
-CONVERSATIONS_TABLE_ARN = os.environ["CONVERSATIONS_TABLE_ARN"]
-BUSINESS_TABLE_ARN      = os.environ["BUSINESS_TABLE_ARN"]
-BACKUP_BUCKET           = os.environ["BACKUP_BUCKET"]
+BUSINESS_TABLE_ARN = os.environ["BUSINESS_TABLE_ARN"]
+BACKUP_BUCKET      = os.environ["BACKUP_BUCKET"]
 
 
 def _export_table(table_arn: str, today: str) -> dict:
@@ -52,12 +54,9 @@ def _export_table(table_arn: str, today: str) -> dict:
 def handler(event, context):
     today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
 
-    exports = []
-    for arn in (CONVERSATIONS_TABLE_ARN, BUSINESS_TABLE_ARN):
-        try:
-            exports.append(_export_table(arn, today))
-        except Exception as e:
-            log.error("Error exportando %s: %s", arn, e)
-            exports.append({"table": arn, "error": str(e)})
-
-    return {"exports": exports}
+    try:
+        export = _export_table(BUSINESS_TABLE_ARN, today)
+        return {"exports": [export]}
+    except Exception as e:
+        log.error("Error exportando %s: %s", BUSINESS_TABLE_ARN, e)
+        return {"exports": [{"table": BUSINESS_TABLE_ARN, "error": str(e)}]}

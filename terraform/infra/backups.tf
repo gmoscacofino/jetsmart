@@ -2,8 +2,12 @@
 #
 # Mecanismo de backup complementario al PITR (point_in_time_recovery enabled en
 # database.tf). PITR cubre los últimos 35 días de forma continua; los exports a
-# S3 cubren retención de archivo más larga y sobreviven a eventos catastróficos
-# (borrado accidental de la tabla, PITR deshabilitado).
+# S3 cubren retención de archivo plurianual para compliance regulatoria.
+#
+# Alcance (TP4): solo la tabla `business`. La tabla `conversations` no se
+# exporta — es efímera por diseño (TTL), los eventos relevantes ya viajan al
+# data lake `analytics/events/` y PITR cubre el delete accidental sin sumar
+# storage en S3.
 #
 # Flujo:
 #   EventBridge cron diario 03:00 UTC
@@ -11,12 +15,14 @@
 #   Lambda backup-dynamodb
 #         ↓ dynamodb:ExportTableToPointInTime (async, corre en background)
 #   S3 bucket dedicado de backups
-#     dynamodb/YYYY-MM-DD/AWSDynamoDB/<export-id>/data/*.json.gz
+#     dynamodb/business/YYYY-MM-DD/AWSDynamoDB/<export-id>/data/*.json.gz
 #
-# Lifecycle:
-#   - 0-90 días: STANDARD
-#   - 90-365 días: GLACIER (acceso poco frecuente, restauración 3-5h)
-#   - 365 días: expira
+# Lifecycle progresivo (alineado a retención AFIP RG 1415, 10 años):
+#   -    0 días: STANDARD
+#   -   30 días: STANDARD_IA   (acceso esporádico, retrieval inmediato)
+#   -   90 días: GLACIER       (retrieval 3-5 h)
+#   -  365 días: DEEP_ARCHIVE  (retrieval 12 h, costo mínimo)
+#   - 3650 días: expira
 
 # ── S3: bucket dedicado de backups ────────────────────────────────────────────
 
@@ -54,11 +60,21 @@ resource "aws_s3_bucket_lifecycle_configuration" "backups" {
     filter { prefix = "dynamodb/" }
 
     transition {
+      days          = 30
+      storage_class = "STANDARD_IA"
+    }
+
+    transition {
       days          = 90
       storage_class = "GLACIER"
     }
 
-    expiration { days = 365 }
+    transition {
+      days          = 365
+      storage_class = "DEEP_ARCHIVE"
+    }
+
+    expiration { days = 3650 }
   }
 }
 
@@ -81,10 +97,9 @@ resource "aws_lambda_function" "backup_dynamodb" {
 
   environment {
     variables = {
-      AWS_REGION_VAR          = var.aws_region
-      CONVERSATIONS_TABLE_ARN = aws_dynamodb_table.conversations.arn
-      BUSINESS_TABLE_ARN      = aws_dynamodb_table.business.arn
-      BACKUP_BUCKET           = aws_s3_bucket.backups.bucket
+      AWS_REGION_VAR     = var.aws_region
+      BUSINESS_TABLE_ARN = aws_dynamodb_table.business.arn
+      BACKUP_BUCKET      = aws_s3_bucket.backups.bucket
     }
   }
 

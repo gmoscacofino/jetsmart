@@ -82,7 +82,6 @@ resource "aws_lambda_function" "payment" {
       AWS_REGION_VAR      = var.aws_region
       BUSINESS_TABLE_NAME = aws_dynamodb_table.business.name
       SNS_EVENTS_ARN      = aws_sns_topic.events.arn
-      ASSETS_BUCKET       = aws_s3_bucket.assets.bucket
     }
   }
 
@@ -116,9 +115,9 @@ resource "aws_lambda_function" "boarding_pass_async" {
 
   environment {
     variables = {
-      AWS_REGION_VAR      = var.aws_region
-      BUSINESS_TABLE_NAME = aws_dynamodb_table.business.name
-      ASSETS_BUCKET       = aws_s3_bucket.assets.bucket
+      AWS_REGION_VAR         = var.aws_region
+      BUSINESS_TABLE_NAME    = aws_dynamodb_table.business.name
+      BOARDING_PASSES_BUCKET = aws_s3_bucket.boarding_passes.bucket
     }
   }
 }

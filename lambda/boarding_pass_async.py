@@ -6,7 +6,7 @@ TP4: el boarding pass se desacopló del Saga. Step Functions
 con el estado completo de la reserva confirmada. Esta Lambda lo consume y:
 
   1. Genera el boarding pass (texto plano por simplicidad académica).
-  2. PutObject en S3 assets bucket bajo boarding-passes/{user_id}/{pnr}.txt
+  2. PutObject en S3 boarding-passes bucket bajo {user_id}/{pnr}.txt
   3. Genera presigned URL (15 min).
   4. UpdateItem en business table: PNR#{pnr}/BP#01 con s3_key y bp_url.
 
@@ -30,7 +30,7 @@ log.setLevel(logging.INFO)
 
 REGION              = os.environ["AWS_REGION_VAR"]
 BUSINESS_TABLE_NAME = os.environ["BUSINESS_TABLE_NAME"]
-ASSETS_BUCKET       = os.environ["ASSETS_BUCKET"]
+BOARDING_PASSES_BUCKET       = os.environ["BOARDING_PASSES_BUCKET"]
 
 dynamodb  = boto3.resource("dynamodb", region_name=REGION)
 biz_table = dynamodb.Table(BUSINESS_TABLE_NAME)
@@ -62,10 +62,10 @@ def _generate_bp(saga_state: dict) -> dict:
         f"Emitido:    {datetime.now(timezone.utc).isoformat()}\n"
     )
 
-    key = f"boarding-passes/{user_id}/{pnr}.txt"
+    key = f"{user_id}/{pnr}.txt"
 
     s3.put_object(
-        Bucket=ASSETS_BUCKET,
+        Bucket=BOARDING_PASSES_BUCKET,
         Key=key,
         Body=content.encode("utf-8"),
         ContentType="text/plain",
@@ -73,7 +73,7 @@ def _generate_bp(saga_state: dict) -> dict:
 
     url = s3.generate_presigned_url(
         "get_object",
-        Params={"Bucket": ASSETS_BUCKET, "Key": key},
+        Params={"Bucket": BOARDING_PASSES_BUCKET, "Key": key},
         ExpiresIn=900,
     )
 
@@ -88,7 +88,7 @@ def _generate_bp(saga_state: dict) -> dict:
         "issued_at":  datetime.now(timezone.utc).isoformat(),
     })
 
-    log.info("BP listo — PNR: %s — s3://%s/%s", pnr, ASSETS_BUCKET, key)
+    log.info("BP listo — PNR: %s — s3://%s/%s", pnr, BOARDING_PASSES_BUCKET, key)
     return {"pnr": pnr, "s3_key": key, "bp_url": url}
 
 
