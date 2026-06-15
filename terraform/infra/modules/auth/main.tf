@@ -49,10 +49,11 @@ resource "aws_cognito_user_pool_client" "frontend" {
   allowed_oauth_scopes                 = ["email", "openid", "profile"]
 
   callback_urls = ["https://${aws_api_gateway_rest_api.auth.id}.execute-api.${var.aws_region}.amazonaws.com/${var.environment}/callback"]
-  # logout_uri al que Cognito redirige DESPUÉS de invalidar la sesión del Hosted UI.
-  # El frontend hace Auth.logout() → ${cognitoDomain}/logout?logout_uri=FRONTEND_URL
-  # Cognito valida que logout_uri match exacto contra esta lista antes de redirigir.
-  logout_urls = [var.frontend_url]
+  # Cognito requiere HTTPS en logout_urls — el frontend está en S3 HTTP, así que
+  # NO se puede apuntar directo. Igual que el callback, usamos la Lambda como
+  # bridge HTTPS: Cognito redirige al endpoint /logout del auth-api (HTTPS), la
+  # Lambda hace el 302 final al frontend HTTP. Mismo workaround del catedra.
+  logout_urls = ["https://${aws_api_gateway_rest_api.auth.id}.execute-api.${var.aws_region}.amazonaws.com/${var.environment}/logout"]
 
   supported_identity_providers = ["COGNITO"]
 

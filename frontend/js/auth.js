@@ -44,13 +44,18 @@ const Auth = (() => {
       // el user al menos queda sin token en el browser.
       localStorage.removeItem(TOKEN_KEY);
       sessionStorage.removeItem('oauth_state');
-      // Disparar el logout de Cognito para invalidar la cookie de sesión
-      // del Hosted UI. Sin esto, un nuevo "Login" auto-loguea sin password.
-      // Después del logout, Cognito redirige a logout_uri (registrado en el
-      // User Pool Client) — debe ser exactamente CONFIG.frontendUrl.
+      // Disparar el logout de Cognito para invalidar la cookie de sesión del
+      // Hosted UI. Sin esto, un nuevo "Login" auto-loguea sin password.
+      //
+      // Cognito requiere HTTPS en logout_uri (igual que en redirect_uri del
+      // login), pero el frontend está en S3 HTTP. Solución: usar el endpoint
+      // /logout del auth-api (HTTPS) como bridge — la Lambda hace el 302 final
+      // al frontend. Mismo patrón que el callback. Derivamos la URL del logout
+      // bridge reemplazando /callback por /logout en callbackUrl.
+      const logoutBridge = CONFIG.callbackUrl.replace(/\/callback$/, '/logout');
       const params = new URLSearchParams({
         client_id:  CONFIG.clientId,
-        logout_uri: CONFIG.frontendUrl,
+        logout_uri: logoutBridge,
       });
       window.location.href = `${CONFIG.cognitoDomain}/logout?${params}`;
     },
