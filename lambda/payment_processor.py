@@ -20,7 +20,7 @@ en business table:
   PASSENGER#{dni}/#PROFILE  — CRM canónico (upsert)
   PASSENGER#{dni}/PNR#{pnr} — back-ref histórico
 """
-import os, json, secrets, logging
+import os, json, hashlib, secrets, logging
 from decimal import Decimal
 from datetime import datetime, timezone
 
@@ -55,15 +55,28 @@ def _generate_pnr() -> str:
 
 def _pnr_from_payment_id(payment_id: str) -> str:
     """
-    Deriva un PNR estable a partir del payment_id para idempotencia.
-    Si el Saga se reintenta con mismo payment_id, genera el mismo PNR.
+    Deriva un PNR estable y resistente a colisiones a partir del payment_id.
+
+    Si el Saga se reintenta con mismo payment_id, genera el mismo PNR
+    (idempotencia). Usamos SHA-256 en lugar de hash() de Python porque:
+      - hash() es un hashtable hash, no criptográfico — colisiones tempranas
+        (birthday paradox cerca de los 32K bookings).
+      - hash() está seedeado por proceso → no es estable entre cold starts.
+      - SHA-256 es colision-resistant: probabilidad de colisión sobre 32^6 PNRs
+        sigue gobernada por el truncamiento (~1B posibles) pero la distribución
+        es uniforme — el birthday paradox no se acelera por sesgos del hash.
+
+    La idempotencia frente a posibles colisiones se cubre además en
+    reserve_booking_handler verificando user_id del PNR existente antes de
+    aceptarlo como "propio".
     """
-    # Hash determinístico del payment_id → 6 chars del charset
-    h = abs(hash(payment_id))
+    digest = hashlib.sha256(payment_id.encode("utf-8")).digest()
+    # 8 bytes = 64 bits → suficiente para 6 chars * log2(32) = 30 bits
+    n = int.from_bytes(digest[:8], "big")
     chars = []
     for _ in range(6):
-        chars.append(_PNR_CHARSET[h % len(_PNR_CHARSET)])
-        h //= len(_PNR_CHARSET)
+        chars.append(_PNR_CHARSET[n % len(_PNR_CHARSET)])
+        n //= len(_PNR_CHARSET)
     return "".join(chars)
 
 
@@ -178,13 +191,31 @@ def reserve_booking_handler(event, context):
                 "email_contacto":  email,
                 "telefono":        phone,
                 "created_at":      now,
+                "payment_id":      event["payment_id"],
             },
             ConditionExpression="attribute_not_exists(PK)",
         )
     except ClientError as e:
         if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            log.info("ReserveBooking — PNR ya existe, idempotente: %s", pnr)
-            return {**event, "reservation_id": pnr, "pnr": pnr}
+            # Verificar ownership antes de tratar como idempotente:
+            # SHA-256 hace colisiones astronómicamente improbables, pero si el
+            # PNR existente pertenece a otro user o a otro payment_id, NO podemos
+            # devolverlo como propio (sería data leak / IDOR).
+            existing = table.get_item(
+                Key={"PK": f"PNR#{pnr}", "SK": "#METADATA"}
+            ).get("Item", {})
+            same_user = existing.get("user_id") == user_id
+            same_pay  = existing.get("payment_id") == event["payment_id"]
+            if same_user and same_pay:
+                log.info("ReserveBooking — PNR ya existe, idempotente: %s", pnr)
+                return {**event, "reservation_id": pnr, "pnr": pnr}
+            # Colisión genuina (improbable con SHA-256, pero defensivo).
+            log.error(
+                "ReserveBooking — PNR collision detectada: %s ya pertenece a otro "
+                "user/payment. existente_user=%s nuevo_user=%s",
+                pnr, existing.get("user_id"), user_id,
+            )
+            raise ValueError(f"PNR collision para {pnr} — reintentar con otro payment_id")
         raise
 
     # SEGMENT — stampa gsi2pk para "quién está en este vuelo/fecha"
@@ -310,29 +341,50 @@ def confirm_booking_handler(event, context):
     total = Decimal(str(event.get("total_pagado", 0)))
     tx = event.get("transaction_id", "")
 
-    # PNR canónico
-    table.update_item(
-        Key={"PK": f"PNR#{pnr}", "SK": "#METADATA"},
-        UpdateExpression="SET #s = :status, #t = :total, transaction_id = :tx",
-        ExpressionAttributeNames={"#s": "status", "#t": "total"},
-        ExpressionAttributeValues={
-            ":status": "CONFIRMADA",
-            ":total":  total,
-            ":tx":     tx,
-        },
-    )
+    # PNR canónico — sólo permitimos transición PENDIENTE → CONFIRMADA.
+    # Defensivo contra: doble invocación del Saga, race condition por colisión
+    # de PNR (improbable post-SHA256 pero el guard cierra el riesgo).
+    try:
+        table.update_item(
+            Key={"PK": f"PNR#{pnr}", "SK": "#METADATA"},
+            UpdateExpression="SET #s = :status, #t = :total, transaction_id = :tx",
+            ConditionExpression="#s = :pending AND user_id = :uid",
+            ExpressionAttributeNames={"#s": "status", "#t": "total"},
+            ExpressionAttributeValues={
+                ":status":  "CONFIRMADA",
+                ":total":   total,
+                ":tx":      tx,
+                ":pending": "PENDIENTE",
+                ":uid":     user_id,
+            },
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            log.warning(
+                "ConfirmBooking — PNR %s no está en PENDIENTE o user_id no coincide. "
+                "Posible doble confirmación o colisión. Skipping update.", pnr,
+            )
+            return {**event, "confirmed": False, "reason": "not_pending_or_owner_mismatch"}
+        raise
 
-    # Thin pointer
-    table.update_item(
-        Key={"PK": f"USER#{user_id}", "SK": f"RESERVATION#{pnr}"},
-        UpdateExpression="SET #s = :status, #t = :total, transaction_id = :tx",
-        ExpressionAttributeNames={"#s": "status", "#t": "total"},
-        ExpressionAttributeValues={
-            ":status": "CONFIRMADA",
-            ":total":  total,
-            ":tx":     tx,
-        },
-    )
+    # Thin pointer — mismo guard por consistencia con el canonical.
+    try:
+        table.update_item(
+            Key={"PK": f"USER#{user_id}", "SK": f"RESERVATION#{pnr}"},
+            UpdateExpression="SET #s = :status, #t = :total, transaction_id = :tx",
+            ConditionExpression="#s = :pending",
+            ExpressionAttributeNames={"#s": "status", "#t": "total"},
+            ExpressionAttributeValues={
+                ":status":  "CONFIRMADA",
+                ":total":   total,
+                ":tx":      tx,
+                ":pending": "PENDIENTE",
+            },
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+        log.warning("ConfirmBooking — thin pointer no estaba en PENDIENTE, skipping")
 
     # SEGMENT status (consumido por GSI2 — el filtro de proactive_notifications)
     vuelo_n = event["flight_info"].get("vuelo_numero", "")
@@ -388,14 +440,26 @@ def cancel_booking_handler(event, context):
     log.info("CancelBooking — PNR: %s", pnr)
     user_id = event.get("user_id", "")
 
-    # PNR canónico
+    # PNR canónico — sólo cancelamos si el PNR pertenece al user del Saga
+    # (defensivo contra colisión de PNR + idempotente: si ya está CANCELADA no falla).
     try:
         table.update_item(
             Key={"PK": f"PNR#{pnr}", "SK": "#METADATA"},
             UpdateExpression="SET #s = :status",
+            ConditionExpression="attribute_exists(PK) AND user_id = :uid",
             ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={":status": "CANCELADA"},
+            ExpressionAttributeValues={
+                ":status": "CANCELADA",
+                ":uid":    user_id,
+            },
         )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            log.warning(
+                "CancelBooking — PNR %s no existe o user_id no coincide. Skipping.", pnr,
+            )
+        else:
+            log.warning("Cancel PNR %s falló: %s", pnr, e)
     except Exception as e:
         log.warning("Cancel PNR %s falló: %s", pnr, e)
 
@@ -405,9 +469,13 @@ def cancel_booking_handler(event, context):
             table.update_item(
                 Key={"PK": f"USER#{user_id}", "SK": f"RESERVATION#{pnr}"},
                 UpdateExpression="SET #s = :status",
+                ConditionExpression="attribute_exists(PK)",
                 ExpressionAttributeNames={"#s": "status"},
                 ExpressionAttributeValues={":status": "CANCELADA"},
             )
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                log.warning("Cancel pointer USER#%s/RESERVATION#%s falló: %s", user_id, pnr, e)
         except Exception as e:
             log.warning("Cancel pointer USER#%s/RESERVATION#%s falló: %s", user_id, pnr, e)
 
