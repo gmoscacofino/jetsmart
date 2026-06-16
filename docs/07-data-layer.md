@@ -134,23 +134,21 @@ user_id       : sub del JWT — valida que la sesión pertenece al usuario
 ttl           : epoch seconds — 7 días desde la escritura (limpieza automática)
 ```
 
-**Reserva de usuario** (`USER#{userId}` / `RESERVATION#{reservationId}`)
+**Thin pointer Reserva de usuario** (`USER#{userId}` / `RESERVATION#{pnr}`)
 ```
-reservation_id : "RES-XXXXXXXX"
-status         : "PENDIENTE" → "CONFIRMADA" → "CHECK-IN" | "CANCELADA"
-origin         : código IATA (ej: "AEP")
-destination    : código IATA (ej: "MDZ")
-flight_number  : número de vuelo (ej: "JA123")
-flight_date    : "YYYY-MM-DD"
-passenger_count: entero
-tarifa         : "BASIC" | "LIGHT" | "SMART" | "FULL FLEX"
-total          : Decimal — precio total en USD
-transaction_id : "TX-XXXXXXXXXXXX" — agregado al confirmar
-email          : email de contacto
-phone          : teléfono de contacto
-passenger_name : nombre completo del pasajero principal
-created_at     : ISO-8601 timestamp
+pnr             : PNR de 6 chars (charset PSS sin 0/1/I/O, ej: "JS7K2P")
+status          : "PENDIENTE" → "CONFIRMADA" → "CHECK-IN" | "CANCELADA"
+origin          : código IATA (ej: "AEP")
+destination     : código IATA (ej: "MDZ")
+flight_number   : número de vuelo (ej: "JA123")
+flight_date     : "YYYY-MM-DD"
+passenger_count : entero
+tarifa          : "BASIC" | "LIGHT" | "SMART" | "FULL FLEX"
+total           : Decimal — precio total en USD
+passenger_name  : nombre completo del pasajero principal
+created_at      : ISO-8601 timestamp
 ```
+> El thin pointer convive con el ítem canónico `PNR#{pnr}/#METADATA` y sus dependientes (`SEGMENT#`, `PAX#`, `BP#`) — ver el modelo PNR-céntrico de la sección anterior. El handler de API mapea `pnr → reservation_id` para exponerlo en el JSON de respuesta.
 
 **Reclamo** (`USER#{userId}` / `CLAIM#{claimId}`)
 ```
@@ -209,12 +207,12 @@ Si dos usuarios intentan reservar el último asiento simultáneamente, DynamoDB 
 }
 ```
 
-**Reserva confirmada:**
+**Reserva confirmada** (thin pointer en `USER#`; el ítem canónico vive en `PNR#JS7K2P/#METADATA`):
 ```json
 {
   "PK": "USER#us-east-1:a1b2c3d4-e5f6-...",
-  "SK": "RESERVATION#RES-D6F11672",
-  "reservation_id": "RES-D6F11672",
+  "SK": "RESERVATION#JS7K2P",
+  "pnr": "JS7K2P",
   "status": "CONFIRMADA",
   "origin": "AEP",
   "destination": "MDZ",
@@ -223,8 +221,6 @@ Si dos usuarios intentan reservar el último asiento simultáneamente, DynamoDB 
   "passenger_count": 1,
   "tarifa": "SMART",
   "total": "120",
-  "transaction_id": "TX-A1B2C3D4E5F6",
-  "email": "usuario@email.com",
   "passenger_name": "Juan Pérez",
   "created_at": "2026-05-15T14:35:00.123456+00:00"
 }

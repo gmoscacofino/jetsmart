@@ -88,11 +88,12 @@ Lambda construye prompt para Claude:
 Lambda llama a la API de Anthropic (claude-haiku-4-5-20251001)
 con API key leída de Secrets Manager (cacheada en cold start)
         ↓
-[bucle de tool use, hasta 5 rondas]
-Si Claude pide tool → Lambda ejecuta:
+[bucle de tool use, hasta 5 rondas — MAX_TOOL_ROUNDS = 5]
+Si Claude pide tool → Lambda ejecuta una de las 10:
   search_flights / list_flight_dates / get_reservation /
   list_user_reservations / list_saved_passengers / check_in /
-  get_boarding_pass / create_claim / create_reservation
+  get_boarding_pass / create_claim / create_reservation /
+  escalate_to_human
         ↓
 Si create_reservation → Lambda llama a Step Functions
   StartExecution (no espera el resultado)
@@ -207,8 +208,8 @@ Lambda boarding_pass_async
         ↓
 Lambda parsea el estado, genera el contenido del boarding pass (texto)
         ↓
-Lambda sube el archivo al bucket S3 jetsmart-prod-<account-id>-assets:
-  ruta: boarding-passes/{user_id}/{pnr}.txt
+Lambda sube el archivo al bucket S3 jetsmart-prod-<account-id>-boarding-passes:
+  ruta dentro del bucket: {user_id}/{pnr}.txt
   SSE-S3, public access block activo
         ↓
 Lambda genera pre-signed URL (válida 15 min, sólo para este objeto)
@@ -343,9 +344,9 @@ Los eventos del chatbot se procesan offline. La capa OLTP (DynamoDB) no se toca 
 
 ```
 Publicadores:
-  chat-handler           → SNS `events`  (mensajes de chat)
-  payment-confirm → SNS `events` (compras completadas)
-  payment-cancel  → SNS `events` (cancelaciones)
+  chat-handler            → SNS `events`  (chat, búsqueda, check-in, claim, handoff)
+  payment-confirm         → SNS `events`  (compras completadas)
+  proactive-notifications → SNS `events`  (notificaciones de cancelación de vuelo enviadas)
         ↓
 SNS topic `events`
         ↓ fan-out (sólo 1 sub hoy: analytics)
@@ -373,8 +374,12 @@ Equipo de business analytics (DBeaver / DataGrip)
 | event_type | Publicador | Cuándo |
 |---|---|---|
 | `chat_message` | chat-handler | Cada mensaje procesado del chatbot |
-| `booking_confirmed` | payment-confirm | Reserva confirmada exitosamente |
-| `booking_cancelled` | payment-cancel | Saga compensa una reserva |
+| `busqueda_vuelo` | chat-handler (tool `search_flights`) | Búsqueda de vuelo con resultados |
+| `checkin_realizado` | chat-handler (tool `check_in`) | Check-in completado |
+| `reclamo_iniciado` | chat-handler (tool `create_claim`) | Claim registrado |
+| `handoff_escalated` | chat-handler (tool `escalate_to_human`) | Derivación a humano encolada |
+| `purchase_complete` | payment-confirm | Reserva confirmada exitosamente |
+| `flight_cancellation_notified` | proactive-notifications | Email de cancelación de vuelo enviado a un pasajero |
 
 ### Por qué SQS entre SNS y Lambda
 

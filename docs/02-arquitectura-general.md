@@ -132,7 +132,7 @@ Si S3 falla (caso muy raro), el mensaje vuelve a SQS para reintento. Después de
 | # | Componente | Categoría | Rol |
 |---|---|---|---|
 | 1 | S3 — frontend | Storage / Edge | Archivos estáticos del sitio web (HTML/CSS/JS). HTTP. |
-| 2 | S3 — assets | Storage | Boarding passes generados y system prompt del chatbot. |
+| 2 | S3 — boarding-passes | Storage | Boarding passes generados por la Lambda `boarding-pass-async`. (Renombrado desde `assets` en TP4: el system prompt se movió a una Lambda Layer.) |
 | 3 | S3 — analytics | Storage / Data lake | Eventos crudos en JSON Lines, particionado por `dt=YYYY-MM-DD/hh=HH`. |
 | 3b | S3 — backups | Storage / Backup | Exports diarios de DynamoDB (Hive-path `dynamodb/YYYY-MM-DD/...`). Lifecycle: 90d STANDARD → GLACIER → expira a 365d. |
 | 4 | Cognito User Pool | Auth | Registro y login con Hosted UI. |
@@ -152,7 +152,7 @@ Si S3 falla (caso muy raro), el mensaje vuelve a SQS para reintento. Después de
 | 18 | Lambda — analytics-processor | Cómputo | Consume SQS, escribe S3 JSON Lines. |
 | 19 | Lambda — auth-callback | Cómputo | Bridge HTTPS del workaround. Intercambia code por tokens. |
 | 20 | Lambda — cognito-trigger | Cómputo | Post-registro: asigna grupo `users`. |
-| 20b | Lambda — backup-dynamodb | Cómputo | Disparada por EventBridge cron diario. Exporta ambas tablas (conversations + business) al bucket de backups. |
+| 20b | Lambda — backup-dynamodb | Cómputo | Disparada por EventBridge cron diario. Exporta sólo la tabla `business` al bucket de backups (la `conversations` es efímera por TTL y queda cubierta por PITR). |
 | 20c | **Lambda — human-handoff-processor (TP4)** | Cómputo | Consume SQS human-handoff, mock POST al call center, actualiza ticket HANDOFF# y notifica al usuario por email. |
 | 20d | **Lambda — proactive-notifications (TP4)** | Cómputo | Consume SQS proactive-notifications, Query a GSI2 ReservationsByFlight, fan-out de emails vía SNS notifications. |
 | 21 | Step Functions | Orquestación | State machine del patrón Saga. TP4: PostBookingActions Branch B ahora publica a SQS en lugar de invocar Lambda directo. |
@@ -174,7 +174,7 @@ Si S3 falla (caso muy raro), el mensaje vuelve a SQS para reintento. Después de
 | 31 | Secrets Manager | Seguridad | API key Anthropic. |
 | 32 | Lambda Layer — anthropic | Cómputo | SDK de Anthropic compilado para Python 3.12. |
 | 33 | IAM — LabRole | Seguridad | Rol preexistente de AWS Academy — compartido por todas las Lambdas. |
-| 34 | CloudWatch (16 log groups + 4 alarms) | Observabilidad | Logs de las 15 Lambdas con retención 30d. Alarms: analytics-processor errors + 3 DLQ depth alarms (human-handoff, proactive-notifications, boarding-pass-generation). |
+| 34 | CloudWatch (17 log groups + 4 alarms) | Observabilidad | Logs de las 16 Lambdas + 1 log group del state machine de Step Functions, todos con retención 30d. Alarms: analytics-processor errors + 3 DLQ depth alarms (human-handoff, proactive-notifications, boarding-pass-generation). |
 
 ---
 
@@ -212,9 +212,9 @@ Si S3 falla (caso muy raro), el mensaje vuelve a SQS para reintento. Después de
                                           └─→ notification               │
 
                           Pipeline analytics:
-                          chat-handler → SNS events ─┐
-                          payment-confirm → SNS events ─┤
-                          payment-cancel/refund → SNS events ─┘
+                          chat-handler          → SNS events ─┐
+                          payment-confirm       → SNS events ─┤
+                          proactive-notifications → SNS events ─┘
                                                               │
                                                               ↓ fan-out
                                                           SQS analytics (+ DLQ)

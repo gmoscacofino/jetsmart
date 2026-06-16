@@ -82,7 +82,7 @@ Es el texto de instrucciones que le da identidad al chatbot. Acá se define:
 
 ### Por qué el LLM no "recuerda" solo
 
-El LLM no tiene memoria entre llamadas. Cada vez que lo llamás, es como la primera vez. Por eso la Lambda siempre le manda **todo el historial** junto con el mensaje nuevo. Ese historial se guarda en DynamoDB.
+El LLM no tiene memoria entre llamadas. Cada vez que lo llamás, es como la primera vez. Por eso la Lambda le manda **los últimos 40 mensajes** (`MAX_HISTORY = 40`) junto con el mensaje nuevo. Ese historial se guarda en DynamoDB y se rescata con un Query limitado.
 
 ```
 DynamoDB — historial de una sesión:
@@ -121,7 +121,7 @@ Anthropic devuelve la respuesta del chatbot
         ↓
 Lambda guarda el intercambio nuevo en DynamoDB (sincrónico)
         ↓
-Lambda publica evento en SNS → SQS → analytics-processor → RDS (asincrónico)
+Lambda publica evento en SNS → SQS → analytics-processor → S3 data lake (asincrónico)
         ↓
 Lambda devuelve la respuesta al frontend
         ↓

@@ -42,7 +42,7 @@ Ver explicación completa en [01 — Cómo funciona un chatbot](./01-como-funcio
 
 ### Runtime y configuración
 
-Todas las Lambdas usan **Python 3.12**. El timeout configurable es de 30 segundos por defecto (variable `lambda_timeout`).
+Todas las Lambdas usan **Python 3.12**. El timeout configurable es de 30 segundos por defecto (variable `lambda_timeout`), con algunas excepciones explícitas en código: `chat-handler` y `backup-dynamodb` usan 60s, y `analytics-processor` usa 120s para tolerar batches grandes hacia S3.
 
 ### Todas las Lambdas regionales (sin VPC)
 
@@ -110,7 +110,7 @@ SNS es un servicio de pub/sub: un publicador manda un mensaje al topic y todos l
 | Topic | Publicado por | Suscriptores |
 |---|---|---|
 | `events` | `chat-handler` (mensajes de chat) y `payment-confirm` (compras completadas) | SQS `analytics` |
-| `notifications` | Lambdas (`notification`, `human-handoff-processor`, `proactive-notifications`, etc.) y CloudWatch Alarms | Endpoints email/SMS suscritos manualmente con `aws sns subscribe` |
+| `notifications` | Lambdas (`notification`, `human-handoff-processor`, `proactive-notifications`, etc.) y CloudWatch Alarms | Endpoints email suscritos manualmente con `aws sns subscribe` (el topic acepta también SMS u otros protocolos sin cambios de código si se quisiera sumarlos) |
 | `flight-events` | Script ops `scripts/cancel_flight.py` cuando un vuelo cambia de estado (cancelado, demorado, gate change) | SQS `proactive-notifications` |
 
 ### Por qué tres topics y no uno solo
@@ -156,7 +156,7 @@ Cuatro flujos asíncronos, cada uno con su DLQ — más una DLQ standalone para 
 
 Todas las queues principales usan:
 - `message_retention_seconds = 86400` (1 día — corto porque la DLQ retiene 14 días si la cola principal falla)
-- `visibility_timeout_seconds = 360` — 6× el timeout de Lambda (60s), recomendación oficial AWS para evitar duplicados durante retries
+- `visibility_timeout_seconds = 360` — 12× el `lambda_timeout` default (30s) que usan los consumers de SQS, en línea con la recomendación de AWS de ≥6× el timeout para evitar duplicados durante retries
 - `receive_wait_time_seconds = 20` — **long polling**: el consumer espera hasta 20s a que llegue un mensaje en vez de pollear constantemente. Reduce requests vacíos y costo
 - `redrive_policy` con `maxReceiveCount = 3` — tras 3 fallas el mensaje pasa a la DLQ
 
@@ -366,7 +366,7 @@ Recibe los logs de todas las Lambdas. Hay un log group por Lambda, creados con `
 | `/aws/lambda/jetsmart-prod-auth-callback` | auth-callback |
 | `/aws/lambda/jetsmart-prod-cognito-trigger` | cognito-trigger |
 | `/aws/lambda/jetsmart-prod-backup-dynamodb` | backup-dynamodb |
-| `/aws/states/jetsmart-prod-booking` | Step Functions state machine |
+| `/aws/states/jetsmart-prod-booking-workflow` | Step Functions state machine |
 
 Retención configurada en 30 días para todos los log groups.
 
