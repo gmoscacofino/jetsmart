@@ -12,7 +12,7 @@ log = logging.getLogger()
 log.setLevel(logging.INFO)
 
 REGION           = os.environ["AWS_REGION_VAR"]
-NOTIFICATION_ARN = os.environ.get("SNS_NOTIFICATION_ARN", "")
+NOTIFICATION_ARN = os.environ.get("SNS_NOTIFICATIONS_ARN", "")
 
 sns = boto3.client("sns", region_name=REGION)
 
@@ -52,7 +52,7 @@ def handler(event, context):
     log.info("Notificando %s — reserva: %s — email: %s", event_type, reservation_id, email)
 
     if not NOTIFICATION_ARN:
-        log.warning("SNS_NOTIFICATION_ARN no configurado, notificación omitida")
+        log.warning("SNS_NOTIFICATIONS_ARN no configurado, notificación omitida")
         return {"notified": False, "reason": "no_topic_configured"}
 
     try:

@@ -30,7 +30,6 @@ resource "aws_lambda_function" "chat_handler" {
       ANTHROPIC_SECRET_ARN     = var.anthropic_secret_arn
       STEP_FUNCTIONS_ARN       = var.step_functions_arn
       FRONTEND_URL             = var.frontend_url
-      COGNITO_USER_POOL_ID     = var.cognito_user_pool_id
     }
   }
 

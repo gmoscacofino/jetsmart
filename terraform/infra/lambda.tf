@@ -227,8 +227,8 @@ resource "aws_lambda_function" "notification" {
 
   environment {
     variables = {
-      AWS_REGION_VAR       = var.aws_region
-      SNS_NOTIFICATION_ARN = aws_sns_topic.notifications.arn
+      AWS_REGION_VAR        = var.aws_region
+      SNS_NOTIFICATIONS_ARN = aws_sns_topic.notifications.arn
     }
   }
 }

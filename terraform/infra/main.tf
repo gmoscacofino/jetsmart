@@ -30,7 +30,6 @@ module "chatbot_lambda" {
   ]
   environment           = var.environment
   frontend_url          = "http://${aws_s3_bucket_website_configuration.frontend.website_endpoint}"
-  cognito_user_pool_id  = module.auth.user_pool_id
   cognito_user_pool_arn = module.auth.user_pool_arn
 
   depends_on = [
