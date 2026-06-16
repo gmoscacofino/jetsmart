@@ -311,6 +311,73 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 ---
 
+## 22. Seat map real con ítems SEAT# individuales (no counter)
+
+**Decisión:** cada vuelo tiene 120 ítems `FLIGHT#<o>#<d>/DATE#<f>#FLIGHT#<v>#SEAT#<row><letter>` con un atributo `reserved_by` ausente cuando el asiento está libre. La reserva atómica usa `UpdateItem` con `ConditionExpression: attribute_exists(PK) AND attribute_not_exists(reserved_by)`. La liberación (compensación de la Saga) usa `ConditionExpression: reserved_by = :owned_pnr` para no liberar asientos de otros PNRs.
+
+**Alternativas:**
+- (a) Counter `asientos_disponibles` (TP3) → previene oversell global pero no double-assignment del mismo número de asiento. El boarding pass decía "ALEATORIO" porque no había seat real.
+- (b) Set-attribute en el FLIGHT item con lista de seats ocupados → DynamoDB no permite operaciones atómicas sobre elementos de set, expone la lista entera en cada read (>=400 KB con vuelo lleno).
+- (c) **Items individuales con ConditionExpression (elegida)** → atomicidad real, prevención de double-assignment, queryable con `Select=COUNT` y `begins_with(SK, "...#SEAT#")`.
+
+**Decisión de atomicidad:** el PNR se genera en `chat_handler.py` con SHA-256 del payment_id ANTES de iniciar el Saga y se pasa en el input del state machine. ReserveFlight escribe `reserved_by = "PNR#XXXXXX"` desde el primer paso. Esto permite que la compensación `ReleaseFlight` libere exactamente el seat de este PNR (sin riesgo de tocar uno ajeno) y que el flujo sea idempotente bajo retry.
+
+**Trade-off:** el volumen de ítems se multiplica por ~121× (20 rutas × 30 fechas × 121 ítems = ~72k). En DynamoDB es despreciable. El seed tarda ~3 min en lugar de ~10 seg.
+
+**Edge cases manejados:**
+- Seat `99Z` que no existe → `ConditionalCheckFailedException` → `get_item` para distinguir vs "ya reservado" → `ValueError` específico → Saga rollea.
+- Seat ya tomado → falla atómica → Saga rollea.
+- Asignación random sin seat_id → helper `_claim_random_seat` con retry hasta 3 veces (race condition).
+- Saga muere entre ReserveFlight y ReserveBooking → CancelBooking es no-op (no hay PNR) → ReleaseFlight libera por `_seat_sk` guardado en `flight_info`.
+
+**Pregunta esperable en oral:** *"¿Por qué no usaste DynamoDB Transactions?"* → para reservar 1 seat alcanza con UpdateItem condicional. Transactions tienen sentido si tuviéramos que reservar N seats simultáneos atómicamente (grupos de N pasajeros con M asientos contiguos), pero para 1 PAX = 1 seat es overkill — Transactions cuestan 2× el throughput y tienen latencia mayor.
+
+---
+
+## 23. Pricing server-side con multiplicadores, no monto fijo
+
+**Decisión:** las tarifas (BASIC/LIGHT/SMART/FULL FLEX) son multiplicadores sobre el precio base del vuelo (×1.00, ×1.10, ×1.25, ×1.50). Los extras (mascota, asiento, equipaje, etc.) son monto fijo en USD por reserva. El cálculo lo hace `lambda/pricing.py:compute_total` server-side; el LLM (Claude) NO calcula el total y ni siquiera lo pasa como input — el campo `total` fue removido del schema de `create_reservation`.
+
+**Por qué multiplicadores y no monto fijo en tarifas:** el costo marginal de servicio premium (cabin crew, refunds, asiento elegido) escala con el costo del vuelo. Antes (`base+$15` para LIGHT) un vuelo de $50 se convertía en LIGHT de $65 (×1.30); uno de $300 en LIGHT de $315 (×1.05). El premium se diluía. Con multiplicadores la proporción es estable.
+
+**Por qué monto fijo en extras:** un sandwich, un kilo de bodega, una jaula de mascota tienen costo operativo fijo. No escalan con el precio del ticket.
+
+**Persistencia de extras:** cada extra contratado se persiste como ítem `PNR#<pnr>/EXTRA#<nn>` con `extra_type`, `amount`, `created_at`. Habilita auditoría por PNR ("¿qué llevó cada pasajero?") y queries del estilo "cuántas mascotas viajaron este mes".
+
+**Validación:**
+- En el chat: `pricing.validate_inputs(tarifa, extras)` rechaza tarifa o extra alucinados antes de iniciar el Saga.
+- En el Saga: `pricing.compute_total` recalcula el total real desde el precio del inventory + tarifa + extras, ignorando cualquier `total` que pudiera haber venido del cliente. **Imposible underpricing por inyección o alucinación.**
+
+**Testeable sin AWS:** `lambda/tests/test_pricing.py` con 13 tests unitarios cubre tarifas, extras incluidos en tarifa superior, redondeo, validación de inputs.
+
+**Pregunta esperable en oral:** *"¿Y si Claude pasa total=1 igual?"* → el server lo ignora; reserve_booking llama a compute_total y usa ese valor. El input total ni siquiera existe en el JSON schema de la tool — Anthropic SDK lo rechazaría antes de invocar.
+
+---
+
+## 24. Vocabulario unificado a español en datos del thin pointer
+
+**Decisión:** el thin pointer `USER#<sub>/RESERVATION#<pnr>` ahora se escribe con keys en español: `origen`, `destino`, `vuelo_numero`, `fecha`, `pasajeros`, `nombre_pasajero`, `telefono`. Antes mezclaba inglés (`origin`, `destination`, `flight_number`, `flight_date`, `passenger_count`, `passenger_name`, `phone`) con español en el resto del sistema. Frontend `chat.js` y endpoint `/api/reservations` también consumen español.
+
+**Por qué se unifica:** el LLM, el system prompt, los logs y el seed ya estaban en español. La inconsistencia era de un solo módulo (`payment_processor.py`) y se propagaba al frontend.
+
+**Qué quedó en inglés (y por qué):**
+- `email`, `created_at`, `status`, `total`, `tarifa`, `pnr` → son neutros o estándares ISO/industria. Cambiarlos sería ruido.
+- PASSENGER#/#PROFILE (CRM) y SEGMENT# atributos internos → no los lee el chat, no cambian la UX. Reducir blast radius del rename.
+
+**Trade-off:** no hay backwards compat para reservas viejas — el destroy+reseed del lab cubre la migración. En producción real haría falta una migración o un dual-read transitorio.
+
+---
+
+## 25. Sacar atributo `aerolinea`
+
+**Decisión:** se eliminó la columna `aerolinea: "JetSmart"` del seed y de las lecturas en `chat_handler`. Era un valor constante en toda la tabla.
+
+**Razón:** YAGNI. La tabla `business` ya está namespaced por `name_prefix = jetsmart-prod-` y el sistema es mono-aerolínea. Tener un campo que siempre dice "JetSmart" sólo añade ruido en la consola y en los logs.
+
+**Si en el futuro fuera multi-tenant:** se reintroduce con un GSI por aerolínea. No retornará por defecto, sería una decisión consciente vinculada a un cambio de scope.
+
+---
+
 ## 12. Frontend HTTP (no HTTPS)
 
 **Decisión:** el frontend S3 sirve HTTP estático sin CloudFront.

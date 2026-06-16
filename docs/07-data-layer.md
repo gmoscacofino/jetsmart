@@ -138,17 +138,31 @@ ttl           : epoch seconds — 7 días desde la escritura (limpieza automáti
 ```
 pnr             : PNR de 6 chars (charset PSS sin 0/1/I/O, ej: "JS7K2P")
 status          : "PENDIENTE" → "CONFIRMADA" → "CHECK-IN" | "CANCELADA"
-origin          : código IATA (ej: "AEP")
-destination     : código IATA (ej: "MDZ")
-flight_number   : número de vuelo (ej: "JA123")
-flight_date     : "YYYY-MM-DD"
-passenger_count : entero
+origen          : código IATA (ej: "AEP")
+destino         : código IATA (ej: "MDZ")
+vuelo_numero    : número de vuelo (ej: "JA123")
+fecha           : "YYYY-MM-DD"
+pasajeros       : entero
 tarifa          : "BASIC" | "LIGHT" | "SMART" | "FULL FLEX"
-total           : Decimal — precio total en USD
-passenger_name  : nombre completo del pasajero principal
+total           : Decimal — precio total en USD (calculado server-side)
+nombre_pasajero : nombre completo del pasajero principal
+telefono        : teléfono de contacto
+email           : email del JWT
+seat            : ID de asiento asignado (ej: "12A")
 created_at      : ISO-8601 timestamp
 ```
-> El thin pointer convive con el ítem canónico `PNR#{pnr}/#METADATA` y sus dependientes (`SEGMENT#`, `PAX#`, `BP#`) — ver el modelo PNR-céntrico de la sección anterior. El handler de API mapea `pnr → reservation_id` para exponerlo en el JSON de respuesta.
+> El thin pointer convive con el ítem canónico `PNR#{pnr}/#METADATA` y sus dependientes (`SEGMENT#`, `PAX#`, `BP#`, `EXTRA#`) — ver el modelo PNR-céntrico de la sección anterior. El handler de API mapea `pnr → reservation_id` para exponerlo en el JSON de respuesta. Vocabulario unificado a español (TP4 — ver justificación #24).
+
+**Extras del PNR** (`PNR#{pnr}` / `EXTRA#{nn:02d}`)
+```
+extra_type : "mascota" | "asiento_estandar" | "asiento_salida_rapida" |
+             "asiento_salida_emergencia" | "asiento_primera_fila" |
+             "flexismart" | "tarjeta_embarque" | "embarque_prioritario" |
+             "equipaje_mano" | "equipaje_bodega"
+amount     : Decimal — monto cobrado (0 si está incluido en la tarifa)
+created_at : ISO-8601
+```
+> Los extras se persisten 1 ítem por extra contratado. Habilita auditoría por PNR ("qué llevó cada pasajero") y queries del estilo "cuántas mascotas viajaron este mes". Los nombres están en `lambda/pricing.py:EXTRAS_FIJOS`.
 
 **Reclamo** (`USER#{userId}` / `CLAIM#{claimId}`)
 ```
@@ -160,35 +174,51 @@ status         : "RECIBIDO"
 created_at     : ISO-8601 timestamp
 ```
 
-**Vuelo disponible** (`FLIGHT#{origen}#{destino}` / `DATE#{fecha}`)
+**Vuelo disponible — master row** (`FLIGHT#{origen}#{destino}` / `DATE#{fecha}#FLIGHT#{vuelo}`)
 ```
 vuelo_numero          : "JA123"
 precio                : Decimal — precio base por pasajero en USD
-asientos_disponibles  : entero — decrementado atómicamente en cada reserva
 hora_salida           : "HH:MM"
 hora_llegada          : "HH:MM"
 duracion              : "2h 10m"
-aerolinea             : "JetSmart"
+estado_vuelo          : "EN_HORARIO" | "DEMORADO" | "CANCELADO"
+puerta                : "12"
 ```
+> El SK incluye `#FLIGHT#{vuelo}` para soportar múltiples frecuencias (mañana/tarde) en la misma ruta+fecha. Los ítems SEAT# (abajo) son lexicográficamente posteriores al master row con `begins_with(SK, "DATE#{fecha}#FLIGHT#{vuelo}#SEAT#")`.
+
+**Inventario de asientos** (`FLIGHT#{origen}#{destino}` / `DATE#{fecha}#FLIGHT#{vuelo}#SEAT#{row}{letter}`)
+```
+seat_id     : "12A"
+row         : entero 1..20
+letter      : "A" | "B" | "C" | "D" | "E" | "F"
+seat_type   : "estandar" | "salida_rapida" | "salida_emergencia" | "primera_fila"
+vuelo_numero: "JA123"
+fecha       : "YYYY-MM-DD"
+reserved_by : (ausente si libre) | "PNR#{pnr}" (si reservado)
+reserved_at : ISO-8601 (sólo si reservado)
+```
+> 120 ítems SEAT# por vuelo (20 filas × 6 letras A-F). Reserva atómica vía `UpdateItem` con `ConditionExpression: attribute_not_exists(reserved_by)`. Liberación con `ConditionExpression: reserved_by = :owned_pnr` para evitar liberar seats de otros PNRs. Categorías: fila 1 = primera_fila, filas 6-10 = salida_rapida, filas 14-15 = salida_emergencia, resto = estandar.
 
 > En TP3 había dos entidades adicionales (`ANALYTICS#DAILY` y `ANALYTICS#ROUTES`) que el dashboard admin leía. En TP4 fueron eliminadas — el equipo de business analytics consume los mismos datos vía Athena sobre S3, no via DynamoDB.
 
 ---
 
-### Decremento atómico de asientos
+### Reserva atómica de asientos (seat map real, TP4)
 
-`reserve_flight_handler` usa `ConditionExpression` para evitar sobreventa:
+`reserve_flight_handler` reserva un asiento ESPECÍFICO con `ConditionExpression`:
 
 ```python
 table.update_item(
-    Key={"PK": f"FLIGHT#{origen}#{destino}", "SK": f"DATE#{fecha}"},
-    UpdateExpression="ADD asientos_disponibles :dec",
-    ConditionExpression="asientos_disponibles >= :min",
-    ExpressionAttributeValues={":dec": -pasajeros, ":min": pasajeros},
+    Key={"PK": f"FLIGHT#{origen}#{destino}", "SK": f"DATE#{fecha}#FLIGHT#{vuelo}#SEAT#{seat_id}"},
+    UpdateExpression="SET reserved_by = :pnr, reserved_at = :now",
+    ConditionExpression="attribute_exists(PK) AND attribute_not_exists(reserved_by)",
+    ExpressionAttributeValues={":pnr": f"PNR#{pnr}", ":now": iso_now},
 )
 ```
 
-Si dos usuarios intentan reservar el último asiento simultáneamente, DynamoDB ejecuta solo uno. El otro recibe `ConditionalCheckFailedException`, que Step Functions propaga como error y dispara las compensaciones (rollback automático vía Saga).
+Si dos usuarios intentan reservar el mismo asiento, DynamoDB ejecuta sólo uno. El otro recibe `ConditionalCheckFailedException` y Step Functions dispara la compensación. La liberación (compensación) usa `ConditionExpression: reserved_by = :owned_pnr` para evitar liberar asientos de otros PNRs.
+
+El PNR se genera con SHA-256 del `payment_id` en `chat_handler.py` ANTES de iniciar el Saga (ver justificación #22), lo que permite que cada paso del Saga sea idempotente y que la compensación libere exactamente el seat de este PNR.
 
 ---
 

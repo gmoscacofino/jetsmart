@@ -2,8 +2,11 @@
 
 data "archive_file" "chat_handler" {
   type        = "zip"
-  source_file = "${path.module}/../../../../lambda/chat_handler.py"
+  source_dir  = "${path.module}/../../../../lambda"
   output_path = "${path.module}/builds/chat_handler.zip"
+  # chat_handler.py importa pricing.py — empaquetamos el dir entero.
+  # Los otros .py del dir se incluyen pero no se ejecutan (handler busca por nombre).
+  excludes = ["tests", "tests/__init__.py", "tests/test_pricing.py", "__pycache__"]
 }
 
 data "aws_iam_role" "lab_role" {

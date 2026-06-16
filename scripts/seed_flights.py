@@ -3,11 +3,15 @@
 Carga vuelos de ejemplo en DynamoDB para el chatbot JetSmart.
 Uso: python3 scripts/seed_flights.py <TABLE_NAME>
 
-Genera vuelos los próximos 75 días (lunes, miércoles y viernes)
-para las rutas que opera JetSmart en Sudamérica.
+Genera vuelos los próximos 30 días (lunes, miércoles y viernes) para las rutas
+que opera JetSmart en Sudamérica. Por cada vuelo crea:
+  - 1 ítem "master row" con precio, horarios y datos del vuelo
+    SK = DATE#YYYY-MM-DD#FLIGHT#JAXX
+  - 120 ítems SEAT# (20 filas × 6 letras A-F)
+    SK = DATE#YYYY-MM-DD#FLIGHT#JAXX#SEAT#<row><letter>
 
-SK format: DATE#YYYY-MM-DD#FLIGHT#JAXX
-Permite múltiples vuelos por ruta/fecha sin sobreescribirse.
+Los SEAT# se crean SIN reserved_by (libres). La Saga los reserva atómicamente
+con ConditionExpression al confirmar la compra (ver payment_processor.py).
 """
 import sys, random
 from datetime import date, timedelta
@@ -47,8 +51,24 @@ RUTAS = [
     ("IGR", "AEP", "JA302",  "09:30", "11:15", 105,  69.0),
 ]
 
+# ── Layout de cabina ──────────────────────────────────────────────────────────
+# 20 filas × 6 letras (A-F) = 120 asientos por vuelo.
+# Categorías por fila — refleja layout real de cabina single-aisle.
+SEAT_LETTERS = ("A", "B", "C", "D", "E", "F")
+ROWS = list(range(1, 21))
 
-def fechas_proximos_dias(dias=75):
+
+def _seat_type(row: int) -> str:
+    if row == 1:
+        return "primera_fila"
+    if 6 <= row <= 10:
+        return "salida_rapida"
+    if row in (14, 15):
+        return "salida_emergencia"
+    return "estandar"
+
+
+def fechas_proximos_dias(dias=30):
     hoy = date.today()
     return [
         (hoy + timedelta(days=i)).isoformat()
@@ -59,35 +79,6 @@ def fechas_proximos_dias(dias=75):
 
 def duracion_str(minutos):
     return f"{minutos // 60}h {minutos % 60:02d}m"
-
-
-def _capacidad(precio_base: float) -> int:
-    if precio_base < 60:
-        return 120
-    if precio_base < 100:
-        return 100
-    return 80
-
-
-def _asientos(vuelo: str, fecha: str, capacidad: int) -> int:
-    """
-    Asientos disponibles variables por fecha.
-    Vuelos próximos tienen menos disponibilidad (ya vendidos); lejanos más.
-    Determinístico: mismo vuelo+fecha → mismo resultado.
-    """
-    days_out = (date.fromisoformat(fecha) - date.today()).days
-    rng = random.Random(hash(f"{vuelo}|{fecha}"))
-    if days_out <= 3:
-        lo, hi = 0.03, 0.20   # casi lleno
-    elif days_out <= 7:
-        lo, hi = 0.12, 0.40
-    elif days_out <= 14:
-        lo, hi = 0.25, 0.60
-    elif days_out <= 30:
-        lo, hi = 0.40, 0.80
-    else:
-        lo, hi = 0.55, 1.00   # muchos lugares aún
-    return max(1, round(rng.uniform(lo, hi) * capacidad))
 
 
 def _precio(precio_base: float, vuelo: str, fecha: str) -> float:
@@ -123,17 +114,14 @@ FECHAS = fechas_proximos_dias()
 
 items = []
 for origen, destino, vuelo, hora_salida, hora_llegada, duracion_min, precio_base in RUTAS:
-    capacidad = _capacidad(precio_base)
-    gate_num  = (abs(hash(vuelo)) % 20) + 1
+    gate_num = (abs(hash(vuelo)) % 20) + 1
 
     for fecha in FECHAS:
-        precio   = _precio(precio_base, vuelo, fecha)
-        asientos = _asientos(vuelo, fecha, capacidad)
+        precio = _precio(precio_base, vuelo, fecha)
 
+        # Master row del vuelo (sin #SEAT# en el SK) — datos comerciales y horarios
         items.append({
             "PK":                   f"FLIGHT#{origen}#{destino}",
-            # SK incluye el número de vuelo → evita sobreescritura cuando hay
-            # dos frecuencias (ej: JA201 mañana y JA203 tarde) en la misma ruta/fecha
             "SK":                   f"DATE#{fecha}#FLIGHT#{vuelo}",
             "vuelo_numero":         vuelo,
             "fecha":                fecha,
@@ -143,18 +131,31 @@ for origen, destino, vuelo, hora_salida, hora_llegada, duracion_min, precio_base
             "hora_llegada":         hora_llegada,
             "duracion":             duracion_str(duracion_min),
             "precio":               Decimal(str(precio)),
-            "asientos_disponibles": asientos,
-            "aerolinea":            "JetSmart",
             "estado_vuelo":         "EN_HORARIO",
             "horario_salida_real":  hora_salida,
             "puerta":               f"{gate_num:02d}",
             "demora_minutos":       0,
         })
 
-print(f"Cargando {len(items)} vuelos en {TABLE_NAME}...")
+        # Ítems SEAT# — 120 por vuelo. Atributo reserved_by ausente = libre.
+        for row in ROWS:
+            for letter in SEAT_LETTERS:
+                seat_id = f"{row}{letter}"
+                items.append({
+                    "PK":           f"FLIGHT#{origen}#{destino}",
+                    "SK":           f"DATE#{fecha}#FLIGHT#{vuelo}#SEAT#{seat_id}",
+                    "seat_id":      seat_id,
+                    "row":          row,
+                    "letter":       letter,
+                    "seat_type":    _seat_type(row),
+                    "vuelo_numero": vuelo,
+                    "fecha":        fecha,
+                })
+
+print(f"Cargando {len(items)} items en {TABLE_NAME} ({len(RUTAS)} rutas × {len(FECHAS)} fechas × ~121 items/vuelo)...")
 
 with table.batch_writer() as batch:
     for item in items:
         batch.put_item(Item=item)
 
-print(f"OK: {len(items)} vuelos cargados ({len(RUTAS)} rutas x {len(FECHAS)} fechas).")
+print(f"OK: {len(items)} items cargados.")

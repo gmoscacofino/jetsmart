@@ -209,11 +209,11 @@ const Chat = (() => {
 
         const route = document.createElement('div');
         route.className = 'reservation-route';
-        route.textContent = `${r.origin} → ${r.destination}`;
+        route.textContent = `${r.origen} → ${r.destino}`;
 
         const detail = document.createElement('div');
         detail.className = 'reservation-detail';
-        detail.textContent = `${r.flight_number} · ${r.date} · ${r.passengers} pasajero(s)`;
+        detail.textContent = `${r.vuelo_numero} · ${r.fecha} · ${r.pasajeros} pasajero(s)`;
 
         const status = document.createElement('div');
         status.className = 'reservation-status';

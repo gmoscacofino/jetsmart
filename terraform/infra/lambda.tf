@@ -62,8 +62,11 @@ locals {
 
 data "archive_file" "payment_processor" {
   type        = "zip"
-  source_file = "${path.module}/../../lambda/payment_processor.py"
+  source_dir  = "${path.module}/../../lambda"
   output_path = "${path.module}/builds/payment_processor.zip"
+  # payment_processor.py importa pricing.py — empaquetamos el dir entero.
+  # Los otros .py del dir se incluyen pero no se ejecutan (handler busca por nombre).
+  excludes = ["tests", "tests/__init__.py", "tests/test_pricing.py", "__pycache__"]
 }
 
 resource "aws_lambda_function" "payment" {

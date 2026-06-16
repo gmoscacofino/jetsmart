@@ -28,6 +28,8 @@ from botocore.exceptions import ClientError
 
 import boto3
 
+from pricing import compute_total, PricingError
+
 log = logging.getLogger()
 log.setLevel(logging.INFO)
 
@@ -84,52 +86,106 @@ def _passenger_key(name: str) -> str:
     return name.lower().replace(" ", "_")[:40] if name else "anon"
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _claim_random_seat(origen: str, destino: str, master_sk: str, pnr: str, max_attempts: int = 3) -> tuple[str, str]:
+    """
+    Reserva un asiento estándar aleatorio del vuelo. Devuelve (seat_id, full_sk).
+    Atomic via ConditionExpression — si hay race, reintenta hasta max_attempts.
+    """
+    import random as _r
+    resp = table.query(
+        KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
+        FilterExpression="attribute_not_exists(reserved_by) AND seat_type = :t",
+        ExpressionAttributeValues={
+            ":pk":     f"FLIGHT#{origen}#{destino}",
+            ":prefix": f"{master_sk}#SEAT#",
+            ":t":      "estandar",
+        },
+    )
+    candidates = resp.get("Items", [])
+    if not candidates:
+        raise ValueError("Sin asientos disponibles en el vuelo")
+
+    for _ in range(max_attempts):
+        choice = _r.choice(candidates)
+        try:
+            table.update_item(
+                Key={"PK": choice["PK"], "SK": choice["SK"]},
+                UpdateExpression="SET reserved_by = :pnr, reserved_at = :now",
+                ConditionExpression="attribute_not_exists(reserved_by)",
+                ExpressionAttributeValues={
+                    ":pnr": f"PNR#{pnr}",
+                    ":now": _now_iso(),
+                },
+            )
+            return choice["seat_id"], choice["SK"]
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                candidates.remove(choice)
+                if not candidates:
+                    break
+                continue
+            raise
+    raise ValueError("No se pudo bloquear un asiento tras múltiples intentos (race condition)")
+
+
 # ── Paso 1 ────────────────────────────────────────────────────────────────────
-# Verifica disponibilidad y bloquea el asiento (decremento atómico).
-# Input:  {payment_id, user_id, reservation: {origen, destino, fecha, pasajeros, vuelo_numero}}
-# Output: agrega flight_info al estado
+# Verifica disponibilidad y bloquea UN asiento específico (atomic via
+# ConditionExpression sobre el ítem SEAT#<row><letter>). El PNR ya viene
+# generado upstream (chat_handler) para que el reserved_by sea estable y la
+# compensación pueda liberar exactamente este asiento.
+#
+# Input: {payment_id, pnr, user_id, reservation: {origen, destino, fecha,
+#         pasajeros, vuelo_numero, seat_id?}}
+# Output: agrega flight_info con seat_id, _flight_pk, _seat_sk
 
 def reserve_flight_handler(event, context):
-    log.info("ReserveFlight — payment_id: %s", event.get("payment_id"))
+    log.info("ReserveFlight — payment_id: %s pnr: %s",
+             event.get("payment_id"), event.get("pnr"))
 
+    pnr = event["pnr"]
     reservation = event["reservation"]
     origen      = reservation["origen"]
     destino     = reservation["destino"]
     fecha       = reservation["fecha"]
-    pasajeros   = int(reservation.get("pasajeros", 1))
     vuelo_pref  = reservation.get("vuelo_numero", "")
+    seat_pref   = (reservation.get("seat_id") or "").upper()
 
-    # Query — puede haber múltiples frecuencias por ruta/fecha (mañana + tarde)
-    resp = table.query(
-        KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
-        ExpressionAttributeValues={
-            ":pk":     f"FLIGHT#{origen}#{destino}",
-            ":prefix": f"DATE#{fecha}#",
-        },
-    )
-    items = resp.get("Items", [])
-    if not items:
-        raise ValueError(f"Sin vuelos disponibles para {origen}-{destino} el {fecha}")
+    # 1. Master row del vuelo — precio y disponibilidad general
+    flight_pk = f"FLIGHT#{origen}#{destino}"
+    master_sk = f"DATE#{fecha}#FLIGHT#{vuelo_pref}"
 
-    # Si el usuario eligió un vuelo específico, filtramos por número
-    if vuelo_pref:
-        items = [i for i in items if i.get("vuelo_numero") == vuelo_pref]
-        if not items:
-            raise ValueError(f"Vuelo {vuelo_pref} no encontrado para {origen}-{destino} {fecha}")
+    master = table.get_item(Key={"PK": flight_pk, "SK": master_sk}).get("Item")
+    if not master:
+        raise ValueError(f"Vuelo {vuelo_pref} {origen}-{destino} {fecha} no existe")
 
-    vuelo = items[0]
-    disponibles = int(vuelo.get("asientos_disponibles", 0))
-
-    if disponibles < pasajeros:
-        raise ValueError(f"Asientos insuficientes: disponibles={disponibles}, solicitados={pasajeros}")
-
-    # Decremento atómico con condición — protege contra oversell concurrente
-    table.update_item(
-        Key={"PK": vuelo["PK"], "SK": vuelo["SK"]},
-        UpdateExpression="ADD asientos_disponibles :dec",
-        ConditionExpression="asientos_disponibles >= :min",
-        ExpressionAttributeValues={":dec": -pasajeros, ":min": pasajeros},
-    )
+    # 2. Reservar asiento — específico o aleatorio
+    if seat_pref:
+        seat_sk = f"{master_sk}#SEAT#{seat_pref}"
+        try:
+            table.update_item(
+                Key={"PK": flight_pk, "SK": seat_sk},
+                UpdateExpression="SET reserved_by = :pnr, reserved_at = :now",
+                ConditionExpression="attribute_exists(PK) AND attribute_not_exists(reserved_by)",
+                ExpressionAttributeValues={
+                    ":pnr": f"PNR#{pnr}",
+                    ":now": _now_iso(),
+                },
+            )
+            seat_id = seat_pref
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                # Doble caso: no existe el seat, o ya está tomado.
+                check = table.get_item(Key={"PK": flight_pk, "SK": seat_sk}).get("Item")
+                if not check:
+                    raise ValueError(f"Asiento {seat_pref} no existe en el vuelo")
+                raise ValueError(f"Asiento {seat_pref} ya está reservado — elegí otro")
+            raise
+    else:
+        seat_id, seat_sk = _claim_random_seat(origen, destino, master_sk, pnr)
 
     return {
         **event,
@@ -137,13 +193,13 @@ def reserve_flight_handler(event, context):
             "origen":               origen,
             "destino":              destino,
             "ruta":                 f"{origen}-{destino}",
-            "vuelo_numero":         vuelo.get("vuelo_numero", ""),
+            "vuelo_numero":         master.get("vuelo_numero", vuelo_pref),
             "fecha":                fecha,
-            "precio_por_pasajero":  float(vuelo.get("precio", 0)),
-            "pasajeros_bloqueados": pasajeros,
+            "precio_por_pasajero":  float(master.get("precio", 0)),
+            "seat_id":              seat_id,
             # Guardamos las claves del item para release_flight (idempotente sin recalcular)
-            "_flight_pk":           vuelo["PK"],
-            "_flight_sk":           vuelo["SK"],
+            "_flight_pk":           flight_pk,
+            "_seat_sk":             seat_sk,
         },
     }
 
@@ -162,18 +218,31 @@ def reserve_booking_handler(event, context):
     reservation_r  = event["reservation"]
     pasajeros      = int(reservation_r.get("pasajeros", 1))
 
-    pnr = _pnr_from_payment_id(event["payment_id"])
-    total = Decimal(str(flight_info["precio_por_pasajero"])) * pasajeros
+    pnr    = event["pnr"]
+    tarifa = reservation_r.get("tarifa", "BASIC")
+    extras = reservation_r.get("extras", []) or []
+
+    # Server-side pricing — fuente única de verdad. El total que pasó el chat
+    # se ignora; recalculamos con tarifa, extras y precio base del inventory.
+    try:
+        pricing = compute_total(
+            Decimal(str(flight_info["precio_por_pasajero"])),
+            tarifa, extras, pasajeros,
+        )
+    except PricingError as e:
+        raise ValueError(f"Error de pricing server-side: {e}")
+    total = pricing["total"]
 
     passenger_name = reservation_r.get("nombre_pasajero", "")
     email          = reservation_r.get("email_contacto", "")
     phone          = reservation_r.get("telefono", "")
     dni            = reservation_r.get("dni", "") or _passenger_key(passenger_name)
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now_iso()
     user_id = event["user_id"]
     vuelo_n = flight_info.get("vuelo_numero", "")
     fecha   = flight_info["fecha"]
+    seat_id = flight_info.get("seat_id", "")
 
     # PNR canónico — usamos PutItem con condición para idempotencia (Saga retry-safe)
     try:
@@ -185,8 +254,8 @@ def reserve_booking_handler(event, context):
                 "user_id":         user_id,
                 "status":          "PENDIENTE",
                 "total":           total,
-                "passenger_count": pasajeros,
-                "tarifa":          reservation_r.get("tarifa", ""),
+                "pasajeros":       pasajeros,
+                "tarifa":          tarifa,
                 "email_contacto":  email,
                 "telefono":        phone,
                 "created_at":      now,
@@ -247,12 +316,24 @@ def reserve_booking_handler(event, context):
         "dni":            dni,
         "email":          email,
         "phone":          phone,
-        "seat":           "ALEATORIO",
+        "seat":           seat_id,
         # GSI3: ReservationsByPassenger — KEYS_ONLY, suficiente para resolver PNR
         "gsi3pk":         f"DNI#{dni}",
         "gsi3sk":         f"PNR#{pnr}",
     }
     table.put_item(Item=pax_item)
+
+    # EXTRA# — persistir cada extra contratado como ítem aparte para auditoría
+    # y queries del tipo "qué llevó cada pasajero".
+    for idx, (extra_type, amount) in enumerate(pricing["desglose"]["extras"].items(), start=1):
+        table.put_item(Item={
+            "PK":         f"PNR#{pnr}",
+            "SK":         f"EXTRA#{idx:02d}",
+            "pnr":        pnr,
+            "extra_type": extra_type,
+            "amount":     amount,
+            "created_at": now,
+        })
 
     # Si tenemos email distinto a DNI, stampar también un alias por email
     if email:
@@ -264,22 +345,24 @@ def reserve_booking_handler(event, context):
             "gsi3sk": f"PNR#{pnr}",
         })
 
-    # User thin pointer — denormalizado para "mis reservas" en O(1)
+    # User thin pointer — denormalizado para "mis reservas" en O(1).
+    # Vocabulario en español para consistencia con el resto del sistema.
     table.put_item(Item={
         "PK":              f"USER#{user_id}",
         "SK":              f"RESERVATION#{pnr}",
         "pnr":             pnr,
         "status":          "PENDIENTE",
-        "origin":          flight_info["origen"],
-        "destination":     flight_info["destino"],
-        "flight_number":   vuelo_n,
-        "flight_date":     fecha,
-        "passenger_count": pasajeros,
-        "tarifa":          reservation_r.get("tarifa", ""),
+        "origen":          flight_info["origen"],
+        "destino":         flight_info["destino"],
+        "vuelo_numero":    vuelo_n,
+        "fecha":           fecha,
+        "pasajeros":       pasajeros,
+        "tarifa":          tarifa,
         "total":           total,
         "email":           email,
-        "phone":           phone,
-        "passenger_name":  passenger_name,
+        "telefono":        phone,
+        "nombre_pasajero": passenger_name,
+        "seat":            seat_id,
         "created_at":      now,
     })
 
@@ -320,7 +403,20 @@ def collect_payment_handler(event, context):
     flight_info = event["flight_info"]
     reservation = event["reservation"]
     pasajeros   = int(reservation.get("pasajeros", 1))
-    total = float(flight_info["precio_por_pasajero"]) * pasajeros
+    tarifa      = reservation.get("tarifa", "BASIC")
+    extras      = reservation.get("extras", []) or []
+
+    # Mismo cálculo que reserve_booking — double-check del total contra pricing.
+    # El input "total_pagado" del paso siguiente debe coincidir con esto.
+    try:
+        pricing = compute_total(
+            Decimal(str(flight_info["precio_por_pasajero"])),
+            tarifa, extras, pasajeros,
+        )
+    except PricingError as e:
+        raise ValueError(f"Error de pricing en collect_payment: {e}")
+
+    total = float(pricing["total"])
     tx_id = f"TX-{event['payment_id'].replace('-', '')[:12].upper()}"
 
     log.info("Pago mock aprobado — total: $%.2f — tx: %s", total, tx_id)
@@ -484,31 +580,40 @@ def cancel_booking_handler(event, context):
 # ── Compensación: release flight ─────────────────────────────────────────────
 
 def release_flight_handler(event, context):
-    flight_info = event.get("flight_info")
-    if not flight_info:
+    """
+    Libera el asiento reservado por reserve_flight_handler. Idempotente:
+    si el seat ya fue liberado o pertenece a otro PNR, no falla.
+    """
+    flight_info = event.get("flight_info") or {}
+    pnr = event.get("pnr")
+
+    if not flight_info or not pnr:
         log.info("ReleaseFlight — sin asiento bloqueado que liberar")
         return {"released": False, "reason": "no_flight_reserved"}
 
-    pasajeros = flight_info.get("pasajeros_bloqueados", 1)
-    log.info("ReleaseFlight — ruta: %s — pasajeros: %d",
-             flight_info.get("ruta"), pasajeros)
+    pk = flight_info.get("_flight_pk")
+    sk = flight_info.get("_seat_sk")
+    if not (pk and sk):
+        log.warning("ReleaseFlight — faltan keys del seat en flight_info")
+        return {"released": False, "reason": "missing_seat_keys"}
 
-    # Usamos las claves guardadas en reserve_flight si están disponibles —
-    # si no, reconstruimos del flight_info (fallback compat)
-    pk = flight_info.get("_flight_pk") or f"FLIGHT#{flight_info['origen']}#{flight_info['destino']}"
-    sk = flight_info.get("_flight_sk") or f"DATE#{flight_info['fecha']}#FLIGHT#{flight_info.get('vuelo_numero','')}"
+    log.info("ReleaseFlight — pnr: %s seat: %s sk: %s",
+             pnr, flight_info.get("seat_id"), sk)
 
     try:
         table.update_item(
             Key={"PK": pk, "SK": sk},
-            UpdateExpression="ADD asientos_disponibles :inc",
-            ConditionExpression="attribute_exists(PK)",
-            ExpressionAttributeValues={":inc": pasajeros},
+            UpdateExpression="REMOVE reserved_by, reserved_at",
+            ConditionExpression="reserved_by = :owned_pnr",
+            ExpressionAttributeValues={":owned_pnr": f"PNR#{pnr}"},
         )
     except ClientError as e:
         if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            log.warning("ReleaseFlight — vuelo no encontrado: %s/%s", pk, sk)
-            return {"released": False, "reason": "flight_not_found"}
+            log.warning(
+                "ReleaseFlight — seat %s no estaba reservado por PNR %s "
+                "(ya liberado o de otro PNR)", sk, pnr,
+            )
+            return {"released": False, "reason": "not_owned_or_already_released"}
         raise
 
-    return {"released": True, "ruta": flight_info.get("ruta")}
+    return {"released": True, "seat_id": flight_info.get("seat_id")}

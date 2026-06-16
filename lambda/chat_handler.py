@@ -1,8 +1,11 @@
-import os, json, uuid, time, logging, re
+import os, json, uuid, time, hashlib, logging, re
 from datetime import datetime, timezone, date, timedelta
+from decimal import Decimal
 
 import boto3
 import anthropic
+
+from pricing import validate_inputs, PricingError, EXTRAS_FIJOS
 
 log = logging.getLogger()
 log.setLevel(logging.INFO)
@@ -46,6 +49,25 @@ _anthropic_client  = _init_anthropic()
 _raw_system_prompt = _load_system_prompt()
 
 _system_prompt_cache: dict = {}
+
+# Charset PNR estándar — mismo que payment_processor.py para consistencia.
+# Alfanumérico uppercase sin caracteres ambiguos (0/O, 1/I).
+_PNR_CHARSET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def _pnr_from_payment_id(payment_id: str) -> str:
+    """
+    Genera PNR estable desde payment_id usando SHA-256.
+    Mismo algoritmo que payment_processor.py — duplicado a propósito para no
+    acoplar este Lambda al package del Saga.
+    """
+    digest = hashlib.sha256(payment_id.encode("utf-8")).digest()
+    n = int.from_bytes(digest[:8], "big")
+    chars = []
+    for _ in range(6):
+        chars.append(_PNR_CHARSET[n % len(_PNR_CHARSET)])
+        n //= len(_PNR_CHARSET)
+    return "".join(chars)
 
 
 def _build_system_prompt() -> str:
@@ -214,6 +236,25 @@ TOOLS = [
         },
     },
     {
+        "name": "list_available_seats",
+        "description": (
+            "Lista categorías de asientos disponibles para un vuelo+fecha. "
+            "Devuelve conteos por categoría (estandar, salida_rapida, salida_emergencia, "
+            "primera_fila) y 6 ejemplos de seat_id por categoría. Usar en PASO 3 antes "
+            "de pedirle al usuario que elija."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "origen":       {"type": "string"},
+                "destino":      {"type": "string"},
+                "fecha":        {"type": "string"},
+                "vuelo_numero": {"type": "string"},
+            },
+            "required": ["origen", "destino", "fecha", "vuelo_numero"],
+        },
+    },
+    {
         "name": "get_reservation",
         "description": "Consulta el estado de una reserva por PNR (record locator de 6 caracteres).",
         "input_schema": {
@@ -279,7 +320,8 @@ TOOLS = [
             "Crea una reserva real e inicia el flujo de pago (Saga). "
             "Llamar SÓLO cuando el usuario confirmó explícitamente todos los detalles. "
             "NO pedir el email al usuario: la herramienta lo completa automáticamente "
-            "con el email del usuario autenticado (claim del JWT de Cognito)."
+            "con el email del usuario autenticado (claim del JWT de Cognito). "
+            "NO pasar `total` — el sistema lo calcula server-side a partir de tarifa+extras."
         ),
         "input_schema": {
             "type": "object",
@@ -288,14 +330,19 @@ TOOLS = [
                 "destino":         {"type": "string"},
                 "fecha":           {"type": "string", "description": "YYYY-MM-DD"},
                 "pasajeros":       {"type": "integer"},
-                "tarifa":          {"type": "string", "description": "BASIC, LIGHT, SMART, FULL FLEX"},
-                "total":           {"type": "number"},
+                "tarifa":          {"type": "string", "enum": ["BASIC", "LIGHT", "SMART", "FULL FLEX"]},
+                "extras": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(EXTRAS_FIJOS.keys())},
+                    "description": "Lista de extras contratados (vacía si no hay).",
+                },
+                "seat_id":         {"type": "string", "description": "ID asiento (ej '12A'). Vacío = sistema asigna aleatorio."},
                 "telefono":        {"type": "string"},
                 "nombre_pasajero": {"type": "string"},
                 "dni":             {"type": "string", "description": "DNI del pasajero principal (sin puntos)"},
                 "vuelo_numero":    {"type": "string", "description": "Número de vuelo (JA203, etc.)"},
             },
-            "required": ["origen", "destino", "fecha", "pasajeros", "tarifa", "total"],
+            "required": ["origen", "destino", "fecha", "pasajeros", "tarifa", "vuelo_numero"],
         },
     },
     {
@@ -343,17 +390,19 @@ def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "", u
         items = resp.get("Items", [])
         if not items:
             return json.dumps({"disponible": False, "mensaje": f"No hay vuelos de {origen} a {destino}."})
+        # Filtrar master rows (sin "#SEAT#" en el SK). Los ítems SEAT# también
+        # empiezan con DATE# pero no son vuelos buscables — son inventario.
         fechas = []
         for i in items:
-            if int(i.get("asientos_disponibles", 0)) > 0:
-                sk_parts = i["SK"].split("#")
-                fechas.append({
-                    "fecha":                sk_parts[1],
-                    "vuelo":                i.get("vuelo_numero"),
-                    "hora_salida":          i.get("hora_salida"),
-                    "precio_desde":         float(i.get("precio", 0)),
-                    "asientos_disponibles": int(i.get("asientos_disponibles", 0)),
-                })
+            if "#SEAT#" in i.get("SK", ""):
+                continue
+            sk_parts = i["SK"].split("#")
+            fechas.append({
+                "fecha":       sk_parts[1],
+                "vuelo":       i.get("vuelo_numero"),
+                "hora_salida": i.get("hora_salida"),
+                "precio_desde": float(i.get("precio", 0)),
+            })
         return json.dumps({"origen": origen, "destino": destino, "fechas": fechas})
 
     if name == "search_flights":
@@ -370,31 +419,42 @@ def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "", u
             },
             ScanIndexForward=True,
         )
-        found = resp.get("Items", [])
-        if not found:
+        # Filtramos master rows — los SEAT# se cuentan aparte con COUNT
+        masters = [i for i in resp.get("Items", []) if "#SEAT#" not in i.get("SK", "")]
+        if not masters:
             return json.dumps({"disponible": False, "mensaje": f"No hay vuelos de {origen} a {destino} el {fecha}."})
+
         vuelos = []
-        for item in found:
-            asientos = int(item.get("asientos_disponibles", 0))
-            if asientos >= pasajeros:
+        for item in masters:
+            vuelo_n = item["vuelo_numero"]
+            # COUNT real de asientos libres — pasa por el seat map
+            cnt = biz_table.query(
+                KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
+                FilterExpression="attribute_not_exists(reserved_by)",
+                Select="COUNT",
+                ExpressionAttributeValues={
+                    ":pk":     f"FLIGHT#{origen}#{destino}",
+                    ":prefix": f"DATE#{fecha}#FLIGHT#{vuelo_n}#SEAT#",
+                },
+            )["Count"]
+            if cnt >= pasajeros:
                 vuelos.append({
-                    "vuelo":                item["vuelo_numero"],
+                    "vuelo":                vuelo_n,
                     "hora_salida":          item.get("hora_salida"),
                     "hora_llegada":         item.get("hora_llegada"),
                     "duracion":             item.get("duracion"),
                     "precio_por_pasajero":  float(item["precio"]),
                     "precio_total":         float(item["precio"]) * pasajeros,
-                    "asientos_disponibles": asientos,
-                    "aerolinea":            item.get("aerolinea", "JetSmart"),
+                    "asientos_disponibles": cnt,
                     "estado_vuelo":         item.get("estado_vuelo", "EN_HORARIO"),
                 })
+
         if not vuelos:
-            total = sum(int(i.get("asientos_disponibles", 0)) for i in found)
             return json.dumps({
                 "disponible": False,
                 "mensaje": (
                     f"Hay vuelo(s) {origen}-{destino} {fecha} sin asientos suficientes "
-                    f"para {pasajeros} pax (máx disponible: {total})."
+                    f"para {pasajeros} pax."
                 ),
             })
         _emit_event("busqueda_vuelo", {
@@ -404,6 +464,32 @@ def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "", u
         return json.dumps({
             "disponible": True, "origen": origen, "destino": destino,
             "fecha": fecha, "pasajeros": pasajeros, "vuelos": vuelos,
+        })
+
+    if name == "list_available_seats":
+        o = inputs["origen"].upper()
+        d = inputs["destino"].upper()
+        f = inputs["fecha"]
+        v = inputs["vuelo_numero"]
+        log.info("list_available_seats: %s→%s %s %s", o, d, f, v)
+        resp = biz_table.query(
+            KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
+            FilterExpression="attribute_not_exists(reserved_by)",
+            ExpressionAttributeValues={
+                ":pk":     f"FLIGHT#{o}#{d}",
+                ":prefix": f"DATE#{f}#FLIGHT#{v}#SEAT#",
+            },
+        )
+        by_cat = {"estandar": [], "salida_rapida": [], "salida_emergencia": [], "primera_fila": []}
+        for s in resp.get("Items", []):
+            cat = s.get("seat_type", "estandar")
+            by_cat.setdefault(cat, []).append(s.get("seat_id"))
+        return json.dumps({
+            "vuelo": v, "fecha": f,
+            "categorias": {
+                cat: {"disponibles": len(lst), "ejemplos": sorted(lst)[:6]}
+                for cat, lst in by_cat.items()
+            },
         })
 
     if name == "get_reservation":
@@ -418,10 +504,10 @@ def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "", u
             "encontrada":     True,
             "reservation_id": pnr,
             "pnr":            pnr,
-            "origen":         item.get("origin"),
-            "destino":        item.get("destination"),
-            "fecha":          item.get("flight_date"),
-            "pasajeros":      item.get("passenger_count"),
+            "origen":         item.get("origen"),
+            "destino":        item.get("destino"),
+            "fecha":          item.get("fecha"),
+            "pasajeros":      item.get("pasajeros"),
             "status":         item.get("status"),
             "total":          float(item.get("total", 0)),
         }, default=str)
@@ -444,11 +530,11 @@ def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "", u
             {
                 "reservation_id": i.get("pnr"),
                 "pnr":            i.get("pnr"),
-                "vuelo":          i.get("flight_number", "—"),
-                "origen":         i.get("origin", "—"),
-                "destino":        i.get("destination", "—"),
-                "fecha":          i.get("flight_date", "—"),
-                "pasajeros":      int(i.get("passenger_count", 1)),
+                "vuelo":          i.get("vuelo_numero", "—"),
+                "origen":         i.get("origen", "—"),
+                "destino":        i.get("destino", "—"),
+                "fecha":          i.get("fecha", "—"),
+                "pasajeros":      int(i.get("pasajeros", 1)),
                 "tarifa":         i.get("tarifa", "—"),
                 "status":         i.get("status", "—"),
                 "total":          float(i.get("total", 0)),
@@ -468,12 +554,12 @@ def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "", u
             return json.dumps({"ok": True, "ya_realizado": True, "mensaje": "Ya tenés check-in realizado para esta reserva."})
         if item.get("status") not in ("CONFIRMADA",):
             return json.dumps({"ok": False, "mensaje": f"No se puede hacer check-in: la reserva está en estado {item.get('status')}."})
-        flight_dt = date.fromisoformat(item["flight_date"])
+        flight_dt = date.fromisoformat(item["fecha"])
         today = date.today()
         if flight_dt < today:
             return json.dumps({"ok": False, "mensaje": "No podés hacer check-in para un vuelo que ya pasó."})
         if flight_dt > today + timedelta(days=1):
-            return json.dumps({"ok": False, "mensaje": f"El check-in abre 24 horas antes del vuelo. Tu vuelo es el {item['flight_date']}."})
+            return json.dumps({"ok": False, "mensaje": f"El check-in abre 24 horas antes del vuelo. Tu vuelo es el {item['fecha']}."})
         # Update thin pointer + PNR canonical
         biz_table.update_item(
             Key={"PK": f"USER#{user_id}", "SK": f"RESERVATION#{pnr}"},
@@ -489,17 +575,17 @@ def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "", u
         )
         _emit_event("checkin_realizado", {
             "reservation_id": pnr, "pnr": pnr,
-            "flight_number":  item.get("flight_number", ""),
-            "origin":         item.get("origin", ""),
-            "destination":    item.get("destination", ""),
-            "flight_date":    item.get("flight_date", ""),
+            "vuelo_numero":   item.get("vuelo_numero", ""),
+            "origen":         item.get("origen", ""),
+            "destino":        item.get("destino", ""),
+            "fecha":          item.get("fecha", ""),
         }, user_id)
         return json.dumps({
             "ok": True, "reservation_id": pnr,
-            "vuelo":  item.get("flight_number", "—"),
-            "origen": item.get("origin", "—"),
-            "destino": item.get("destination", "—"),
-            "fecha":  item.get("flight_date", "—"),
+            "vuelo":  item.get("vuelo_numero", "—"),
+            "origen": item.get("origen", "—"),
+            "destino": item.get("destino", "—"),
+            "fecha":  item.get("fecha", "—"),
             "mensaje": "Check-in realizado correctamente. Ya podés obtener tu boarding pass.",
         })
 
@@ -529,11 +615,11 @@ def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "", u
             "destino_email":  destino_email,
             "boarding_pass": {
                 "reservation_id": pnr,
-                "pasajero":       item.get("passenger_name", "Pasajero"),
-                "vuelo":          item.get("flight_number", "—"),
-                "origen":         item.get("origin", "—"),
-                "destino":        item.get("destination", "—"),
-                "fecha":          item.get("flight_date", "—"),
+                "pasajero":       item.get("nombre_pasajero", "Pasajero"),
+                "vuelo":          item.get("vuelo_numero", "—"),
+                "origen":         item.get("origen", "—"),
+                "destino":        item.get("destino", "—"),
+                "fecha":          item.get("fecha", "—"),
                 "asiento":        item.get("seat", "ALEATORIO"),
                 "grupo":          "B",
                 "puerta":         "12",
@@ -614,14 +700,25 @@ def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "", u
         if not SF_ARN:
             return json.dumps({"error": "Procesador de pagos no configurado"})
 
+        tarifa = inputs.get("tarifa", "BASIC")
+        extras = inputs.get("extras", []) or []
+        # Validar tarifa y extras antes de iniciar el Saga (fail-fast).
+        # El total real lo computa el server con el precio del inventory.
+        try:
+            validate_inputs(tarifa, extras)
+        except PricingError as e:
+            return json.dumps({"error": f"Datos de reserva inválidos: {e}"})
+
         payment_id = str(uuid.uuid4())
+        pnr = _pnr_from_payment_id(payment_id)
         reservation_data = {
             "origen":          inputs["origen"].upper(),
             "destino":         inputs["destino"].upper(),
             "fecha":           inputs["fecha"],
             "pasajeros":       int(inputs.get("pasajeros", 1)),
-            "tarifa":          inputs.get("tarifa", "BASIC"),
-            "total":           float(inputs.get("total", 0)),
+            "tarifa":          tarifa,
+            "extras":          extras,
+            "seat_id":         (inputs.get("seat_id") or "").upper(),
             "email_contacto":  user_email or inputs.get("email_contacto", ""),
             "telefono":        inputs.get("telefono", ""),
             "nombre_pasajero": inputs.get("nombre_pasajero", ""),
@@ -629,9 +726,9 @@ def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "", u
             "vuelo_numero":    inputs.get("vuelo_numero", ""),
         }
 
-        log.info("create_reservation: %s→%s %s user=%s",
+        log.info("create_reservation: %s→%s %s pnr=%s user=%s",
                  reservation_data["origen"], reservation_data["destino"],
-                 reservation_data["fecha"], user_id)
+                 reservation_data["fecha"], pnr, user_id)
 
         try:
             sf.start_execution(
@@ -639,6 +736,7 @@ def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "", u
                 name=payment_id,
                 input=json.dumps({
                     "payment_id":  payment_id,
+                    "pnr":         pnr,
                     "user_id":     user_id,
                     "reservation": reservation_data,
                 }),
@@ -646,7 +744,8 @@ def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "", u
             return json.dumps({
                 "procesando": True,
                 "payment_id": payment_id,
-                "mensaje":    "La reserva está siendo procesada. Aparecerá en 'Mis Reservas' en unos segundos.",
+                "pnr":        pnr,
+                "mensaje":    f"Reserva {pnr} en proceso. Aparecerá en 'Mis Reservas' en unos segundos.",
             })
         except Exception as e:
             log.error("Error iniciando Step Functions: %s", e)
@@ -825,11 +924,11 @@ def _handle_reservations(user: dict) -> dict:
         {
             "reservation_id": i.get("pnr"),
             "pnr":            i.get("pnr"),
-            "flight_number":  i.get("flight_number", "—"),
-            "origin":         i.get("origin", "—"),
-            "destination":    i.get("destination", "—"),
-            "date":           i.get("flight_date", "—"),
-            "passengers":     int(i.get("passenger_count", 1)),
+            "vuelo_numero":   i.get("vuelo_numero", "—"),
+            "origen":         i.get("origen", "—"),
+            "destino":        i.get("destino", "—"),
+            "fecha":          i.get("fecha", "—"),
+            "pasajeros":      int(i.get("pasajeros", 1)),
             "status":         i.get("status", "CONFIRMADA"),
         }
         for i in resp.get("Items", [])
