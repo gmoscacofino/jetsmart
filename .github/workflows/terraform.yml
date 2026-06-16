@@ -188,7 +188,11 @@ jobs:
         env:
           TF_VAR_anthropic_api_key:              ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
           TF_VAR_state_bucket_suffix:            ${{ secrets.STATE_BUCKET_SUFFIX }}
-          TF_VAR_notification_email_subscribers: '["gmoscacofino@itba.edu.ar"]'
+          # TF_VAR_notification_email_subscribers NO se pasa aca: el plan
+          # guardado ya tiene el valor, y reinyectarlo dispara el bug de
+          # Terraform "Can't change variable when applying a saved plan" para
+          # variables de tipo list (env var se reinterpreta de forma distinta
+          # a como quedo guardada en el plan).
         run: terraform apply -auto-approve tfplan
 
       - name: Inject Terraform outputs into config.js
