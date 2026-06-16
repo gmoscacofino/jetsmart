@@ -208,7 +208,7 @@ Si S3 falla (caso muy raro), el mensaje vuelve a SQS para reintento. Después de
                                  ├─→ Anthropic API (HTTPS externo)       │
                                  └─→ Step Functions (Saga reserva)       │
                                           ├─→ payment-* Lambdas          │
-                                          ├─→ boarding-pass              │
+                                          ├─→ SQS → boarding-pass-async  │
                                           └─→ notification               │
 
                           Pipeline analytics:

@@ -36,7 +36,7 @@ Para llegar al demo presencial del 17/06 incorporamos cinco cambios que cierran 
 | **Boarding pass async via SQS** | Step Functions PostBookingActions ya no invoca Lambda directo — publica a SQS `boarding-pass-generation`; nueva Lambda `boarding_pass_async` consume y graba `bp_url` en PNR. Fire-and-forget + DLQ. |
 | **3 SQS + DLQs nuevas + 1 SNS nuevo + 3 CloudWatch alarms** | Patrón consistente con el SQS de analytics. Ver `terraform/infra/messaging.tf` y `cloudwatch.tf`. |
 
-Total Lambdas: **13 → 15** (eliminada `boarding-pass`, agregadas `boarding-pass-async`, `human-handoff-processor`, `proactive-notifications`).
+Total Lambdas: **13 → 16** (eliminada `boarding-pass`, agregadas `boarding-pass-async`, `human-handoff-processor`, `proactive-notifications`, `backup-dynamodb`).
 
 ## Requerimientos
 

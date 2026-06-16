@@ -85,7 +85,7 @@ Lambda construye prompt para Claude:
   [historial completo de la sesión]
   [mensaje nuevo]
         ↓
-Lambda llama a la API de Anthropic (claude-sonnet-4-6)
+Lambda llama a la API de Anthropic (claude-haiku-4-5-20251001)
 con API key leída de Secrets Manager (cacheada en cold start)
         ↓
 [bucle de tool use, hasta 5 rondas]
@@ -139,10 +139,10 @@ ReserveFlight   (Lambda payment-reserve-flight)
 ReserveBooking  (Lambda payment-reserve-booking)
   Crea la reserva en DynamoDB con estado PENDIENTE
         ↓
-CollectPayment  (Lambda payment-collect-payment)
+CollectPayment  (Lambda payment-collect)
   Procesa el cobro (mock; en prod sería la pasarela de pagos)
         ↓
-ConfirmBooking  (Lambda payment-confirm-booking)
+ConfirmBooking  (Lambda payment-confirm)
   Update reserva PENDIENTE → CONFIRMADA en DynamoDB
   Publica evento en SNS `events`
         ↓
@@ -165,7 +165,7 @@ Cada paso de éxito tiene un `Catch` que dispara la rama de compensación. La Sa
 
 ```
 Si CollectPayment falla:
-  → CancelBooking (Lambda payment-cancel-booking)
+  → CancelBooking (Lambda payment-cancel)
        Marca la reserva como CANCELADA
   → ReleaseFlight (Lambda payment-release-flight)
        Devuelve los asientos bloqueados en DynamoDB
@@ -175,7 +175,7 @@ Si CollectPayment falla:
   → BookingFailed ✗
 
 Si ConfirmBooking falla (raro: el cobro ya pasó):
-  → RefundPayment (Lambda payment-refund-payment)
+  → RefundPayment (Lambda payment-refund)
        Revierte el cobro
   → CancelBooking → ReleaseFlight → NotifyBookingFailed → BookingDLQ
 ```
@@ -344,8 +344,8 @@ Los eventos del chatbot se procesan offline. La capa OLTP (DynamoDB) no se toca 
 ```
 Publicadores:
   chat-handler           → SNS `events`  (mensajes de chat)
-  payment-confirm-booking → SNS `events` (compras completadas)
-  payment-cancel-booking  → SNS `events` (cancelaciones)
+  payment-confirm → SNS `events` (compras completadas)
+  payment-cancel  → SNS `events` (cancelaciones)
         ↓
 SNS topic `events`
         ↓ fan-out (sólo 1 sub hoy: analytics)
@@ -373,8 +373,8 @@ Equipo de business analytics (DBeaver / DataGrip)
 | event_type | Publicador | Cuándo |
 |---|---|---|
 | `chat_message` | chat-handler | Cada mensaje procesado del chatbot |
-| `booking_confirmed` | payment-confirm-booking | Reserva confirmada exitosamente |
-| `booking_cancelled` | payment-cancel-booking | Saga compensa una reserva |
+| `booking_confirmed` | payment-confirm | Reserva confirmada exitosamente |
+| `booking_cancelled` | payment-cancel | Saga compensa una reserva |
 
 ### Por qué SQS entre SNS y Lambda
 

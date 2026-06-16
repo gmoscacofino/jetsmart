@@ -8,23 +8,26 @@ Lambda es el servicio de cómputo principal de este proyecto. Cada función Lamb
 - Se cobra por invocación y por milisegundos de ejecución
 - No requiere provisionar servidores ni administrar infraestructura
 
-### Las 13 Lambdas del proyecto
+### Las 16 Lambdas del proyecto
 
 | Nombre | Trigger | Función |
 |---|---|---|
 | `chat-handler` | API Gateway (todos los paths, **detrás de Cognito Authorizer**) | Punto de entrada principal: chat con tool use, historial, reservas del usuario, inicio de pago. Lee claims ya validados de `event.requestContext.authorizer.claims` (sin validación JWT manual) |
 | `payment-reserve-flight` | Step Functions (estado ReserveFlight) | Verifica disponibilidad y bloquea asientos en DynamoDB (decremento atómico con ConditionExpression) |
 | `payment-reserve-booking` | Step Functions (estado ReserveBooking) | Crea la reserva en DynamoDB con estado PENDIENTE |
-| `payment-collect-payment` | Step Functions (estado CollectPayment) | Procesa el cobro (mock; en producción llama al gateway de pagos) |
-| `payment-confirm-booking` | Step Functions (estado ConfirmBooking) | Actualiza la reserva a CONFIRMADA; publica evento para analytics |
-| `payment-refund-payment` | Step Functions (compensación) | Revierte el cobro si ConfirmBooking falla |
-| `payment-cancel-booking` | Step Functions (compensación) | Cancela la reserva si fue creada |
+| `payment-collect` | Step Functions (estado CollectPayment) | Procesa el cobro (mock; en producción llama al gateway de pagos) |
+| `payment-confirm` | Step Functions (estado ConfirmBooking) | Actualiza la reserva a CONFIRMADA; publica evento para analytics |
+| `payment-refund` | Step Functions (compensación) | Revierte el cobro si ConfirmBooking falla |
+| `payment-cancel` | Step Functions (compensación) | Cancela la reserva si fue creada |
 | `payment-release-flight` | Step Functions (compensación) | Libera los asientos bloqueados si ReserveFlight se ejecutó |
-| `boarding-pass` | Step Functions (PostBookingActions, rama paralela) | Genera el boarding pass y lo persiste en DynamoDB |
-| `notification` | Step Functions (PostBookingActions + error path) | Envía confirmación al usuario (éxito o fracaso del pago) |
-| `analytics-processor` | SQS analytics-queue | Escribe eventos crudos en S3 como JSON Lines particionado por fecha (TP4: ya no escribe a RDS) |
+| `boarding-pass-async` | SQS `boarding-pass-generation` (publicado por Step Functions PostBookingActions) | Consume mensajes encolados, genera el boarding pass, lo sube a S3 `boarding-passes` y graba `bp_url` en el PNR. Fire-and-forget: si falla, no afecta la reserva confirmada |
+| `notification` | Step Functions (PostBookingActions + error path) | Envía confirmación al usuario (éxito o fracaso del pago) vía SNS `notifications` |
+| `analytics-processor` | SQS `analytics` | Escribe eventos crudos en S3 `analytics` como JSON Lines particionado por fecha (TP4: ya no escribe a RDS) |
+| `human-handoff-processor` | SQS `human-handoff` (publicado por chat-handler cuando el LLM invoca la tool `escalate_to_human`) | Simula el POST al sistema del call center y actualiza el ticket HANDOFF# en `conversations` a status=ACK |
+| `proactive-notifications` | SQS `proactive-notifications` (suscrita a SNS `flight-events` publicado por ops) | Ante cancelación de vuelo, hace Query a GSI2 para encontrar todos los PNRs afectados y publica un email por usuario |
 | `auth-callback` | API Gateway GET /callback (bridge HTTPS del workaround) | Intercambia authorization code por tokens JWT y redirige al frontend |
 | `cognito-trigger` | Cognito post-registration | Asigna grupo `users` al usuario nuevo |
+| `backup-dynamodb` | EventBridge cron diario 03:00 UTC | Dispara `dynamodb:ExportTableToPointInTime` sobre `business`; el export queda en S3 `backups`. Mecanismo complementario a PITR (35d continuos), cubre retención AFIP de 10 años |
 
 ### Tool use en chat-handler
 
@@ -98,59 +101,88 @@ Lambda Function URLs son más simples pero no soportan Cognito Authorizer nativo
 
 ## SNS (Simple Notification Service)
 
-SNS es un servicio de pub/sub: un publicador manda un mensaje al topic y todos los suscriptores lo reciben.
+SNS es un servicio de pub/sub: un publicador manda un mensaje al topic y todos los suscriptores lo reciben. Permite fan-out (un evento → muchos consumidores) sin que el publicador conozca a los consumidores.
 
-### El SNS topic del proyecto
+### Los SNS topics del proyecto
+
+**Tres topics**, cada uno con un dominio claro (`messaging.tf`).
 
 | Topic | Publicado por | Suscriptores |
 |---|---|---|
-| `events` | chat-handler (mensajes de chat) y payment-confirm-booking (compras completadas) | analytics-queue (SQS) |
+| `events` | `chat-handler` (mensajes de chat) y `payment-confirm` (compras completadas) | SQS `analytics` |
+| `notifications` | Lambdas (`notification`, `human-handoff-processor`, `proactive-notifications`, etc.) y CloudWatch Alarms | Endpoints email/SMS suscritos manualmente con `aws sns subscribe` |
+| `flight-events` | Script ops `scripts/cancel_flight.py` cuando un vuelo cambia de estado (cancelado, demorado, gate change) | SQS `proactive-notifications` |
 
-En la arquitectura original (TALO — Trigger-and-Lambda-Orchestration) había 5 topics encadenando los pasos del flujo de pago. Esa responsabilidad la asumió **Step Functions**: el state machine orquesta los pasos directamente, invocando cada Lambda en el orden definido en la ASL. SNS queda únicamente para fan-out de eventos de analytics.
+### Por qué tres topics y no uno solo
 
-### Fan-out con SNS
+Cada topic representa un **dominio de eventos** distinto y tiene consumidores diferentes:
 
-El topic `events` recibe eventos de dos fuentes:
-- Mensajes de chat (publicados por `chat-handler`)
-- Compras completadas (publicadas por `payment-confirm-booking`)
+- `events` → analytics interno (data lake)
+- `notifications` → comunicación saliente al usuario y al equipo de operaciones (alarmas)
+- `flight-events` → ingest desde el sistema externo de operaciones de JetSmart
 
-Todos llegan a la misma `analytics-queue` → `analytics-processor` → **S3 analytics** (JSON Lines particionado). Si en el futuro se quiere agregar otro consumidor (por ejemplo, un servicio de marketing que dispara emails), basta con suscribirlo al topic — sin tocar el código de los publicadores.
+Unificar todo en un solo topic acoplaría dominios sin necesidad y haría que cada consumer tuviera que filtrar mensajes por `event_type` — antipatrón. Topics separados dejan que cada consumer se suscriba solo a lo que le importa.
+
+### Por qué SNS y no Step Functions
+
+En la arquitectura original del TP3 (TALO — Trigger-and-Lambda-Orchestration) había topics SNS encadenando los pasos del flujo de pago, generando una orquestación distribuida. Esa responsabilidad la asumió **Step Functions** en TP4: el state machine invoca cada Lambda en orden y SNS quedó únicamente para los tres roles de arriba (analytics, notifications, ingest de operaciones).
+
+### Fan-out con SNS — caso de uso
+
+`notifications` recibe eventos de **CloudWatch Alarms** (`analytics-processor-errors` y 3 DLQ depth alarms) y de Lambdas que confirman acciones al usuario. Cualquier endpoint suscrito (email del equipo de ops, eventualmente Slack) recibe todo. Sumar un consumer nuevo (Telegram, PagerDuty) es una sola subscripción — no requiere tocar las Lambdas ni las alarms.
 
 ---
 
 ## SQS (Simple Queue Service)
 
-SQS es una cola de mensajes. El productor pone mensajes en la cola y el consumidor los lee cuando puede.
+SQS es una cola de mensajes. El productor pone mensajes en la cola y el consumidor los lee cuando puede. Patrón fundamental para desacoplar productores rápidos de consumidores que pueden ser lentos o fallar.
 
 ### Las queues del proyecto
 
-| Queue | Fuente | Propósito |
+Cuatro flujos asíncronos, cada uno con su DLQ — más una DLQ standalone para reservas fallidas. **9 recursos SQS en total** (`messaging.tf`).
+
+| Queue principal | Productor | Consumidor | DLQ |
+|---|---|---|---|
+| `analytics` | SNS `events` (chat-handler + payment-confirm) | `analytics-processor` → S3 data lake | `analytics-dlq` |
+| `human-handoff` | `chat-handler` cuando el LLM invoca tool `escalate_to_human` | `human-handoff-processor` → call center mock | `human-handoff-dlq` |
+| `proactive-notifications` | SNS `flight-events` (script ops cancela vuelo) | `proactive-notifications` → Query GSI2 + fan-out emails | `proactive-notifications-dlq` |
+| `boarding-pass-generation` | Step Functions `PostBookingActions` (vía `arn:aws:states:::sqs:sendMessage`) | `boarding-pass-async` → genera BP + sube a S3 | `boarding-pass-generation-dlq` |
+
+| DLQ standalone | Fuente | Propósito |
 |---|---|---|
-| `analytics-queue` | SNS `events` | Trigger de `analytics-processor` para escribir en S3 (data lake) |
-| `analytics-dlq` | `analytics-queue` (mensajes fallidos) | Retención de eventos de analytics que fallaron 3 veces |
-| `booking-failed-dlq` | Step Functions (estado BookingDLQ) | Retención de reservas fallidas para investigación (14 días) |
+| `booking-failed-dlq` | Step Functions estado `BookingDLQ` (SDK integration) | Retención de 14 días de reservas fallidas para investigación manual |
 
-El flujo de pago ya no usa colas SQS entre sus pasos — Step Functions orquesta directamente cada Lambda de pago y maneja retries y compensaciones.
+### Configuración común
 
-### Por qué SQS para analytics y no invocación directa
+Todas las queues principales usan:
+- `message_retention_seconds = 86400` (1 día — corto porque la DLQ retiene 14 días si la cola principal falla)
+- `visibility_timeout_seconds = 360` — 6× el timeout de Lambda (60s), recomendación oficial AWS para evitar duplicados durante retries
+- `receive_wait_time_seconds = 20` — **long polling**: el consumer espera hasta 20s a que llegue un mensaje en vez de pollear constantemente. Reduce requests vacíos y costo
+- `redrive_policy` con `maxReceiveCount = 3` — tras 3 fallas el mensaje pasa a la DLQ
 
-Para analytics, el volumen puede ser alto (un evento por cada mensaje de chat). SQS desacopla la escritura a S3:
+Todas las DLQs usan `message_retention_seconds = 1209600` (14 días) para dar tiempo a investigar.
+
+### Por qué SQS y no invocación directa
+
+Cada cola desacopla un punto donde **el productor no debe esperar al consumidor**:
 
 ```
 Sin SQS:
-chat-handler → analytics-processor Lambda → S3
-(si S3 está lento, chat-handler espera → el usuario espera)
+chat-handler → analytics-processor → S3
+(si S3 está lento, el usuario del chat espera)
 
 Con SQS:
 chat-handler → SNS → SQS → analytics-processor → S3
-(chat-handler termina inmediatamente; analytics se procesa después)
+(chat-handler termina inmediato; analytics corre después)
 ```
 
-Aunque S3 PutObject es rápido (~50ms), sacarlo del path sincrónico del chat mejora la latencia y permite reintentos automáticos con DLQ si algo falla.
+Mismo principio para human-handoff (chat no debe esperar al call center), boarding-pass (la reserva ya está confirmada, el BP puede llegar 5s después), proactive-notifications (cancelar un vuelo no debe esperar a que se envíen N emails).
 
-### Long polling
+### Por qué el flujo de pago NO usa SQS entre pasos
 
-`analytics-queue` está configurada con `receive_wait_time_seconds = 20` (long polling). En lugar de consultar la cola constantemente, Lambda espera hasta 20 segundos a que llegue un mensaje. Reduce el número de requests vacíos y el costo.
+Step Functions orquesta las Lambdas de pago directamente y maneja retries + compensaciones en la ASL. SQS entre pasos sumaría latencia sin aportar — el flujo es sincrónico desde la perspectiva del usuario (espera la confirmación del pago).
+
+La excepción es el paso post-pago `boarding-pass-generation`: ahí sí se publica a SQS porque la generación del BP es best-effort y no debe bloquear `BookingConfirmed`.
 
 ---
 
@@ -202,7 +234,14 @@ La compensación automática ante errores es la ventaja más importante: en TALO
 
 ### PostBookingActions: estado Parallel
 
-Cuando el pago es exitoso, `boarding-pass` y `notification` se ejecutan en paralelo (estado `Parallel` en ASL). Step Functions espera a que ambas terminen antes de avanzar a `BookingConfirmed`. Esto reduce el tiempo total de la acción post-pago sin código adicional.
+Cuando el pago es exitoso, el estado `Parallel` corre dos ramas en simultáneo:
+
+- **Rama A — `NotifyBookingConfirmed`** invoca la Lambda `notification` directamente (síncrono).
+- **Rama B — `EnqueueBoardingPass`** publica el state a la cola SQS `boarding-pass-generation` usando la integración SDK nativa de Step Functions (`arn:aws:states:::sqs:sendMessage`). La Lambda `boarding-pass-async` consume después y genera el BP en background.
+
+Step Functions espera a que ambas ramas terminen antes de avanzar a `BookingConfirmed`, pero un `Catch` envuelve todo el `Parallel` con `Next: BookingConfirmed` para que la reserva quede confirmada aún si una rama falla — el BP fallido se puede regenerar después desde la DLQ.
+
+Cambio respecto al TP3: antes el boarding pass se generaba dentro del path sincrónico del Saga (Lambda directa, no SQS). Si la generación fallaba, el Saga compensaba toda la reserva — un BP roto cancelaba el vuelo. En TP4 se sacó del path crítico: la reserva queda confirmada y el BP es eventualmente consistente.
 
 ### BookingDLQ: SDK integration
 
@@ -314,54 +353,116 @@ Recibe los logs de todas las Lambdas. Hay un log group por Lambda, creados con `
 | `/aws/lambda/jetsmart-prod-chat-handler` | chat-handler |
 | `/aws/lambda/jetsmart-prod-payment-reserve-flight` | payment-reserve-flight |
 | `/aws/lambda/jetsmart-prod-payment-reserve-booking` | payment-reserve-booking |
-| `/aws/lambda/jetsmart-prod-payment-collect-payment` | payment-collect-payment |
-| `/aws/lambda/jetsmart-prod-payment-confirm-booking` | payment-confirm-booking |
-| `/aws/lambda/jetsmart-prod-payment-refund-payment` | payment-refund-payment |
-| `/aws/lambda/jetsmart-prod-payment-cancel-booking` | payment-cancel-booking |
+| `/aws/lambda/jetsmart-prod-payment-collect` | payment-collect |
+| `/aws/lambda/jetsmart-prod-payment-confirm` | payment-confirm |
+| `/aws/lambda/jetsmart-prod-payment-refund` | payment-refund |
+| `/aws/lambda/jetsmart-prod-payment-cancel` | payment-cancel |
 | `/aws/lambda/jetsmart-prod-payment-release-flight` | payment-release-flight |
-| `/aws/lambda/jetsmart-prod-boarding-pass` | boarding-pass |
+| `/aws/lambda/jetsmart-prod-boarding-pass-async` | boarding-pass-async |
 | `/aws/lambda/jetsmart-prod-notification` | notification |
 | `/aws/lambda/jetsmart-prod-analytics-processor` | analytics-processor |
+| `/aws/lambda/jetsmart-prod-human-handoff-processor` | human-handoff-processor |
+| `/aws/lambda/jetsmart-prod-proactive-notifications` | proactive-notifications |
 | `/aws/lambda/jetsmart-prod-auth-callback` | auth-callback |
 | `/aws/lambda/jetsmart-prod-cognito-trigger` | cognito-trigger |
+| `/aws/lambda/jetsmart-prod-backup-dynamodb` | backup-dynamodb |
 | `/aws/states/jetsmart-prod-booking` | Step Functions state machine |
 
-Retención configurada en 30 días.
+Retención configurada en 30 días para todos los log groups.
+
+### Alarms
+
+Cuatro alarmas conectadas al SNS topic `notifications`:
+
+| Alarma | Métrica | Por qué importa |
+|---|---|---|
+| `analytics-processor-errors` | `AWS/Lambda Errors > 0` sobre `analytics-processor` | Si falla, no escribimos eventos al data lake |
+| `human-handoff-dlq-messages-visible` | `AWS/SQS ApproximateNumberOfMessagesVisible > 0` | Hay derivaciones a humano que no se procesaron |
+| `proactive-notifications-dlq-messages-visible` | idem | Hay notificaciones proactivas que no se enviaron |
+| `boarding-pass-generation-dlq-messages-visible` | idem | Hay boarding passes pendientes de generar |
 
 ---
 
 ## S3
 
-Tres buckets con propósitos distintos:
+Cuatro buckets con propósitos distintos:
 
 ### `jetsmart-prod-<account-id>-frontend`
 - Archivos estáticos del sitio web (HTML, CSS, JS)
 - Static website hosting habilitado
-- Público (accesible desde internet)
+- Público (accesible desde internet) con `aws_s3_bucket_policy.frontend` que permite `s3:GetObject` a `Principal: "*"`
 - Sin versionado (los archivos se sobreescriben en cada deploy)
+- Sin encriptación adicional (contenido público)
 
-### `jetsmart-prod-<account-id>-assets`
-- Boarding passes generados por Lambda
-- **System prompt de Claude** (`config/system_prompt.txt`) — guardado en S3 para evitar el límite de 4 KB de variables de entorno de Lambda. La Lambda lo descarga en el cold start.
-- Privado — acceso a boarding passes via pre-signed URLs temporales (15 min)
-- Lifecycle: boarding passes expiran en 90 días; backups migran a STANDARD_IA a los 30 días
-- Encriptación AES-256 habilitada por defecto
+### `jetsmart-prod-<account-id>-boarding-passes`
+- Boarding passes generados por la Lambda `boarding-pass-async` — un archivo de texto por PNR
+- Acceso desde el chatbot vía **presigned URLs temporales** (15 min de validez)
+- Privado con `public_access_block` activo en las cuatro dimensiones
+- **Versionado ON** — protege contra `DELETE` accidental. Los BP son write-once por PNR, no hay overwrites en operación normal
+- Lifecycle:
+  - Versión current: expira a los **90 días**
+  - Versiones non-current: expiran a los **30 días** (cleanup de huérfanas tras delete accidental)
+- Encriptación SSE-S3 (AES-256)
+
+> Renombrado desde `assets` en TP4. Cuando el system prompt se movió a Lambda Layer (ver sección "Lambda Layers"), el bucket pasó a contener únicamente boarding passes y se renombró para reflejarlo.
 
 ### `jetsmart-prod-<account-id>-analytics`
-- Eventos crudos del chatbot en formato JSON Lines particionado: `events/dt=YYYY-MM-DD/hh=HH/<uuid>.jsonl`
+- Eventos crudos del chatbot en formato JSON Lines particionado Hive-style: `events/dt=YYYY-MM-DD/hh=HH/<uuid>.jsonl`
 - Resultados de queries Athena en `athena-results/`
-- Privado con `public_access_block` activo en todas las dimensiones
+- Privado con `public_access_block` activo
 - Lifecycle: archivar particiones a Glacier después de 90 días; expirar resultados Athena a los 14 días
-- Encriptación AES-256
+- Encriptación SSE-S3
+
+### `jetsmart-prod-<account-id>-backups`
+- Exports diarios de la tabla DynamoDB `business` generados por la Lambda `backup-dynamodb`
+- Estructura: `dynamodb/business/YYYY-MM-DD/AWSDynamoDB/<export-id>/data/*.json.gz`
+- Privado con `public_access_block` activo
+- **Versionado ON** — defensa contra `DELETE`/`PUT` accidental sobre exports
+- Lifecycle progresivo (alineado a retención AFIP RG 1415, 10 años):
+
+| Edad | Storage class |
+|---|---|
+| 0–29 días | `STANDARD` |
+| 30–89 días | `STANDARD_IA` (acceso esporádico, retrieval inmediato) |
+| 90–364 días | `GLACIER` (retrieval 3–5 h) |
+| 365–3649 días | `DEEP_ARCHIVE` (retrieval 12 h, costo mínimo) |
+| 3650 días | expira |
+
+- Lifecycle de versiones non-current: transición a `GLACIER` a los 30 días, expiran a los 90
+- Cleanup automático de delete markers huérfanos con `expired_object_delete_marker = true`
+- Bucket policy permite a `dynamodb.amazonaws.com` hacer `PutObject` (export funciona)
+- Encriptación SSE-S3
 
 ## Lambda Layers
 
-Un único layer compilado para Python 3.12 en Linux x86_64:
+**Dos layers** compilados para Python 3.12 en Linux x86_64 (`layers.tf`):
 
-| Layer | Contenido | Usada por |
-|---|---|---|
-| `jetsmart-prod-anthropic` | SDK `anthropic` + dependencias HTTP | `chat-handler` |
+| Layer | Contenido | Montado en | Usada por |
+|---|---|---|---|
+| `jetsmart-prod-anthropic` | SDK `anthropic` + dependencias HTTP | `/opt/python/` | `chat-handler` |
+| `jetsmart-prod-system-prompt` | El system prompt del chatbot (texto) | `/opt/system_prompt.txt` | `chat-handler` |
 
-> El layer `jetsmart-prod-psycopg2` del TP3 (driver PostgreSQL) se eliminó junto con RDS. La validación JWT manual con `python-jose` también desapareció — la hace ahora el Cognito Authorizer.
+### Por qué el system prompt en layer y no en S3 (cambio respecto al TP3)
 
-El layer se construye localmente con `scripts/build-layers.sh` antes de correr `terraform apply`. El script usa `--platform manylinux2014_x86_64` para garantizar compatibilidad con el runtime de Lambda.
+En el TP3 el system prompt vivía en S3 (`config/system_prompt.txt`) y la Lambda lo descargaba en el cold start con `s3:GetObject`. En TP4 se movió a Lambda Layer. Justificación:
+
+- **Cero penalty de cold start** — leer un filesystem local de Lambda es ~1ms; un `GetObject` sobre la red regional son ~30-50ms en el cold start.
+- **Versionado inmutable nativo** — cada `PublishLayerVersion` devuelve un ARN nuevo. Rollback es un click cambiando el ARN atachado a la Lambda. En S3 había que copiar archivos a una key alternativa.
+- **Sin permisos IAM extra** — eliminamos el `s3:GetObject` de la policy del LabRole para esta key específica. Superficie de permisos más chica.
+
+### Por qué dos layers separados y no uno solo
+
+Distintos ciclos de vida:
+
+- El SDK de `anthropic` cambia cuando Anthropic publica una versión nueva (mensual aprox).
+- El system prompt cambia cuando el equipo de Producto tunea el comportamiento del bot (a veces varias veces por semana).
+
+Mezclarlos contaminaría el versionado: cada ajuste de una línea del prompt obligaría a republicar el SDK también. Separarlos permite versionarlos independientemente y rotar el prompt sin tocar el SDK.
+
+### Build pipeline
+
+Ambos layers se construyen con `scripts/build-layers.sh` antes de `terraform apply`:
+- `anthropic` se compila con `pip --platform manylinux2014_x86_64 --target` para garantizar compatibilidad con el runtime de Lambda
+- `system-prompt` se zipea desde `config/system_prompt.txt`
+
+> El layer `jetsmart-prod-psycopg2` del TP3 (driver PostgreSQL) se eliminó junto con RDS. La validación JWT manual con `python-jose` también desapareció — ahora la hace el Cognito Authorizer en el perímetro del API Gateway.
