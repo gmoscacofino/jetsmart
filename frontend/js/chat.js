@@ -161,6 +161,15 @@ const Chat = (() => {
       if (data.options && data.options.length > 0) {
         renderOptions(wrapper, data.options);
       }
+      // Hold countdown — el backend manda metadata.hold cuando el user
+      // acaba de holdear un asiento, o metadata.hold_cleared al confirmar/liberar
+      if (data.metadata) {
+        if (data.metadata.hold && data.metadata.hold.expires_at_epoch) {
+          HoldBanner.start(data.metadata.hold);
+        } else if (data.metadata.hold_cleared) {
+          HoldBanner.hide();
+        }
+      }
     } catch (err) {
       setTyping(false);
       const msg = _errorMessage(err);
@@ -247,4 +256,110 @@ const Chat = (() => {
       sendMessage(text);
     },
   };
+})();
+
+/**
+ * HoldBanner — countdown visual del soft-hold de asiento.
+ * Maneja el banner sticky con timer regresivo.
+ * Estado vive en memoria (no localStorage) para que se resetee al refrescar
+ * la página — la fuente de verdad es el backend (se restablece con check_hold_status).
+ */
+const HoldBanner = (() => {
+  let _intervalId = null;
+  let _expiresAtMs = 0;
+
+  function _$(id) { return document.getElementById(id); }
+  function _pad(n) { return n < 10 ? '0' + n : String(n); }
+
+  function _tick() {
+    const now = Date.now();
+    const remainingMs = _expiresAtMs - now;
+    const banner = _$('hold-banner');
+    const timer = _$('hold-banner-timer');
+    if (!banner || !timer) return;
+
+    if (remainingMs <= 0) {
+      timer.textContent = '0:00';
+      banner.classList.add('expiring');
+      _stopInterval();
+      // Después de un segundo, mostrar mensaje informativo dentro del chat
+      setTimeout(() => {
+        const msgContainer = _$('messages-container');
+        if (msgContainer) {
+          const div = document.createElement('div');
+          div.className = 'message message-assistant';
+
+          const avatar = document.createElement('div');
+          avatar.className = 'message-avatar';
+          const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+          svg.setAttribute('width', '16');
+          svg.setAttribute('height', '16');
+          const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+          use.setAttribute('href', '#icon-jet');
+          svg.appendChild(use);
+          avatar.appendChild(svg);
+
+          const bubble = document.createElement('div');
+          bubble.className = 'message-bubble';
+          const p = document.createElement('p');
+          p.textContent = '⏱️ Tu hold de asiento venció. Decile al asistente "verificá mi asiento" para ver si sigue libre.';
+          bubble.appendChild(p);
+
+          const time = document.createElement('span');
+          time.className = 'message-time';
+          time.textContent = 'Ahora';
+
+          div.append(avatar, bubble, time);
+          msgContainer.appendChild(div);
+          msgContainer.scrollTop = msgContainer.scrollHeight;
+        }
+        hide();
+      }, 1200);
+      return;
+    }
+
+    const totalSec = Math.floor(remainingMs / 1000);
+    const mins = Math.floor(totalSec / 60);
+    const secs = totalSec % 60;
+    timer.textContent = `${mins}:${_pad(secs)}`;
+
+    // Last 60 seconds → pulse rojo
+    if (remainingMs <= 60000) {
+      banner.classList.add('expiring');
+    } else {
+      banner.classList.remove('expiring');
+    }
+  }
+
+  function _stopInterval() {
+    if (_intervalId) { clearInterval(_intervalId); _intervalId = null; }
+  }
+
+  function start(holdData) {
+    if (!holdData || !holdData.expires_at_epoch) return;
+    _expiresAtMs = holdData.expires_at_epoch * 1000;
+    const banner = _$('hold-banner');
+    if (!banner) return;
+    _$('hold-banner-seat').textContent = holdData.seat_id || '--';
+    const flight = holdData.vuelo_numero
+      ? `${holdData.vuelo_numero}${holdData.fecha ? ' · ' + holdData.fecha : ''}`
+      : '--';
+    _$('hold-banner-flight').textContent = flight;
+    banner.style.display = 'flex';
+    banner.classList.remove('expiring');
+    _stopInterval();
+    _tick();
+    _intervalId = setInterval(_tick, 1000);
+  }
+
+  function hide() {
+    _stopInterval();
+    const banner = _$('hold-banner');
+    if (banner) {
+      banner.style.display = 'none';
+      banner.classList.remove('expiring');
+    }
+  }
+
+  return { start, hide };
 })();

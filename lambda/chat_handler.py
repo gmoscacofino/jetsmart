@@ -3,6 +3,7 @@ from datetime import datetime, timezone, date, timedelta
 from decimal import Decimal
 
 import boto3
+from botocore.exceptions import ClientError
 import anthropic
 
 from pricing import validate_inputs, PricingError, EXTRAS_FIJOS
@@ -34,6 +35,7 @@ MAX_HISTORY     = 40
 MSG_TTL_SECONDS = 7 * 24 * 3600
 HANDOFF_TTL_SECONDS = 30 * 24 * 3600
 MAX_TOOL_ROUNDS = 5
+HOLD_TTL_SECONDS = 600  # 10 minutos — soft-hold de asiento mientras el user completa la reserva
 
 # Inicialización eager: ocurre en el cold start, no en el primer request.
 def _init_anthropic() -> anthropic.Anthropic:
@@ -255,6 +257,67 @@ TOOLS = [
         },
     },
     {
+        "name": "hold_seat",
+        "description": (
+            "Reserva temporal (soft-hold) de un asiento por 10 minutos. "
+            "Llamar en PASO 3 apenas el usuario elige un asiento específico. "
+            "Si el user tenía otro hold previo en el MISMO vuelo, se libera automáticamente. "
+            "Devuelve expires_at_epoch para el countdown del frontend. "
+            "Si retorna ok=False, ofrecer otros asientos."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "origen":       {"type": "string"},
+                "destino":      {"type": "string"},
+                "fecha":        {"type": "string"},
+                "vuelo_numero": {"type": "string"},
+                "seat_id":      {"type": "string"},
+            },
+            "required": ["origen", "destino", "fecha", "vuelo_numero", "seat_id"],
+        },
+    },
+    {
+        "name": "check_hold_status",
+        "description": (
+            "Verifica el estado del hold actual del usuario sobre un asiento. "
+            "OBLIGATORIO llamar al INICIO de cada turn entre PASO 3 (hold) y PASO 6c (confirmar). "
+            "Devuelve status:'still_held' si el hold sigue vigente, "
+            "'expired_seat_free' si expiró pero el asiento sigue libre (ofrecer retomar), "
+            "'expired_seat_taken' si otro lo tomó (avisar y mostrar alternativas), "
+            "'no_hold' si nunca hubo hold en este seat."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "origen":       {"type": "string"},
+                "destino":      {"type": "string"},
+                "fecha":        {"type": "string"},
+                "vuelo_numero": {"type": "string"},
+                "seat_id":      {"type": "string"},
+            },
+            "required": ["origen", "destino", "fecha", "vuelo_numero", "seat_id"],
+        },
+    },
+    {
+        "name": "release_hold",
+        "description": (
+            "Libera el hold del usuario sobre un asiento (cuando cambia de opinión). "
+            "Idempotente — si no había hold, devuelve ok=True igual."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "origen":       {"type": "string"},
+                "destino":      {"type": "string"},
+                "fecha":        {"type": "string"},
+                "vuelo_numero": {"type": "string"},
+                "seat_id":      {"type": "string"},
+            },
+            "required": ["origen", "destino", "fecha", "vuelo_numero", "seat_id"],
+        },
+    },
+    {
         "name": "get_reservation",
         "description": "Consulta el estado de una reserva por PNR (record locator de 6 caracteres).",
         "input_schema": {
@@ -472,6 +535,8 @@ def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "", u
         f = inputs["fecha"]
         v = inputs["vuelo_numero"]
         log.info("list_available_seats: %s→%s %s %s", o, d, f, v)
+        # FilterExpression server-side: sólo seats sin reserved_by.
+        # Los holds los filtramos en Python para distinguir "hold propio" vs "hold ajeno".
         resp = biz_table.query(
             KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
             FilterExpression="attribute_not_exists(reserved_by)",
@@ -480,17 +545,182 @@ def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "", u
                 ":prefix": f"DATE#{f}#FLIGHT#{v}#SEAT#",
             },
         )
+        now_epoch = int(time.time())
+        user_key = f"USER#{user_id}"
         by_cat = {"estandar": [], "salida_rapida": [], "salida_emergencia": [], "primera_fila": []}
+        my_hold = None
         for s in resp.get("Items", []):
+            held_by = s.get("held_by")
+            hold_expires = int(s.get("hold_expires_at") or 0)
+            seat_id = s.get("seat_id")
             cat = s.get("seat_type", "estandar")
-            by_cat.setdefault(cat, []).append(s.get("seat_id"))
+            # Hold vigente de OTRO user → no disponible
+            if held_by and held_by != user_key and hold_expires > now_epoch:
+                continue
+            # Hold vigente del MISMO user → marcarlo
+            if held_by == user_key and hold_expires > now_epoch:
+                my_hold = {"seat_id": seat_id, "expires_at_epoch": hold_expires}
+                continue
+            by_cat.setdefault(cat, []).append(seat_id)
         return json.dumps({
             "vuelo": v, "fecha": f,
             "categorias": {
                 cat: {"disponibles": len(lst), "ejemplos": sorted(lst)[:6]}
                 for cat, lst in by_cat.items()
             },
+            "tu_hold_actual": my_hold,
         })
+
+    if name == "hold_seat":
+        o = inputs["origen"].upper()
+        d = inputs["destino"].upper()
+        f = inputs["fecha"]
+        v = inputs["vuelo_numero"]
+        seat_id = inputs["seat_id"].upper()
+        log.info("hold_seat: %s→%s %s %s seat=%s user=%s", o, d, f, v, seat_id, user_id)
+
+        now_epoch = int(time.time())
+        expires_at = now_epoch + HOLD_TTL_SECONDS
+        user_key = f"USER#{user_id}"
+        flight_pk = f"FLIGHT#{o}#{d}"
+        new_seat_sk = f"DATE#{f}#FLIGHT#{v}#SEAT#{seat_id}"
+
+        # Paso 1 — intentar el hold del seat nuevo (atomic).
+        try:
+            biz_table.update_item(
+                Key={"PK": flight_pk, "SK": new_seat_sk},
+                UpdateExpression="SET held_by = :user, hold_expires_at = :exp",
+                ConditionExpression=(
+                    "attribute_exists(PK) AND attribute_not_exists(reserved_by) AND "
+                    "(attribute_not_exists(held_by) OR held_by = :user "
+                    "OR hold_expires_at <= :now)"
+                ),
+                ExpressionAttributeValues={
+                    ":user": user_key,
+                    ":exp":  expires_at,
+                    ":now":  now_epoch,
+                },
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                # Distinguir: no existe vs ya reservado vs holdeado por otro
+                check = biz_table.get_item(Key={"PK": flight_pk, "SK": new_seat_sk}).get("Item")
+                if not check:
+                    return json.dumps({"ok": False, "motivo": "seat_no_existe",
+                                       "mensaje": f"El asiento {seat_id} no existe en este vuelo."})
+                if check.get("reserved_by"):
+                    return json.dumps({"ok": False, "motivo": "seat_reservado",
+                                       "mensaje": f"El asiento {seat_id} ya está confirmado por otro pasajero."})
+                return json.dumps({"ok": False, "motivo": "hold_ajeno",
+                                   "mensaje": f"Otro pasajero está reservando {seat_id} ahora. Elegí otro."})
+            raise
+
+        # Paso 2 — liberar holds previos del MISMO user en el mismo vuelo
+        # (best-effort, fuera de transacción atómica con el hold nuevo).
+        prev_resp = biz_table.query(
+            KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
+            FilterExpression="held_by = :user AND attribute_not_exists(reserved_by)",
+            ExpressionAttributeValues={
+                ":pk":     flight_pk,
+                ":prefix": f"DATE#{f}#FLIGHT#{v}#SEAT#",
+                ":user":   user_key,
+            },
+        )
+        for prev in prev_resp.get("Items", []):
+            if prev["SK"] == new_seat_sk:
+                continue
+            try:
+                biz_table.update_item(
+                    Key={"PK": prev["PK"], "SK": prev["SK"]},
+                    UpdateExpression="REMOVE held_by, hold_expires_at",
+                    ConditionExpression="held_by = :user",
+                    ExpressionAttributeValues={":user": user_key},
+                )
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                    log.warning("No pude liberar hold previo %s: %s", prev["SK"], e)
+
+        return json.dumps({
+            "ok": True,
+            "seat_id": seat_id,
+            "expires_at_epoch": expires_at,
+            "ttl_seconds": HOLD_TTL_SECONDS,
+            "vuelo_numero": v,
+            "fecha": f,
+            "origen": o,
+            "destino": d,
+            "mensaje": f"Reservé temporalmente el asiento {seat_id}. Tenés {HOLD_TTL_SECONDS // 60} minutos para confirmar la compra.",
+        })
+
+    if name == "check_hold_status":
+        o = inputs["origen"].upper()
+        d = inputs["destino"].upper()
+        f = inputs["fecha"]
+        v = inputs["vuelo_numero"]
+        seat_id = inputs["seat_id"].upper()
+        log.info("check_hold_status: seat=%s user=%s", seat_id, user_id)
+
+        now_epoch = int(time.time())
+        user_key = f"USER#{user_id}"
+        flight_pk = f"FLIGHT#{o}#{d}"
+        seat_sk = f"DATE#{f}#FLIGHT#{v}#SEAT#{seat_id}"
+
+        item = biz_table.get_item(Key={"PK": flight_pk, "SK": seat_sk}).get("Item")
+        if not item:
+            return json.dumps({"status": "no_hold", "seat_id": seat_id,
+                               "mensaje": f"Asiento {seat_id} no existe."})
+
+        if item.get("reserved_by"):
+            return json.dumps({
+                "status": "expired_seat_taken", "seat_id": seat_id,
+                "mensaje": f"El asiento {seat_id} ya fue confirmado por otro pasajero.",
+            })
+
+        held_by = item.get("held_by")
+        hold_expires = int(item.get("hold_expires_at") or 0)
+
+        if held_by == user_key and hold_expires > now_epoch:
+            return json.dumps({
+                "status": "still_held", "seat_id": seat_id,
+                "expires_at_epoch": hold_expires,
+                "seconds_remaining": hold_expires - now_epoch,
+                "vuelo_numero": v, "fecha": f,
+            })
+
+        if held_by and held_by != user_key and hold_expires > now_epoch:
+            return json.dumps({
+                "status": "expired_seat_taken", "seat_id": seat_id,
+                "mensaje": f"Otro pasajero está reservando {seat_id} ahora.",
+            })
+
+        # held_by ausente o expirado, sin reserved_by → seat libre
+        return json.dumps({
+            "status": "expired_seat_free", "seat_id": seat_id,
+            "vuelo_numero": v, "fecha": f,
+            "mensaje": f"El hold sobre {seat_id} venció pero el asiento sigue libre. Lo puedo retomar si querés.",
+        })
+
+    if name == "release_hold":
+        o = inputs["origen"].upper()
+        d = inputs["destino"].upper()
+        f = inputs["fecha"]
+        v = inputs["vuelo_numero"]
+        seat_id = inputs["seat_id"].upper()
+        log.info("release_hold: seat=%s user=%s", seat_id, user_id)
+        flight_pk = f"FLIGHT#{o}#{d}"
+        seat_sk = f"DATE#{f}#FLIGHT#{v}#SEAT#{seat_id}"
+        user_key = f"USER#{user_id}"
+        try:
+            biz_table.update_item(
+                Key={"PK": flight_pk, "SK": seat_sk},
+                UpdateExpression="REMOVE held_by, hold_expires_at",
+                ConditionExpression="held_by = :user",
+                ExpressionAttributeValues={":user": user_key},
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                raise
+        return json.dumps({"ok": True, "seat_id": seat_id, "released": True})
 
     if name == "get_reservation":
         pnr = inputs["reservation_id"].upper()
@@ -848,6 +1078,9 @@ def _handle_chat(event: dict, user: dict) -> dict:
 
     messages = history + [{"role": "user", "content": message}]
 
+    # Metadata acumulada para el frontend (countdown del hold).
+    response_metadata: dict = {}
+
     try:
         for _ in range(MAX_TOOL_ROUNDS):
             resp = _anthropic_client.messages.create(
@@ -879,6 +1112,8 @@ def _handle_chat(event: dict, user: dict) -> dict:
                     "tool_use_id": tc.id,
                     "content":     result,
                 })
+                # Extraer metadata de hold para el frontend
+                _update_hold_metadata(response_metadata, tc.name, result)
 
             _save_message(session_id, user_id, "assistant", content_list)
             _save_message(session_id, user_id, "user", tool_results)
@@ -906,7 +1141,50 @@ def _handle_chat(event: dict, user: dict) -> dict:
     _save_message(session_id, user_id, "assistant", assistant_text)
     _emit_event("chat_message", {"session_id": session_id, "message_length": len(message)}, user_id)
 
-    return _response(200, {"response": assistant_text, "session_id": session_id, "options": options})
+    body_out = {"response": assistant_text, "session_id": session_id, "options": options}
+    if response_metadata:
+        body_out["metadata"] = response_metadata
+    return _response(200, body_out)
+
+
+def _update_hold_metadata(metadata: dict, tool_name: str, raw_result: str) -> None:
+    """
+    Mira el JSON de las tools que afectan el hold y actualiza el dict metadata
+    que se devolverá al frontend para que arme/cierre el countdown.
+    """
+    try:
+        r = json.loads(raw_result) if isinstance(raw_result, str) else raw_result
+    except (json.JSONDecodeError, TypeError):
+        return
+    if not isinstance(r, dict):
+        return
+
+    if tool_name == "hold_seat" and r.get("ok"):
+        metadata["hold"] = {
+            "seat_id":          r["seat_id"],
+            "expires_at_epoch": r["expires_at_epoch"],
+            "vuelo_numero":     r.get("vuelo_numero"),
+            "fecha":            r.get("fecha"),
+        }
+        metadata.pop("hold_cleared", None)
+    elif tool_name == "check_hold_status":
+        if r.get("status") == "still_held":
+            metadata["hold"] = {
+                "seat_id":          r["seat_id"],
+                "expires_at_epoch": r["expires_at_epoch"],
+                "vuelo_numero":     r.get("vuelo_numero"),
+                "fecha":            r.get("fecha"),
+            }
+            metadata.pop("hold_cleared", None)
+        else:
+            metadata["hold_cleared"] = True
+            metadata.pop("hold", None)
+    elif tool_name == "release_hold" and r.get("ok"):
+        metadata["hold_cleared"] = True
+        metadata.pop("hold", None)
+    elif tool_name == "create_reservation" and r.get("procesando"):
+        metadata["hold_cleared"] = True
+        metadata.pop("hold", None)
 
 
 def _handle_reservations(user: dict) -> dict:

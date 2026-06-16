@@ -20,7 +20,7 @@ en business table:
   PASSENGER#{dni}/#PROFILE  — CRM canónico (upsert)
   PASSENGER#{dni}/PNR#{pnr} — back-ref histórico
 """
-import os, json, hashlib, secrets, logging
+import os, json, time, hashlib, secrets, logging
 from decimal import Decimal
 from datetime import datetime, timezone
 
@@ -90,12 +90,20 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _claim_random_seat(origen: str, destino: str, master_sk: str, pnr: str, max_attempts: int = 3) -> tuple[str, str]:
+def _claim_random_seat(origen: str, destino: str, master_sk: str, pnr: str, user_id: str = "", max_attempts: int = 3) -> tuple[str, str]:
     """
     Reserva un asiento estándar aleatorio del vuelo. Devuelve (seat_id, full_sk).
     Atomic via ConditionExpression — si hay race, reintenta hasta max_attempts.
+
+    Filtra holds vigentes de otros users (no entran al pool de candidatos).
+    Si el seat tiene hold propio (vigente o expirado), igual se puede tomar.
     """
     import random as _r
+    now_epoch = int(time.time())
+    user_key = f"USER#{user_id}" if user_id else None
+
+    # Query trae todos los SEAT# del vuelo; filtramos holds ajenos vigentes en Python
+    # (la FilterExpression no permite OR sobre attribute_not_exists con < timestamp).
     resp = table.query(
         KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
         FilterExpression="attribute_not_exists(reserved_by) AND seat_type = :t",
@@ -105,7 +113,15 @@ def _claim_random_seat(origen: str, destino: str, master_sk: str, pnr: str, max_
             ":t":      "estandar",
         },
     )
-    candidates = resp.get("Items", [])
+    candidates = []
+    for c in resp.get("Items", []):
+        held_by = c.get("held_by")
+        hold_expires = int(c.get("hold_expires_at") or 0)
+        # Hold vigente de otro user → no es candidato
+        if held_by and held_by != user_key and hold_expires > now_epoch:
+            continue
+        candidates.append(c)
+
     if not candidates:
         raise ValueError("Sin asientos disponibles en el vuelo")
 
@@ -114,11 +130,20 @@ def _claim_random_seat(origen: str, destino: str, master_sk: str, pnr: str, max_
         try:
             table.update_item(
                 Key={"PK": choice["PK"], "SK": choice["SK"]},
-                UpdateExpression="SET reserved_by = :pnr, reserved_at = :now",
-                ConditionExpression="attribute_not_exists(reserved_by)",
+                UpdateExpression=(
+                    "SET reserved_by = :pnr, reserved_at = :now "
+                    "REMOVE held_by, hold_expires_at"
+                ),
+                ConditionExpression=(
+                    "attribute_not_exists(reserved_by) AND "
+                    "(attribute_not_exists(held_by) OR held_by = :user "
+                    "OR hold_expires_at <= :now_epoch)"
+                ),
                 ExpressionAttributeValues={
-                    ":pnr": f"PNR#{pnr}",
-                    ":now": _now_iso(),
+                    ":pnr":       f"PNR#{pnr}",
+                    ":now":       _now_iso(),
+                    ":user":      user_key or "USER#__none__",
+                    ":now_epoch": now_epoch,
                 },
             )
             return choice["seat_id"], choice["SK"]
@@ -147,12 +172,15 @@ def reserve_flight_handler(event, context):
              event.get("payment_id"), event.get("pnr"))
 
     pnr = event["pnr"]
+    user_id = event.get("user_id", "")
+    user_key = f"USER#{user_id}" if user_id else "USER#__none__"
     reservation = event["reservation"]
     origen      = reservation["origen"]
     destino     = reservation["destino"]
     fecha       = reservation["fecha"]
     vuelo_pref  = reservation.get("vuelo_numero", "")
     seat_pref   = (reservation.get("seat_id") or "").upper()
+    now_epoch   = int(time.time())
 
     # 1. Master row del vuelo — precio y disponibilidad general
     flight_pk = f"FLIGHT#{origen}#{destino}"
@@ -162,30 +190,44 @@ def reserve_flight_handler(event, context):
     if not master:
         raise ValueError(f"Vuelo {vuelo_pref} {origen}-{destino} {fecha} no existe")
 
-    # 2. Reservar asiento — específico o aleatorio
+    # 2. Reservar asiento — específico o aleatorio.
+    # Condición compuesta para consumir hold propio (vigente o expirado) y
+    # rechazar hold ajeno vigente. Si el seat tiene reserved_by, falla siempre.
     if seat_pref:
         seat_sk = f"{master_sk}#SEAT#{seat_pref}"
         try:
             table.update_item(
                 Key={"PK": flight_pk, "SK": seat_sk},
-                UpdateExpression="SET reserved_by = :pnr, reserved_at = :now",
-                ConditionExpression="attribute_exists(PK) AND attribute_not_exists(reserved_by)",
+                UpdateExpression=(
+                    "SET reserved_by = :pnr, reserved_at = :now "
+                    "REMOVE held_by, hold_expires_at"
+                ),
+                ConditionExpression=(
+                    "attribute_exists(PK) AND attribute_not_exists(reserved_by) AND "
+                    "(attribute_not_exists(held_by) OR held_by = :user "
+                    "OR hold_expires_at <= :now_epoch)"
+                ),
                 ExpressionAttributeValues={
-                    ":pnr": f"PNR#{pnr}",
-                    ":now": _now_iso(),
+                    ":pnr":       f"PNR#{pnr}",
+                    ":now":       _now_iso(),
+                    ":user":      user_key,
+                    ":now_epoch": now_epoch,
                 },
             )
             seat_id = seat_pref
         except ClientError as e:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                # Doble caso: no existe el seat, o ya está tomado.
+                # Distinguir el motivo del fallo
                 check = table.get_item(Key={"PK": flight_pk, "SK": seat_sk}).get("Item")
                 if not check:
                     raise ValueError(f"Asiento {seat_pref} no existe en el vuelo")
-                raise ValueError(f"Asiento {seat_pref} ya está reservado — elegí otro")
+                if check.get("reserved_by"):
+                    raise ValueError(f"Asiento {seat_pref} ya está reservado — elegí otro")
+                # held_by de otro user vigente
+                raise ValueError(f"Asiento {seat_pref} está siendo reservado por otro pasajero — elegí otro")
             raise
     else:
-        seat_id, seat_sk = _claim_random_seat(origen, destino, master_sk, pnr)
+        seat_id, seat_sk = _claim_random_seat(origen, destino, master_sk, pnr, user_id=user_id)
 
     return {
         **event,

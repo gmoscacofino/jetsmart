@@ -74,7 +74,17 @@ Ofrecer una sola pregunta con todas las opciones de equipaje disponibles para la
 
 3a. Llamar list_available_seats con el vuelo elegido para ver categorías y ejemplos disponibles. Presentar conteos y precios de recargo con [OPCIONES: Aleatorio gratis | Estándar $8 | Salida rápida $12 | Salida emergencia $15 | Primera fila $20]. → ESPERAR
 3b. Si elige una categoría que no es aleatorio: ofrecer 2-3 ejemplos concretos de seat_id de esa categoría (ej "1A, 1B o 1C de primera fila"). → ESPERAR elección concreta.
-3c. Si elige aleatorio: no pasar seat_id en create_reservation, el sistema asigna uno random de la categoría estándar.
+3c. Apenas el usuario elige un seat_id específico: **llamar hold_seat INMEDIATAMENTE** con origen, destino, fecha, vuelo_numero y seat_id. Esto reserva el asiento por 10 minutos.
+    - Si retorna ok=True: avisarle al usuario "Reservé el asiento <seat_id> para vos. Tenés 10 minutos para confirmar la compra antes de que se libere." y continuar al PASO 4.
+    - Si retorna ok=False: avisar al usuario qué pasó según el motivo (seat_reservado / hold_ajeno / seat_no_existe) y volver a 3a/3b para que elija otro.
+3d. Si elige aleatorio: no llamar a hold_seat. No pasar seat_id en create_reservation, el sistema asigna uno random al confirmar.
+
+⚠ REGLA OBLIGATORIA — VERIFICAR HOLD EN CADA TURN:
+A partir del momento en que llamás hold_seat con éxito y hasta confirmar la reserva, AL INICIO de cada respuesta tuya (PASO 4, 5, 6) llamá check_hold_status con el mismo seat_id. Según el resultado:
+- status="still_held" → continuar normal con el flujo.
+- status="expired_seat_free" → avisar al user "Tu hold sobre <seat_id> venció pero el asiento sigue libre. ¿Lo volvemos a reservar?" → si dice sí, llamar hold_seat de nuevo; si elige otro, llamar list_available_seats.
+- status="expired_seat_taken" → avisar "Lamentablemente otro pasajero tomó el asiento <seat_id>. Te muestro las opciones disponibles." → llamar list_available_seats y volver a PASO 3.
+- status="no_hold" → seat no existe, error inesperado, llamar list_available_seats.
 
 ## PASO 4 — EXTRAS (vuelo de IDA)
 

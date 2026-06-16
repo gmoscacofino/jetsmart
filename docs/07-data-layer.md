@@ -188,16 +188,20 @@ puerta                : "12"
 
 **Inventario de asientos** (`FLIGHT#{origen}#{destino}` / `DATE#{fecha}#FLIGHT#{vuelo}#SEAT#{row}{letter}`)
 ```
-seat_id     : "12A"
-row         : entero 1..20
-letter      : "A" | "B" | "C" | "D" | "E" | "F"
-seat_type   : "estandar" | "salida_rapida" | "salida_emergencia" | "primera_fila"
-vuelo_numero: "JA123"
-fecha       : "YYYY-MM-DD"
-reserved_by : (ausente si libre) | "PNR#{pnr}" (si reservado)
-reserved_at : ISO-8601 (sólo si reservado)
+seat_id         : "12A"
+row             : entero 1..20
+letter          : "A" | "B" | "C" | "D" | "E" | "F"
+seat_type       : "estandar" | "salida_rapida" | "salida_emergencia" | "primera_fila"
+vuelo_numero    : "JA123"
+fecha           : "YYYY-MM-DD"
+reserved_by     : (ausente si libre) | "PNR#{pnr}" (si reservado)
+reserved_at     : ISO-8601 (sólo si reservado)
+held_by         : (ausente si no holdeado) | "USER#{sub}" (soft-hold)
+hold_expires_at : epoch UTC seconds (sólo si holdeado)
 ```
 > 120 ítems SEAT# por vuelo (20 filas × 6 letras A-F). Reserva atómica vía `UpdateItem` con `ConditionExpression: attribute_not_exists(reserved_by)`. Liberación con `ConditionExpression: reserved_by = :owned_pnr` para evitar liberar seats de otros PNRs. Categorías: fila 1 = primera_fila, filas 6-10 = salida_rapida, filas 14-15 = salida_emergencia, resto = estandar.
+>
+> **Soft-hold (TP4):** atributos `held_by` y `hold_expires_at` opcionales para el patrón de reserva temporal (10 min) mientras el usuario completa el flujo de compra. Permite que dos users no peleen por el mismo asiento entre PASO 3 (elección) y PASO 6 (confirmación). Ver justificación #26.
 
 > En TP3 había dos entidades adicionales (`ANALYTICS#DAILY` y `ANALYTICS#ROUTES`) que el dashboard admin leía. En TP4 fueron eliminadas — el equipo de business analytics consume los mismos datos vía Athena sobre S3, no via DynamoDB.
 

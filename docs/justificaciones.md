@@ -378,6 +378,42 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 ---
 
+## 26. Soft-hold de asiento con TTL de 10 minutos
+
+**Decisión:** cuando el usuario elige un asiento específico en el chat, Claude llama `hold_seat` que lockea el ítem `SEAT#<row><letter>` con `held_by = "USER#<sub>"` y `hold_expires_at = now + 600`. El asiento queda bloqueado para otros users hasta que (a) el user confirme la reserva (el hold se convierte en `reserved_by`), (b) el user libere o cambie a otro seat (auto-release), o (c) expire el TTL.
+
+**Alternativas consideradas:**
+- (a) Optimistic — refrescar lista al fallar → simple pero el race window queda abierto los minutos que tarda el user en PASOS 4-5-6 (mascota, asiento, datos). Vio en pruebas con dos tabs simultáneos: pisada constante.
+- (b) Re-validar con `check_seat_available` antes de confirmar → reduce race a milisegundos pero igual existe ventana entre check y reserve_flight.
+- (c) Auto-asignar uno cercano cuando el preferido falla → cómodo, pero el user pierde control sobre la elección.
+- (d) **Soft-hold con TTL (elegida)** → patrón estándar de la industria (Expedia, Booking.com, Decolar). Garantiza que el seat queda reservado durante el flujo de checkout sin requerir WebSocket en tiempo real.
+- (e) WebSocket + DDB Streams para updates live → UX premium pero requiere API GW WebSocket + Lambda broadcaster + connection registry. Días de trabajo. Fuera de scope.
+
+**Implementación atómica:**
+- `hold_seat` hace `UpdateItem` con ConditionExpression compuesta que acepta seats libres O con `held_by` propio (renueva) O con `hold_expires_at` ya vencido. Rechaza seats con `reserved_by` o `held_by` ajeno vigente.
+- En el mismo handler, después del lock, se liberan holds previos del mismo user en el MISMO vuelo (best-effort, no atomic). Si el race genera un hold huérfano, sólo bloquea 10 min hasta TTL.
+- `reserve_flight_handler` (Saga) usa la misma ConditionExpression compuesta: el hold se "consume" en la operación que pone `reserved_by`, eliminando `held_by` y `hold_expires_at` en el mismo UpdateItem. No hay ventana entre liberar y reservar.
+- `_claim_random_seat` (asignación aleatoria) filtra holds ajenos vigentes del pool de candidatos.
+
+**Aviso continuo del estado al usuario:**
+- En cada turn del chat entre PASO 3 (hold) y PASO 6c (confirmar), Claude llama `check_hold_status` que retorna `still_held` / `expired_seat_free` / `expired_seat_taken`. Según el resultado, Claude notifica al user proactivamente sin esperar al intento de confirmación.
+
+**Countdown visual en el frontend:**
+- El backend devuelve `metadata.hold = {seat_id, expires_at_epoch, vuelo_numero, fecha}` en el response del chat cuando `hold_seat` tiene éxito.
+- El módulo `HoldBanner` en `frontend/js/chat.js` arranca un `setInterval` que actualiza el banner cada segundo con formato `MM:SS`.
+- Cuando faltan ≤60 segundos, el banner cambia a estilo rojo con pulse animation.
+- Al llegar a 0, el banner muestra "0:00" y aparece un mensaje en el chat invitando al user a verificar el estado.
+- El backend también emite `metadata.hold_cleared = true` cuando el user libera, confirma reserva o el check_hold_status detecta cambios — el frontend cierra el banner.
+
+**Trade-off honesto:**
+- Si el user abandona la conversación, el seat queda bloqueado 10 min sin beneficio para nadie. Aceptable — el costo de un seat bloqueado por 10 min es mucho menor que la fricción de no tener hold.
+- Si el user tarda >10 min completando PASOS 4-5-6, el hold expira. El backend lo detecta y le ofrece retomar. Si en ese intervalo otro usuario tomó el mismo seat, le mostramos alternativas.
+- No usamos `TransactWriteItems` para liberar previos + tomar nuevo. Atomic global agregaría costo 2× WCU y complejidad. El hold huérfano por race es bounded por TTL.
+
+**Pregunta esperable en oral:** *"¿Y si el user holdea desde un tab e intenta confirmar desde otro?"* → el `user_id` viene del JWT del Cognito Authorizer, es el mismo en ambos tabs. El handler reconoce el hold como propio y lo consume. **Funciona transparente.**
+
+---
+
 ## 12. Frontend HTTP (no HTTPS)
 
 **Decisión:** el frontend S3 sirve HTTP estático sin CloudFront.
