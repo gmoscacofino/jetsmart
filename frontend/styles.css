@@ -1015,64 +1015,41 @@ a:hover { text-decoration: underline; }
   .kpi-grid { grid-template-columns: 1fr 1fr; }
 }
 
-/* ── Hold countdown banner ──────────────────────────────────────────
-   Banner persistente con countdown del soft-hold de asiento.
-   Aparece encima del input area cuando el user reserva un asiento. */
+/* ── Hold countdown — slim bar arriba del chat ──────────────────────
+   Minimalista: una sola línea, sin sombras grandes. Naranja sutil en
+   modo normal; color de alerta en los últimos 60 seg (sin pulse). */
 .hold-banner {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 12px 18px;
-  margin: 0 18px 8px;
-  background: linear-gradient(135deg, #FFF4E6 0%, #FFE8D1 100%);
-  border: 1px solid #FF6600;
-  border-left: 4px solid #FF6600;
-  border-radius: 8px;
+  gap: 8px;
+  padding: 6px 16px;
+  background: #FFF8F0;
+  border-bottom: 1px solid #FFD9B8;
   font-family: 'DM Sans', sans-serif;
-  color: #4A2E00;
-  box-shadow: 0 2px 8px rgba(255, 102, 0, 0.15);
-  animation: hold-banner-enter 0.3s ease-out;
-}
-@keyframes hold-banner-enter {
-  from { opacity: 0; transform: translateY(8px); }
-  to   { opacity: 1; transform: translateY(0); }
+  font-size: 12.5px;
+  color: #7A4500;
+  line-height: 1;
 }
 .hold-banner.expiring {
-  background: linear-gradient(135deg, #FFE6E6 0%, #FFCCCC 100%);
-  border-color: #D32F2F;
-  border-left-color: #D32F2F;
-  color: #4A0000;
-  box-shadow: 0 2px 8px rgba(211, 47, 47, 0.25);
-  animation: hold-pulse 1s ease-in-out infinite;
-}
-@keyframes hold-pulse {
-  0%, 100% { box-shadow: 0 2px 8px rgba(211, 47, 47, 0.25); }
-  50%      { box-shadow: 0 2px 16px rgba(211, 47, 47, 0.45); }
+  background: #FFF0F0;
+  border-bottom-color: #F2B6B6;
+  color: #8A1A1A;
 }
 .hold-banner-icon {
-  display: flex;
-  align-items: center;
+  flex-shrink: 0;
   color: #FF6600;
 }
-.hold-banner.expiring .hold-banner-icon { color: #D32F2F; }
+.hold-banner.expiring .hold-banner-icon { color: #C92020; }
 .hold-banner-text {
   flex: 1;
-  font-size: 14px;
-  line-height: 1.4;
+  letter-spacing: 0.1px;
 }
-.hold-banner-text strong { font-weight: 700; }
+.hold-banner-text strong { font-weight: 600; }
 .hold-banner-timer {
   font-family: 'Space Mono', monospace;
-  font-size: 18px;
+  font-size: 12.5px;
   font-weight: 700;
-  letter-spacing: 0.5px;
-  background: #FF6600;
-  color: white;
-  padding: 4px 10px;
-  border-radius: 4px;
-  min-width: 60px;
-  text-align: center;
+  letter-spacing: 0.3px;
+  color: #FF6600;
 }
-.hold-banner.expiring .hold-banner-timer {
-  background: #D32F2F;
-}
+.hold-banner.expiring .hold-banner-timer { color: #C92020; }

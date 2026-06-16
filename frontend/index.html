@@ -127,6 +127,18 @@
         </div>
       </header>
 
+      <!-- Hold countdown — minimalista, visible sólo cuando hay un seat holdeado -->
+      <div id="hold-banner" class="hold-banner" style="display:none;" role="status" aria-live="polite">
+        <svg class="hold-banner-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4">
+          <circle cx="12" cy="12" r="10"/>
+          <polyline points="12 6 12 12 16 14"/>
+        </svg>
+        <span class="hold-banner-text">
+          Asiento <strong id="hold-banner-seat">--</strong> · <span id="hold-banner-flight">--</span>
+        </span>
+        <span class="hold-banner-timer" id="hold-banner-timer">10:00</span>
+      </div>
+
       <div class="messages-container" id="messages-container">
         <!-- Welcome message -->
         <div class="message message-assistant">
@@ -145,20 +157,6 @@
           </div>
           <span class="message-time">Ahora</span>
         </div>
-      </div>
-
-      <!-- Hold countdown banner — visible solo cuando hay un seat holdeado -->
-      <div id="hold-banner" class="hold-banner" style="display:none;" role="status" aria-live="polite">
-        <div class="hold-banner-icon">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <circle cx="12" cy="12" r="10"/>
-            <polyline points="12 6 12 12 16 14"/>
-          </svg>
-        </div>
-        <div class="hold-banner-text">
-          Asiento <strong id="hold-banner-seat">--</strong> reservado · vuelo <span id="hold-banner-flight">--</span>
-        </div>
-        <div class="hold-banner-timer" id="hold-banner-timer">10:00</div>
       </div>
 
       <div class="chat-input-area">
