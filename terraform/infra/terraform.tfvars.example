@@ -13,3 +13,10 @@ anthropic_api_key = "REEMPLAZAR_CON_API_KEY"
 
 # Backend — debe coincidir con el suffix usado al correr 00-backend
 state_bucket_suffix = "REEMPLAZAR_CON_SUFFIX_UNICO"
+
+# Notifications — emails que reciben booking confirmed / failed via SNS.
+# Después del apply, AWS manda un mail "Confirm subscription" a cada endpoint:
+# hay que clickear el link para activar la subscription.
+notification_email_subscribers = [
+  # "alguien@example.com",
+]

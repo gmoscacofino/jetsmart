@@ -178,15 +178,17 @@ jobs:
 
       - name: Terraform Plan
         env:
-          TF_VAR_anthropic_api_key:   ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
-          TF_VAR_state_bucket_suffix: ${{ secrets.STATE_BUCKET_SUFFIX }}
+          TF_VAR_anthropic_api_key:              ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
+          TF_VAR_state_bucket_suffix:            ${{ secrets.STATE_BUCKET_SUFFIX }}
+          TF_VAR_notification_email_subscribers: '["gmoscacofino@itba.edu.ar"]'
         run: terraform plan -out=tfplan
 
       - name: Terraform Apply
         if: github.event.inputs.action == 'apply'
         env:
-          TF_VAR_anthropic_api_key:   ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
-          TF_VAR_state_bucket_suffix: ${{ secrets.STATE_BUCKET_SUFFIX }}
+          TF_VAR_anthropic_api_key:              ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
+          TF_VAR_state_bucket_suffix:            ${{ secrets.STATE_BUCKET_SUFFIX }}
+          TF_VAR_notification_email_subscribers: '["gmoscacofino@itba.edu.ar"]'
         run: terraform apply -auto-approve tfplan
 
       - name: Inject Terraform outputs into config.js

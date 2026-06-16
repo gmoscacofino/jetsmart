@@ -277,7 +277,9 @@ TOOLS = [
         "name": "create_reservation",
         "description": (
             "Crea una reserva real e inicia el flujo de pago (Saga). "
-            "Llamar SÓLO cuando el usuario confirmó explícitamente todos los detalles."
+            "Llamar SÓLO cuando el usuario confirmó explícitamente todos los detalles. "
+            "NO pedir el email al usuario: la herramienta lo completa automáticamente "
+            "con el email del usuario autenticado (claim del JWT de Cognito)."
         ),
         "input_schema": {
             "type": "object",
@@ -288,13 +290,12 @@ TOOLS = [
                 "pasajeros":       {"type": "integer"},
                 "tarifa":          {"type": "string", "description": "BASIC, LIGHT, SMART, FULL FLEX"},
                 "total":           {"type": "number"},
-                "email_contacto":  {"type": "string"},
                 "telefono":        {"type": "string"},
                 "nombre_pasajero": {"type": "string"},
                 "dni":             {"type": "string", "description": "DNI del pasajero principal (sin puntos)"},
                 "vuelo_numero":    {"type": "string", "description": "Número de vuelo (JA203, etc.)"},
             },
-            "required": ["origen", "destino", "fecha", "pasajeros", "tarifa", "total", "email_contacto"],
+            "required": ["origen", "destino", "fecha", "pasajeros", "tarifa", "total"],
         },
     },
     {
@@ -326,7 +327,7 @@ TOOLS = [
 ]
 
 
-def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "") -> str:
+def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "", user_email: str = "") -> str:
     if name == "list_flight_dates":
         origen  = inputs["origen"].upper()
         destino = inputs["destino"].upper()
@@ -521,8 +522,11 @@ def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "") -
                 "procesando": True,
                 "mensaje": "Tu boarding pass se está generando, intentá en unos segundos.",
             })
+        destino_email = user_email or "tu casilla registrada"
         return json.dumps({
             "ok":             True,
+            "enviado_por_mail": True,
+            "destino_email":  destino_email,
             "boarding_pass": {
                 "reservation_id": pnr,
                 "pasajero":       item.get("passenger_name", "Pasajero"),
@@ -531,11 +535,11 @@ def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "") -
                 "destino":        item.get("destination", "—"),
                 "fecha":          item.get("flight_date", "—"),
                 "asiento":        item.get("seat", "ALEATORIO"),
-                "url":            bp.get("bp_url"),
                 "grupo":          "B",
                 "puerta":         "12",
                 "embarque":       "45 min antes de la salida",
             },
+            "mensaje": f"Te enviamos el boarding pass a {destino_email}. Llega en unos minutos.",
         })
 
     if name == "create_claim":
@@ -618,7 +622,7 @@ def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "") -
             "pasajeros":       int(inputs.get("pasajeros", 1)),
             "tarifa":          inputs.get("tarifa", "BASIC"),
             "total":           float(inputs.get("total", 0)),
-            "email_contacto":  inputs.get("email_contacto", ""),
+            "email_contacto":  user_email or inputs.get("email_contacto", ""),
             "telefono":        inputs.get("telefono", ""),
             "nombre_pasajero": inputs.get("nombre_pasajero", ""),
             "dni":             inputs.get("dni", ""),
@@ -769,7 +773,7 @@ def _handle_chat(event: dict, user: dict) -> dict:
                     content_list.append({"type": "text", "text": b.text})
 
             for tc in tool_calls:
-                result = _execute_tool(tc.name, tc.input, user_id, session_id)
+                result = _execute_tool(tc.name, tc.input, user_id, session_id, user.get("email", ""))
                 log.info("Tool %s → %s", tc.name, result[:120])
                 tool_results.append({
                     "type":        "tool_result",

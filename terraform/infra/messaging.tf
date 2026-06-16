@@ -7,11 +7,22 @@ resource "aws_sns_topic" "events" {
 # ── SNS: topic de notificaciones al usuario ────────────────────────────────────
 #
 # Recibe eventos de booking_confirmed / booking_failed / handoff_ack /
-# flight_cancellation desde varias Lambdas. Agregar suscripciones email:
-#   aws sns subscribe --topic-arn <arn> --protocol email --notification-endpoint <email>
+# flight_cancellation desde varias Lambdas. Las suscripciones email se declaran
+# en la variable var.notification_email_subscribers.
+#
+# Atención: después del primer apply, AWS manda un mail "Confirm subscription"
+# a cada endpoint. Hasta que se clickee el link, la subscription queda en estado
+# "PendingConfirmation" y NO llegan los mails reales.
 
 resource "aws_sns_topic" "notifications" {
   name = "${local.name_prefix}-notifications"
+}
+
+resource "aws_sns_topic_subscription" "notifications_email" {
+  for_each  = toset(var.notification_email_subscribers)
+  topic_arn = aws_sns_topic.notifications.arn
+  protocol  = "email"
+  endpoint  = each.value
 }
 
 # ── SNS: topic de eventos de operaciones (vuelos) ─────────────────────────────

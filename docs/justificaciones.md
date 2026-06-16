@@ -265,6 +265,51 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 ---
 
+## 19. Email del JWT, no preguntárselo al usuario en el chat
+
+**Decisión:** la tool `create_reservation` ignora el campo `email_contacto` del input y usa el claim `email` del JWT de Cognito. El system prompt instruye explícitamente *"NUNCA preguntar el email al usuario"*.
+
+**Razón:** el usuario ya se autenticó vía Cognito Hosted UI — su email está validado por el IdP, llega firmado en el JWT y la API Gateway lo expone vía `event.requestContext.authorizer.claims.email`. Preguntárselo de nuevo en el chat es:
+1. **Mala UX** — el usuario lo escribió hace 10 segundos en el login.
+2. **Riesgo de tipos** — un email mal tipeado en el chat dispara mails fallidos sin que el sistema se entere.
+3. **Inconsistente con el design de Cognito Authorizer** (decisión #4): si confiamos en el JWT para autenticación, también confiamos en sus claims para identidad.
+
+**Trade-off:** el `email_contacto` queda como opcional en el schema de la tool — útil sólo si el usuario quiere especificar un mail distinto al del login (caso edge, no documentado en el flujo). El handler hace `user_email or inputs.email_contacto` por compatibilidad.
+
+---
+
+## 20. Boarding pass entregado por mail (mock), no como link en el chat
+
+**Decisión:** `get_boarding_pass` retorna los datos del BP + un flag `enviado_por_mail`. El system prompt prohíbe explícitamente mostrar links/URLs del BP. El bucket S3 con el archivo del BP sigue existiendo (lo escribe `boarding_pass_async`) pero la URL presigned no se expone al chat.
+
+**Alternativas:**
+- (a) Link presigned URL en el chat (estado anterior) → expone un link largo, feo, con credenciales temporales que se vencen.
+- (b) SES con el PDF adjunto (producción real) → requiere domain validation en SES, fuera del scope del TP.
+- (c) **Mock por mail (elegida)** → el chat dice "te lo enviamos por mail"; en realidad no se envía nada de SES, pero el bucket S3 con el archivo queda como evidencia para auditoría.
+
+**Trade-off explícito:** el "envío por mail" es un mock — el archivo está en S3 pero no se envía físicamente. Es deuda técnica honesta: el flujo de UX queda correcto y migrar a SES más adelante es cuestión de configurar el sender en `boarding_pass_async`.
+
+**Por qué es correcto:** el chat es para conversar, no para distribuir archivos. Los archivos se distribuyen por canales asíncronos (mail, app, portal). El estado anterior mezclaba ambas responsabilidades y exponía detalles de infraestructura (`s3.amazonaws.com/...?AWSAccessKeyId=...`) que no le importan al pasajero.
+
+---
+
+## 21. SNS topic global de notificaciones, no destino por usuario
+
+**Decisión:** el topic `jetsmart-prod-notifications` hace fan-out broadcast a todos los suscriptos (configurados en `var.notification_email_subscribers`). Para el TP, el único suscripto es el email del demo (`gmoscacofino@itba.edu.ar`), confirmado manualmente vía el link de "Confirm subscription".
+
+**Alternativas:**
+- (a) SES con destino dinámico por usuario (producción real) → requiere domain validation y sandbox approval; no factible en AWS Academy.
+- (b) Una subscription email por usuario, filtrada por `MessageAttributes` y `SubscriptionFilterPolicy` → costosa en gestión (crear subscriptions en cada signup) y el confirm subscription rompe la UX.
+- (c) **SNS broadcast con un único endpoint para el demo (elegida)** → simple, suficiente para mostrar el patrón Saga → notificación.
+
+**Trade-off honesto:** con más de un usuario activo todos reciben los mails de todos. **Esto es un anti-patrón para producción y hay que decirlo en la presentación**. En la realidad este punto se resuelve con SES (`SendEmail` con destinatario dinámico) — el patrón Saga publica un evento, una Lambda específica formatea el mail y lo manda al destinatario correcto vía SES.
+
+**Por qué se quedó así:** el TP4 evalúa elasticidad (SQS/SNS presentes), no la solución de email transaccional. Migrar a SES era scope creep y AWS Academy no tiene SES totalmente habilitado sin domain validation.
+
+**Pregunta esperable en oral:** *"¿Y si un atacante se suscribe al topic?"* → buena pregunta. La bucket policy del topic (faltante en el TP) debería restringir `sns:Subscribe` al LabRole. En producción real esta sería una vulnerabilidad seria — para el TP el topic no es público y nadie puede suscribirse desde fuera de la cuenta.
+
+---
+
 ## 12. Frontend HTTP (no HTTPS)
 
 **Decisión:** el frontend S3 sirve HTTP estático sin CloudFront.

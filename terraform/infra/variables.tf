@@ -59,3 +59,20 @@ variable "state_bucket_suffix" {
   description = "Suffix used in the S3 state bucket name — must match the value used in 00-backend"
   type        = string
 }
+
+# ── Notifications ─────────────────────────────────────────────────────────────
+
+variable "notification_email_subscribers" {
+  description = <<-EOT
+    Emails que se suscriben al SNS topic de notificaciones (booking confirmed/failed,
+    handoff_ack, boarding pass mock). Cada endpoint recibe un mail de AWS "Confirm
+    subscription" que tiene que clickearse manualmente — hasta entonces no llegan
+    los mails reales.
+
+    Nota arquitectónica: SNS hace fan-out broadcast al topic — todos los suscriptos
+    reciben todas las notificaciones, no sólo las suyas. En producción real esto
+    iría por SES con destino dinámico por usuario.
+  EOT
+  type        = list(string)
+  default     = []
+}
