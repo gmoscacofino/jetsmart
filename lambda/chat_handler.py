@@ -62,11 +62,13 @@ def _get_user(event: dict) -> dict:
     claims = (event.get("requestContext") or {}).get("authorizer", {}).get("claims")
     if not claims:
         raise ValueError("Request sin claims de Cognito Authorizer")
+    if not claims.get("sub"):
+        raise ValueError("Claim 'sub' ausente en el token")
     return claims
 
 
 def _user_id(user: dict) -> str:
-    return user.get("sub", "anonymous")
+    return user["sub"]
 
 
 # ── DynamoDB: conversations table ─────────────────────────────────────────────
