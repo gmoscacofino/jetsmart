@@ -215,13 +215,13 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 **Decisión:** las cancelaciones de vuelo se notifican proactivamente vía SNS `flight-events` → SQS `proactive-notifications` → Lambda → SNS `notifications` (emails).
 
 **Alternativas:**
-- (a) El usuario consulta periódicamente (polling) → mala UX, carga DynamoDB.
-- (b) Polling desde el sistema PSS hacia DynamoDB → carga GSI innecesariamente.
-- (c) **Event-driven push (elegida)** → el sistema PSS publica un evento, los suscriptores se enteran.
+- (a) El usuario consulta periódicamente (polling) → mala UX, carga la tabla.
+- (b) Una Lambda cron que escanee la tabla buscando vuelos cancelados → carga el GSI innecesariamente y agrega latencia (los pasajeros se enteran cuando corre la cron, no cuando se canceló).
+- (c) **Event-driven push (elegida)** → el módulo de ops de la aerolínea publica un evento, los suscriptores se enteran al instante.
 
 **Por qué GSI2 ReservationsByFlight:** sin él, encontrar los pasajeros afectados requiere Scan de toda la business table — O(n) lineal. Con GSI2, una sola Query devuelve la lista — O(log n). Es **el habilitador técnico** del feature.
 
-**Demo offline:** en producción el evento vendría del sistema interno de ops cuando marca un vuelo como cancelado. En el TP el trigger es un script CLI (`scripts/cancel_flight.py`); el flujo se prueba antes del demo y se muestra el resultado en CloudWatch logs durante la presentación, sin disparar en vivo.
+**Demo offline:** el evento de `flight-events` lo publica el módulo de operaciones de la aerolínea cuando marca un vuelo como cancelado. En el TP, ese rol lo cumple el script CLI `scripts/cancel_flight.py` (mismo payload SNS, mismo `UpdateItem` sobre la tabla `business`). El flujo se prueba antes del demo y se muestra el resultado en CloudWatch logs durante la presentación, sin disparar en vivo.
 
 ---
 

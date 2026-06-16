@@ -33,10 +33,10 @@ Lambda es el servicio de cómputo principal de este proyecto. Cada función Lamb
 
 `chat-handler` no llama al LLM una sola vez — implementa un **bucle de tool use** de hasta 5 rondas. Claude puede pausar su respuesta y pedir que la Lambda ejecute funciones reales para obtener datos antes de responder:
 
-- `search_flights` — consulta disponibilidad de vuelos en DynamoDB (simula el PSS real de JetSmart)
+- `search_flights` — consulta disponibilidad de vuelos en la tabla `business` (el PSS de la aerolínea)
 - `get_reservation` — consulta el estado de una reserva del usuario
 
-En producción, estas funciones llamarían a la API interna de JetSmart en lugar de DynamoDB. La interfaz hacia Claude es idéntica en ambos casos.
+La tabla `business` es la fuente única de verdad: la consultan tanto el chatbot como (en una arquitectura completa) la web, la app móvil y el call center.
 
 Ver explicación completa en [01 — Cómo funciona un chatbot](./01-como-funciona-chatbot.md#tool-use-cómo-el-chatbot-consulta-datos-reales).
 
@@ -119,7 +119,7 @@ Cada topic representa un **dominio de eventos** distinto y tiene consumidores di
 
 - `events` → analytics interno (data lake)
 - `notifications` → comunicación saliente al usuario y al equipo de operaciones (alarmas)
-- `flight-events` → ingest desde el sistema externo de operaciones de JetSmart
+- `flight-events` → publicado por el módulo de operaciones de la aerolínea cuando un vuelo cambia de estado (cancelación, demora, gate change). En el TP el publisher es el script `scripts/cancel_flight.py`.
 
 Unificar todo en un solo topic acoplaría dominios sin necesidad y haría que cada consumer tuviera que filtrar mensajes por `event_type` — antipatrón. Topics separados dejan que cada consumer se suscriba solo a lo que le importa.
 

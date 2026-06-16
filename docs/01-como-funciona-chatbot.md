@@ -242,41 +242,33 @@ TOOLS = [
 
 Claude decide cuándo y cómo llamarlas según la pregunta del usuario — la Lambda no le dice explícitamente "usá esta herramienta".
 
-### Integración con la API real de JetSmart
+### La tabla `business` ES el PSS
 
-En este TP, `_execute_tool` consulta DynamoDB para obtener los datos de vuelos. DynamoDB actúa como una simulación del **PSS (Passenger Service System)**: el sistema de reservas central que usan las aerolíneas reales.
-
-En producción, la misma función llamaría a la API interna de JetSmart:
+En esta arquitectura la tabla DynamoDB `business` no simula al PSS (Passenger Service System) — **es** el PSS de la aerolínea. El chatbot es uno de los canales que lo consumen; los otros canales (web, app móvil, agencias, IVR, call center) consultan la misma fuente.
 
 ```python
-# Implementación en este TP (DynamoDB simula el PSS):
 def _execute_tool(name, inputs, user_id):
     if name == "search_flights":
-        resp = table.get_item(
-            Key={"PK": f"FLIGHT#{origen}#{destino}", "SK": f"DATE#{fecha}"}
+        resp = biz_table.query(
+            KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
+            ExpressionAttributeValues={
+                ":pk":     f"FLIGHT#{origen}#{destino}",
+                ":prefix": f"DATE#{fecha}#",
+            },
         )
-        return json.dumps(resp.get("Item", {}))
-
-# Implementación en producción (API interna de JetSmart):
-def _execute_tool(name, inputs, user_id):
-    if name == "search_flights":
-        resp = requests.get(
-            "https://api-interna.jetsmart.com/availability",
-            params={"origin": origen, "destination": destino, "date": fecha},
-            headers={"Authorization": f"Bearer {JETSMART_INTERNAL_TOKEN}"},
-        )
-        return json.dumps(resp.json())
+        return json.dumps(resp.get("Items", []))
 ```
 
-La interfaz hacia Claude es exactamente igual en ambos casos. La única diferencia es que en producción `_execute_tool` hace una llamada HTTP al PSS real en lugar de leer DynamoDB.
+No hay "modo demo" ni "modo prod" — la Lambda hace `Query` a la business table igual hoy que en una hipotética operación real. El TP carga un dataset de vuelos cuando se hace `terraform apply` (ver `seed.py`), pero el esquema (`PK=FLIGHT#{origen}#{destino}` / `SK=DATE#{fecha}#FLIGHT#{vuelo}` + GSIs por número de vuelo, por reserva y por pasajero) es el que tendría un PSS de verdad.
 
 ```
-Todos los canales de JetSmart consumen el mismo PSS:
+Todos los canales de la aerolínea consultan el mismo PSS:
 
-  App móvil  ──→ API Gateway → chatbot Lambda → _execute_tool → PSS (API interna)
-  Sitio web  ──→                                                     ↑
-  Agencias   ──→────────────────────────────────────────────────────→│
-                                                          (fuente única de verdad)
+  App móvil  ──→                                                  ┌─→ DynamoDB
+  Sitio web  ──→  API Gateway / API canal ──→ Lambda / servicio ──┤    business
+  Chatbot    ──→  (este TP modela el del chatbot)                 │    (PSS)
+  Agencias   ──→                                                  └─→
+                                                       (fuente única de verdad)
 ```
 
 ### El flujo completo con tool use
@@ -294,7 +286,7 @@ Claude responde: stop_reason = "tool_use"
   → quiere ejecutar search_flights(origen=AEP, destino=SCL, fecha=2026-06-20, pasajeros=2)
         ↓
 Lambda ejecuta _execute_tool("search_flights", {...})
-  → consulta DynamoDB (o en producción: API interna JetSmart)
+  → consulta DynamoDB business (el PSS)
   → obtiene: vuelo JA-201, salida 08:00, precio $85, asientos disponibles: 142
         ↓
 Lambda devuelve el resultado a Claude como tool_result

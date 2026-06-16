@@ -290,7 +290,7 @@ Cuando un vuelo se cancela en el sistema de operaciones, todos los pasajeros afe
 > **Nota del demo:** este flujo NO se dispara en vivo durante la presentación. El disparador (`scripts/cancel_flight.py`) se ejecuta offline antes de la demo para validar que funcione, y en la defensa se muestra el diagrama + los logs en CloudWatch de la corrida previa.
 
 ```
-[Disparador — en producción sería el sistema PSS de ops; en TP es un script]
+[Disparador — representa al módulo de operaciones de la aerolínea; en el TP es un script CLI]
 $ python3 scripts/cancel_flight.py JA203 2026-06-20 "mal tiempo en Mendoza"
         ↓
 Script:

@@ -4,7 +4,7 @@
 
 Un chatbot conversacional que replica la experiencia de la web de JetSmart, funcionando como canal end-to-end para reservar vuelos, hacer check-in, consultar el estado de vuelos, gestionar reservas y hacer reclamos.
 
-El chatbot usa inteligencia artificial (Claude de Anthropic) para entender lenguaje natural. Los datos de vuelos son simulados (mock data) ya que la API real de JetSmart no es pública.
+El chatbot usa inteligencia artificial (Claude de Anthropic) para entender lenguaje natural. La tabla DynamoDB `business` cumple el rol de PSS (Passenger Service System) de la aerolínea — es la fuente única de verdad de vuelos, reservas, pasajeros y reclamos que consumirían también el sitio web, la app móvil y el call center. Para el TP se pre-carga un dataset de demo con `seed.py`.
 
 ---
 
@@ -25,7 +25,7 @@ El chatbot usa inteligencia artificial (Claude de Anthropic) para entender lengu
 | **DynamoDB partida en dos tablas single-design**: `jetsmart-prod-conversations` (chat) + `jetsmart-prod-business` (PSS-like) | Bounded contexts: separa estado efímero del chatbot del dominio de negocio. Failure isolation entre el canal y el core. Retention policies independientes (TTL en chat, persistencia en negocio). Prepara la arquitectura para sumar otros canales que compartirían la business table. |
 | **Reservas migran a esquema PNR-céntrico** (record locator de 6 chars uppercase, à la Navitaire/Amadeus) con sub-items `SEGMENT#`, `PAX#`, `BP#` | Refleja cómo modelaría las reservas un PSS real. Habilita queries útiles ("quién está en este vuelo") via GSI2. |
 | **Implementada derivación a humano**: nueva tool `escalate_to_human` en `chat_handler` → SQS `human-handoff` → Lambda `human_handoff_processor` (mock call center) | Completar la feature de TP1 que no se había implementado. SQS desacopla el chatbot del sistema del call center: si el call center está caído, el pedido queda esperando. |
-| **Implementadas notificaciones proactivas**: trigger `scripts/cancel_flight.py` → SNS `flight-events` → SQS `proactive-notifications` → Lambda → fan-out de emails vía SNS `notifications` | Completar la feature de TP1. El trigger no se dispara en vivo en la demo (queda demostrado offline + diagrama); en producción el disparo sería desde el sistema PSS real de operaciones. |
+| **Implementadas notificaciones proactivas**: trigger `scripts/cancel_flight.py` → SNS `flight-events` → SQS `proactive-notifications` → Lambda → fan-out de emails vía SNS `notifications` | Completar la feature de TP1. El trigger no se dispara en vivo en la demo (queda demostrado offline + diagrama); el script representa al módulo de operaciones de la aerolínea que en una operación real publicaría a `flight-events` cuando marca un vuelo como cancelado. |
 | **Boarding pass async vía SQS**: el Saga ya no invoca la Lambda de boarding pass directamente — publica un mensaje a SQS `boarding-pass-generation` y la nueva Lambda `boarding_pass_async` la consume | Desacopla el path sync del Saga del trabajo de generación del PDF. Si el BP falla queda en DLQ sin afectar la reserva ya confirmada. |
 | **3 nuevas SQS + DLQs** y **1 nuevo SNS topic** (`flight-events`) | Patrón consistente con el SQS de analytics: cada cola funcional tiene su DLQ con retención de 14 días y CloudWatch alarm. |
 
@@ -80,9 +80,9 @@ Si ConfirmBooking falla:
 
 El chat **debe** ser sincrónico: el usuario manda un mensaje y espera la respuesta inmediata. Al confirmar la compra, `chat-handler` llama a Step Functions con `startExecution` (no espera el resultado) y retorna un transaction ID inmediatamente. La Saga corre en background.
 
-### Mock data en lugar de API real de JetSmart
+### DynamoDB `business` como PSS
 
-En producción, el backend se conectaría a la API interna de JetSmart para obtener disponibilidad de vuelos. Esa API no es pública. En este TP los datos (rutas, precios, fechas) se cargan como mock data en DynamoDB con esquema `PK=FLIGHT#{origen}#{destino}` / `SK=DATE#{fecha}`.
+La tabla `business` no es un mock que se reemplazaría por otra cosa — es el PSS. El chatbot, la web, la app y el call center son canales sobre la misma tabla. El esquema PNR-céntrico (`PK=PNR#...`, sub-items `SEGMENT#`, `PAX#`, `BP#`, GSIs por número de vuelo / por reserva / por pasajero) es el patrón estándar de un PSS comercial (estilo Navitaire / Amadeus). Para que el chatbot tenga algo que mostrar, `seed.py` precarga rutas, fechas, precios e inventario al hacer `terraform apply`.
 
 ### DynamoDB para tiempo real, S3+Athena para analytics
 
