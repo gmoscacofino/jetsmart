@@ -6,7 +6,12 @@
 #
 # Restricción AWS Academy: CloudTrail puede asumir LabRole y escribir a S3,
 # pero NO se puede habilitar CloudWatch Logs integration. La consulta de logs
-# se hace con Athena sobre el bucket S3 (paginando por prefix dt=YYYY/MM/DD).
+# se hace ad-hoc: `aws s3 cp` + `gunzip | jq` para investigaciones puntuales,
+# o creando una tabla on-demand en Athena cuando hace falta. NO declaramos
+# Glue catalog + crawler en este TP porque el JSON classifier default de Glue
+# no infiere bien el formato wrapped {"Records":[...]} de CloudTrail — en
+# producción real iría con un custom classifier o una tabla manual con
+# CloudTrailSerde.
 #
 # Lifecycle agresivo (90 días) para mantener el costo dentro del budget del lab.
 
@@ -58,15 +63,6 @@ resource "aws_s3_bucket_lifecycle_configuration" "cloudtrail" {
     noncurrent_version_expiration {
       noncurrent_days = 30
     }
-  }
-
-  rule {
-    id     = "expire-athena-query-results"
-    status = "Enabled"
-
-    filter { prefix = "athena-results/" }
-
-    expiration { days = 14 }
   }
 
   depends_on = [aws_s3_bucket_versioning.cloudtrail]
@@ -127,72 +123,4 @@ resource "aws_cloudtrail" "this" {
   # cloud_watch_logs_group_arn / cloud_watch_logs_role_arn quedan vacíos.
 
   depends_on = [aws_s3_bucket_policy.cloudtrail]
-}
-
-# ── Glue Data Catalog + Athena para queries de auditoría ──────────────────────
-#
-# Como en Academy no podemos sinkar el trail a CloudWatch Logs, la única manera
-# de consultar los eventos es Athena sobre el bucket S3. El crawler infiere el
-# schema de los archivos JSON.GZ de CloudTrail y crea automáticamente las
-# particiones por región/año/mes/día.
-#
-# Workgroup separado del de business analytics (`-analytics`) para mantener
-# segregada la actividad de auditoría — distintos consumidores, distintos
-# resultados, distinto cost attribution.
-
-resource "aws_glue_catalog_database" "audit" {
-  name        = replace("${local.name_prefix}_audit", "-", "_")
-  description = "Database de Glue para los logs de CloudTrail (consultados desde Athena)"
-}
-
-resource "aws_glue_crawler" "cloudtrail" {
-  name          = "${local.name_prefix}-cloudtrail-crawler"
-  database_name = aws_glue_catalog_database.audit.name
-  role          = data.aws_iam_role.lab_role.arn
-
-  s3_target {
-    path = "s3://${aws_s3_bucket.cloudtrail.bucket}/AWSLogs/${data.aws_caller_identity.current.account_id}/CloudTrail/"
-  }
-
-  configuration = jsonencode({
-    Version = 1.0
-    Grouping = {
-      TableGroupingPolicy = "CombineCompatibleSchemas"
-    }
-    CrawlerOutput = {
-      Partitions = { AddOrUpdateBehavior = "InheritFromTable" }
-    }
-  })
-
-  # Schedule cada 6 horas: balance entre frescura y costo. Para auditoría
-  # ad-hoc también se puede invocar manualmente:
-  #   aws glue start-crawler --name jetsmart-prod-cloudtrail-crawler
-  schedule = "cron(0 */6 * * ? *)"
-
-  schema_change_policy {
-    delete_behavior = "LOG"
-    update_behavior = "UPDATE_IN_DATABASE"
-  }
-
-  depends_on = [aws_cloudtrail.this]
-}
-
-resource "aws_athena_workgroup" "audit" {
-  name        = "${local.name_prefix}-audit"
-  description = "Workgroup para queries de auditoría sobre los logs de CloudTrail"
-
-  configuration {
-    enforce_workgroup_configuration    = true
-    publish_cloudwatch_metrics_enabled = true
-
-    result_configuration {
-      output_location = "s3://${aws_s3_bucket.cloudtrail.bucket}/athena-results/"
-
-      encryption_configuration {
-        encryption_option = "SSE_S3"
-      }
-    }
-  }
-
-  force_destroy = true
 }

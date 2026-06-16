@@ -242,26 +242,27 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 ## 18. CloudTrail multi-region como capa de auditoría
 
-**Decisión:** trail multi-region con management events + global service events, log file validation activada, sink en bucket S3 dedicado con lifecycle de 90 días.
+**Decisión:** trail multi-region con management events + global service events, log file validation activada, sink en bucket S3 dedicado con lifecycle de 90 días. **Sin** Glue catalog ni Athena workgroup — consulta de logs ad-hoc vía CLI.
 
 **Alternativas:**
 - (a) Sin CloudTrail → no hay traza de quién hizo qué en la cuenta (failure de gobernanza).
 - (b) Trail single-region → pierde IAM/STS (servicios globales) y actividad en otras regiones.
 - (c) Trail + CloudWatch Logs → bloqueado por AWS Academy (no se puede habilitar el sink a CloudWatch).
-- (d) **Trail multi-region + S3 + Athena para queries (elegida)** → única combinación viable en el lab.
+- (d) Trail + Glue Catalog + Athena → probado y descartado: el JSON classifier default de Glue no infiere bien la estructura `{"Records":[...]}` de CloudTrail (queda una columna `records` de tipo array que rompe las queries útiles). Habría requerido custom classifier o tabla manual con `CloudTrailSerde`.
+- (e) **Trail multi-region + S3 con consulta ad-hoc (elegida)** → para la frecuencia de auditoría del TP, la diferencia entre Athena y CLI no justifica el overhead de mantener Glue.
 
-**Trade-off:** sin CloudWatch Logs no hay alertas en tiempo real sobre eventos sospechosos (ej. `ConsoleLogin` desde IP nueva, `DeleteTrail`, etc.). Las queries son ad-hoc vía Athena sobre el bucket. En una cuenta real esto se compensa con EventBridge rules sobre el trail, que sí están disponibles fuera de Academy.
+**Trade-off:** sin Athena, queries SQL no son directas. Para investigar un evento puntual: `aws s3 cp s3://...-cloudtrail/AWSLogs/<acc>/CloudTrail/<region>/<año>/<mes>/<día>/*.json.gz . && zcat *.gz | jq '.Records[]'`. En producción real se montaría un Lake Formation blueprint de CloudTrail o un SIEM (Datadog, Splunk, OpenSearch).
 
 **Por qué es correcto:**
 - Compensa la pérdida de VPC Flow Logs (decisión #1) en el plano de management.
 - Captura *fuera* de cuenta no auditable: si alguien rota la API key de Anthropic vía consola, queda registrado.
 - `enable_log_file_validation = true` produce digest SHA-256 firmados → detección de tampering ex-post.
-- Lifecycle a 90 días + Glacier transition implícita: costo ~0 en sandbox con uso bajo.
+- Lifecycle a 90 días: costo ~0 en sandbox con uso bajo.
 - Multi-region significa que un atacante no puede "esquivar" la auditoría operando en `us-west-2`.
 
 **Por qué no data events (S3/DynamoDB):** cuestan ~$0.10 por 100k events y para los criterios del TP4 alcanza con management events. Si en producción quisiéramos auditar quién descarga cada boarding pass, se prende `data_resource` sobre el bucket `boarding_passes` agregando ~5 líneas al recurso `aws_cloudtrail`.
 
-**Pregunta esperable en oral:** *"¿Cómo consultás los logs sin CloudWatch?"* → ya está armado en Terraform: Glue Catalog database `jetsmart_prod_audit` + crawler `jetsmart-prod-cloudtrail-crawler` (cron cada 6 h) sobre el prefix `AWSLogs/<account>/CloudTrail/` + workgroup Athena `jetsmart-prod-audit` con results en `s3://...-cloudtrail/athena-results/` (lifecycle 14 d). El analista abre Athena → workgroup audit → query SQL estándar. Patrón idéntico al data lake de business analytics (decisión #2) — segregado en workgroup distinto para mantener separación de consumidores y cost attribution.
+**Pregunta esperable en oral:** *"¿Cómo consultás los logs sin CloudWatch?"* → vía CLI con `aws s3 cp` + `jq` para investigaciones puntuales. Por qué no Athena: el JSON classifier default no parsea bien la estructura wrapped de CloudTrail, y montar un classifier custom o un schema manual para un consumo de baja frecuencia es sobreingeniería para este TP — en producción iría un SIEM o Lake Formation.
 
 ---
 

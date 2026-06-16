@@ -143,21 +143,6 @@ output "cloudtrail_arn" {
 }
 
 output "cloudtrail_bucket" {
-  description = "Bucket S3 donde CloudTrail deposita los logs (consultable vía Athena)"
+  description = "Bucket S3 donde CloudTrail deposita los logs (consulta ad-hoc vía aws s3 cp + jq)"
   value       = aws_s3_bucket.cloudtrail.bucket
-}
-
-output "audit_glue_database_name" {
-  description = "Database Glue del catálogo de logs de CloudTrail (usado por Athena)"
-  value       = aws_glue_catalog_database.audit.name
-}
-
-output "audit_glue_crawler_name" {
-  description = "Crawler que infiere schema de los logs de CloudTrail (start-crawler para refrescar)"
-  value       = aws_glue_crawler.cloudtrail.name
-}
-
-output "audit_athena_workgroup" {
-  description = "Workgroup de Athena para queries de auditoría sobre CloudTrail"
-  value       = aws_athena_workgroup.audit.name
 }
