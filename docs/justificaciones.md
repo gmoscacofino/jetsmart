@@ -240,6 +240,31 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 ---
 
+## 18. CloudTrail multi-region como capa de auditoría
+
+**Decisión:** trail multi-region con management events + global service events, log file validation activada, sink en bucket S3 dedicado con lifecycle de 90 días.
+
+**Alternativas:**
+- (a) Sin CloudTrail → no hay traza de quién hizo qué en la cuenta (failure de gobernanza).
+- (b) Trail single-region → pierde IAM/STS (servicios globales) y actividad en otras regiones.
+- (c) Trail + CloudWatch Logs → bloqueado por AWS Academy (no se puede habilitar el sink a CloudWatch).
+- (d) **Trail multi-region + S3 + Athena para queries (elegida)** → única combinación viable en el lab.
+
+**Trade-off:** sin CloudWatch Logs no hay alertas en tiempo real sobre eventos sospechosos (ej. `ConsoleLogin` desde IP nueva, `DeleteTrail`, etc.). Las queries son ad-hoc vía Athena sobre el bucket. En una cuenta real esto se compensa con EventBridge rules sobre el trail, que sí están disponibles fuera de Academy.
+
+**Por qué es correcto:**
+- Compensa la pérdida de VPC Flow Logs (decisión #1) en el plano de management.
+- Captura *fuera* de cuenta no auditable: si alguien rota la API key de Anthropic vía consola, queda registrado.
+- `enable_log_file_validation = true` produce digest SHA-256 firmados → detección de tampering ex-post.
+- Lifecycle a 90 días + Glacier transition implícita: costo ~0 en sandbox con uso bajo.
+- Multi-region significa que un atacante no puede "esquivar" la auditoría operando en `us-west-2`.
+
+**Por qué no data events (S3/DynamoDB):** cuestan ~$0.10 por 100k events y para los criterios del TP4 alcanza con management events. Si en producción quisiéramos auditar quién descarga cada boarding pass, se prende `data_resource` sobre el bucket `boarding_passes` agregando ~5 líneas al recurso `aws_cloudtrail`.
+
+**Pregunta esperable en oral:** *"¿Cómo consultás los logs sin CloudWatch?"* → ya está armado en Terraform: Glue Catalog database `jetsmart_prod_audit` + crawler `jetsmart-prod-cloudtrail-crawler` (cron cada 6 h) sobre el prefix `AWSLogs/<account>/CloudTrail/` + workgroup Athena `jetsmart-prod-audit` con results en `s3://...-cloudtrail/athena-results/` (lifecycle 14 d). El analista abre Athena → workgroup audit → query SQL estándar. Patrón idéntico al data lake de business analytics (decisión #2) — segregado en workgroup distinto para mantener separación de consumidores y cost attribution.
+
+---
+
 ## 12. Frontend HTTP (no HTTPS)
 
 **Decisión:** el frontend S3 sirve HTTP estático sin CloudFront.

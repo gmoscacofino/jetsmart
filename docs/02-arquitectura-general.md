@@ -28,6 +28,7 @@ El chatbot usa inteligencia artificial (Claude de Anthropic) para entender lengu
 | **Implementadas notificaciones proactivas**: trigger `scripts/cancel_flight.py` → SNS `flight-events` → SQS `proactive-notifications` → Lambda → fan-out de emails vía SNS `notifications` | Completar la feature de TP1. El trigger no se dispara en vivo en la demo (queda demostrado offline + diagrama); el script representa al módulo de operaciones de la aerolínea que en una operación real publicaría a `flight-events` cuando marca un vuelo como cancelado. |
 | **Boarding pass async vía SQS**: el Saga ya no invoca la Lambda de boarding pass directamente — publica un mensaje a SQS `boarding-pass-generation` y la nueva Lambda `boarding_pass_async` la consume | Desacopla el path sync del Saga del trabajo de generación del PDF. Si el BP falla queda en DLQ sin afectar la reserva ya confirmada. |
 | **3 nuevas SQS + DLQs** y **1 nuevo SNS topic** (`flight-events`) | Patrón consistente con el SQS de analytics: cada cola funcional tiene su DLQ con retención de 14 días y CloudWatch alarm. |
+| **CloudTrail multi-region** con sink S3 dedicado, log file validation y lifecycle 90 días, **+ Glue Catalog + crawler + Athena workgroup `audit`** sobre el mismo bucket | Capa de auditoría de gobernanza: traza todas las API calls del management plane (IAM, cambios de config de Lambda/SNS/SQS/DynamoDB). Sin CloudWatch Logs (restricción Academy) — el equipo de seguridad/auditoría consulta directamente vía Athena (workgroup separado del de business analytics). Compensa la pérdida de VPC Flow Logs. |
 
 ### Bounded contexts: Conversations vs PSS Business
 
@@ -50,7 +51,7 @@ La separación habilita decisiones independientes de:
 
 Para tener una VPC con sentido se necesitan recursos con identidad de red persistente (EC2, RDS, ElastiCache, contenedores). Cuando la arquitectura es 100% Lambda + servicios managed regionales (DynamoDB, SNS, SQS, Step Functions, S3, Cognito), la VPC sólo agrega complejidad sin beneficio.
 
-Trade-off: perdemos la visibilidad de **VPC Flow Logs** a nivel de red. Ganamos: cold start mínimo, sin endpoints que mantener, sin SGs, sin route tables, sin NAT Gateway. La auditoría se mantiene vía **CloudTrail** (todas las API calls de Lambda a servicios AWS) y **X-Ray** (tracing distribuido).
+Trade-off: perdemos la visibilidad de **VPC Flow Logs** a nivel de red. Ganamos: cold start mínimo, sin endpoints que mantener, sin SGs, sin route tables, sin NAT Gateway. La auditoría se mantiene vía **CloudTrail** (multi-region, todas las API calls del management plane sinkeadas a S3 — consultables con Athena) y **X-Ray** (tracing distribuido).
 
 ### Step Functions con patrón Saga para reservas
 
