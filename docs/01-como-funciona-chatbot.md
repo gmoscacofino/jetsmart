@@ -160,12 +160,32 @@ Con tool use:
 
 ### Las herramientas disponibles
 
-El chatbot tiene declaradas dos herramientas:
+El chatbot tiene declaradas diez herramientas, agrupadas por familia:
+
+**Búsqueda y consulta (read-only sobre el PSS)**
 
 | Herramienta | Cuándo la usa Claude | Datos que devuelve |
 |---|---|---|
-| `search_flights` | El usuario pregunta por disponibilidad, precios o itinerarios | Número de vuelo, horarios, precio por pasajero, asientos disponibles |
-| `get_reservation` | El usuario pregunta por el estado de una reserva | Estado, origen, destino, fecha, total |
+| `list_flight_dates` | El usuario quiere saber cuándo puede volar de A a B sin fecha fija | Fechas con asientos, número de vuelo, hora de salida, precio desde |
+| `search_flights` | El usuario pregunta por un vuelo concreto en una fecha | Número de vuelo, horarios, precio por pasajero, asientos disponibles |
+| `get_reservation` | El usuario pregunta por el estado de una reserva por PNR | Estado, origen, destino, fecha, pasajeros, total |
+| `list_user_reservations` | El usuario pide "mis reservas" | Hasta 20 reservas del usuario autenticado |
+| `list_saved_passengers` | El usuario quiere reusar un pasajero de un viaje anterior | Nombres derivados de reservas pasadas |
+
+**Operaciones transaccionales**
+
+| Herramienta | Cuándo la usa Claude | Efecto |
+|---|---|---|
+| `create_reservation` | El usuario confirmó explícitamente todos los detalles de compra | Arranca el Step Functions de pago (Saga); devuelve `payment_id` |
+| `check_in` | El usuario pide check-in y el vuelo es en ≤24 h | Cambia el status de la reserva a `CHECK-IN` |
+| `get_boarding_pass` | El usuario ya hizo check-in y pide el BP | URL del BP si está listo, o "procesando" si la generación asincrónica no terminó |
+
+**Soporte**
+
+| Herramienta | Cuándo la usa Claude | Efecto |
+|---|---|---|
+| `create_claim` | El usuario reporta equipaje, demoras, cancelaciones, reembolsos | Crea claim con `CLM-xxxx`; emite evento SNS |
+| `escalate_to_human` | El usuario lo pide explícitamente, hay frustración alta, o el caso queda fuera del alcance del bot | Encola handoff en SQS con `ticket_id`; el call center lo retoma con contexto |
 
 ### El bucle de tool use
 
