@@ -88,8 +88,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "backups" {
     }
 
     expiration {
-      days                         = 3650
-      expired_object_delete_marker = false
+      days = 3650
     }
 
     noncurrent_version_transition {
