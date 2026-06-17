@@ -191,7 +191,7 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 **Por qué es correcto:** habilita queries del PSS real:
 - "Quién está en el vuelo X del día Y" → Query GSI2 ReservationsByFlight (clave para notificaciones proactivas).
-- "Encontrar PNR de Juan Pérez" → Query GSI3 ReservationsByPassenger.
+- "Encontrar PNR de Juan Pérez" → en TP3 era Query GSI ReservationsByPassenger; en TP4 final el GSI fue eliminado porque el canal de call center no se implementó. Si llegara a hacerse, se reintroduce el GSI o se resuelve con Scan + filter para volúmenes bajos.
 - Pasajero CRM separado (`PASSENGER#{dni}`) con back-refs históricos.
 
 ---

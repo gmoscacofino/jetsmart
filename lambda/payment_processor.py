@@ -15,7 +15,7 @@ TP4: las reservas son PNR-céntricas (PSS-like). Cada reserva crea varios items
 en business table:
   PNR#{pnr}/#METADATA       — record locator canónico
   PNR#{pnr}/SEGMENT#{seq}   — tramo del PNR (con gsi2pk para "quién está en X")
-  PNR#{pnr}/PAX#{seq}       — pasajero del PNR (con gsi3pk para buscar por DNI)
+  PNR#{pnr}/PAX#{seq}       — pasajero del PNR (full_name, dni, email, seat, DOB, sexo)
   USER#{uid}/RESERVATION#{pnr}  — thin pointer denormalizado
   PASSENGER#{dni}/#PROFILE  — CRM canónico (upsert)
   PASSENGER#{dni}/PNR#{pnr} — back-ref histórico
@@ -350,7 +350,7 @@ def reserve_booking_handler(event, context):
         "status":         "PENDIENTE",
     })
 
-    # PAX — stampa gsi3pk para "buscar PNR por DNI/email".
+    # PAX — pasajero del PNR.
     # fecha_nacimiento + sexo persisten regulación TSA (DOB/género en boarding pass).
     pax_item = {
         "PK":               f"PNR#{pnr}",
@@ -364,9 +364,6 @@ def reserve_booking_handler(event, context):
         "seat":             seat_id,
         "fecha_nacimiento": fecha_nacimiento,
         "sexo":             sexo,
-        # GSI3: ReservationsByPassenger — KEYS_ONLY, suficiente para resolver PNR
-        "gsi3pk":           f"DNI#{dni}",
-        "gsi3sk":           f"PNR#{pnr}",
     }
     table.put_item(Item=pax_item)
 
@@ -382,15 +379,9 @@ def reserve_booking_handler(event, context):
             "created_at": now,
         })
 
-    # Si tenemos email distinto a DNI, stampar también un alias por email
-    if email:
-        table.put_item(Item={
-            "PK":     f"PNR#{pnr}",
-            "SK":     "PAX#01#EMAILALIAS",
-            "pnr":    pnr,
-            "gsi3pk": f"EMAIL#{email.lower()}",
-            "gsi3sk": f"PNR#{pnr}",
-        })
+    # Nota (TP4 final): el item PAX#01#EMAILALIAS se eliminó junto con el GSI
+    # ReservationsByPassenger. Sólo existía para estampar el alias por email
+    # en ese índice. Sin consumidor del GSI, el alias era código muerto.
 
     # User thin pointer — denormalizado para "mis reservas" en O(1).
     # Vocabulario en español para consistencia con el resto del sistema.

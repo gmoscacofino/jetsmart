@@ -30,7 +30,7 @@ Para llegar al demo presencial del 17/06 incorporamos cinco cambios que cierran 
 | Cambio | Detalle |
 |---|---|
 | **DynamoDB partida en dos tablas single-design** | `jetsmart-prod-conversations` (chatbot state) + `jetsmart-prod-business` (PSS-like). Ver `docs/07-data-layer.md` y justificación #13. |
-| **Reservas migran a PNR-céntrico** | PNR de 6 chars alfanumérico (à la Navitaire). Sub-items `SEGMENT#`, `PAX#`, `BP#`, `EXTRA#`. 2 GSIs en business (`ReservationsByFlight`, `ReservationsByPassenger`). |
+| **Reservas migran a PNR-céntrico** | PNR de 6 chars alfanumérico (à la Navitaire). Sub-items `SEGMENT#`, `PAX#`, `BP#`, `EXTRA#`. 1 GSI en business (`ReservationsByFlight`). |
 | **Derivación a humano (TP1 feature)** | Nueva tool `escalate_to_human` en `chat_handler` → SQS `human-handoff` → Lambda `human_handoff_processor` (mock call center) → SNS notifications. Ver Flujo 7 en `docs/04-flujos.md`. |
 | **Notificaciones proactivas event-driven (TP1 feature)** | Ops cambia `estado_vuelo=CANCELADO` en business table → DynamoDB Stream → Lambda `flight_cancellation_detector` → SNS `flight-events` → SQS `proactive-notifications` → Lambda → Query GSI `ReservationsByFlight` → fan-out de emails. Ver Flujo 8 en `docs/04-flujos.md` y justificación #28. |
 | **Boarding pass async via SQS** | Step Functions PostBookingActions ya no invoca Lambda directo — publica a SQS `boarding-pass-generation`; nueva Lambda `boarding_pass_async` consume y graba `bp_url` en PNR. Fire-and-forget + DLQ. |

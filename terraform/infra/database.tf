@@ -59,14 +59,16 @@ resource "aws_dynamodb_table" "conversations" {
 #   CLAIM#{id}             / #METADATA                  — reclamo canónico
 #   USER#{id}              / CLAIM#{id}                  — thin pointer "mis reclamos"
 #
-# 2 GSIs:
-#   GSI1 ReservationsByFlight — "quiénes están en el vuelo X del día Y" (proactive notifications)
-#   GSI2 ReservationsByPassenger — buscar PNR por DNI o email (call center)
+# 1 GSI:
+#   ReservationsByFlight — "quiénes están en el vuelo X del día Y" (proactive notifications)
 #
-# (En TP4 había un tercer GSI FlightByNumber para consultar vuelos por número +
-# fecha. Lo usaba el script cancel_flight.py — al volcar el trigger a DynamoDB
-# Streams el GSI quedó sin consumidor en runtime. Eliminado para no pagar WCU
-# de escrituras replicadas a un índice sin uso.)
+# (En TP4 inicial había dos GSIs adicionales:
+#  - FlightByNumber: lo usaba scripts/cancel_flight.py. Al volcar el trigger a
+#    DynamoDB Streams el GSI quedó sin consumidor → eliminado.
+#  - ReservationsByPassenger: pensado para un canal de call center que buscara
+#    PNRs por DNI/email. El canal nunca se implementó — eliminado para no
+#    pagar WCU de escrituras al GSI ni mantener el item PAX#01#EMAILALIAS
+#    que solo existía para ese índice.)
 
 resource "aws_dynamodb_table" "business" {
   name         = "${local.name_prefix}-business"
@@ -91,7 +93,8 @@ resource "aws_dynamodb_table" "business" {
     type = "S"
   }
 
-  # GSI1: "quiénes están afectados por una cancelación de vuelo X / fecha Y"
+  # GSI ReservationsByFlight — "quiénes están afectados por una cancelación
+  # de vuelo X / fecha Y" (consumido por proactive_notifications)
   attribute {
     name = "gsi2pk"
     type = "S"
@@ -102,21 +105,9 @@ resource "aws_dynamodb_table" "business" {
     type = "S"
   }
 
-  # GSI2: buscar PNR por identificador del pasajero (DNI o email)
-  attribute {
-    name = "gsi3pk"
-    type = "S"
-  }
-
-  attribute {
-    name = "gsi3sk"
-    type = "S"
-  }
-
-  # Nota: los nombres lógicos gsi2pk/gsi2sk/gsi3pk/gsi3sk se mantuvieron tras
-  # eliminar el GSI1 FlightByNumber para no requerir migración de los ítems
-  # ya escritos en la tabla. Renombrarlos a gsi1pk/gsi1sk implicaría
-  # reescribir todos los items con gsi2pk/gsi3pk — costo grande sin beneficio.
+  # Nota: el nombre lógico gsi2pk se mantuvo tras eliminar GSI1 FlightByNumber
+  # y GSI3 ReservationsByPassenger (TP4 final) para no requerir reescritura de
+  # ítems existentes que ya tienen el atributo estampado.
 
   global_secondary_index {
     name            = "ReservationsByFlight"
@@ -131,13 +122,6 @@ resource "aws_dynamodb_table" "business" {
       "origen",
       "destino",
     ]
-  }
-
-  global_secondary_index {
-    name            = "ReservationsByPassenger"
-    hash_key        = "gsi3pk"
-    range_key       = "gsi3sk"
-    projection_type = "KEYS_ONLY"
   }
 
   point_in_time_recovery {

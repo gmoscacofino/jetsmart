@@ -169,7 +169,7 @@ Si S3 falla (caso muy raro), el mensaje vuelve a SQS para reintento. Después de
 | 26b | **SQS — proactive-notifications + DLQ (TP4)** | Mensajería | SNS flight-events → fan-out de emails. DLQ con CloudWatch alarm. |
 | 26c | **SQS — boarding-pass-generation + DLQ (TP4)** | Mensajería | Saga → boarding pass async. DLQ con alarm. |
 | 27a | **DynamoDB — conversations (TP4)** | Base de datos | Single Table Design: sesiones, mensajes, perfil chat-scoped, handoffs. TTL en todos los items. |
-| 27b | **DynamoDB — business (TP4, PSS-like)** | Base de datos | Single Table Design PNR-céntrico: FLIGHT#, PNR#/SEGMENT#/PAX#/BP#, PASSENGER#, CLAIM#. 2 GSIs (ReservationsByFlight, ReservationsByPassenger). Stream habilitado (NEW_AND_OLD_IMAGES) para flight_cancellation_detector. |
+| 27b | **DynamoDB — business (TP4, PSS-like)** | Base de datos | Single Table Design PNR-céntrico: FLIGHT#, PNR#/SEGMENT#/PAX#/BP#/EXTRA#, PASSENGER#, CLAIM#. 1 GSI (ReservationsByFlight). Stream habilitado (NEW_AND_OLD_IMAGES) para flight_cancellation_detector. |
 | 28 | Glue Catalog Database | Catálogo | Schema descubierto del bucket de eventos. |
 | 29 | Glue Crawler | Catálogo | Corre cada hora, descubre nuevas particiones y campos. |
 | 30 | Athena Workgroup | Consultas | Endpoint SQL para el equipo de business analytics. |

@@ -1,6 +1,6 @@
 # 07 — Capa de datos: DynamoDB (dos tablas, bounded contexts) + Data Lake (S3 + Athena)
 
-> **Cambio TP4:** la única tabla DynamoDB del TP3 se separó en **dos tablas single-design**, una por bounded context. El esquema de reservas migró a un patrón **PNR-céntrico** (record locator de 6 chars, à la Navitaire/Amadeus), con 3 GSIs en la tabla de negocio.
+> **Cambio TP4:** la única tabla DynamoDB del TP3 se separó en **dos tablas single-design**, una por bounded context. El esquema de reservas migró a un patrón **PNR-céntrico** (record locator de 6 chars, à la Navitaire/Amadeus), con 1 GSI en la tabla de negocio.
 
 ---
 
@@ -46,7 +46,7 @@ Estado efímero del chatbot. PK/SK, **sin GSIs**, TTL en todos los items.
 
 ### Tabla 2 — `jetsmart-prod-business` (PSS-like)
 
-Estado persistente del dominio. PK/SK, **2 GSIs**, **DynamoDB Stream habilitado** (`NEW_AND_OLD_IMAGES`), sin TTL.
+Estado persistente del dominio. PK/SK, **1 GSI**, **DynamoDB Stream habilitado** (`NEW_AND_OLD_IMAGES`), sin TTL.
 
 | Entidad | PK | SK | Descripción |
 |---|---|---|---|
@@ -54,7 +54,7 @@ Estado persistente del dominio. PK/SK, **2 GSIs**, **DynamoDB Stream habilitado*
 | **Vuelo — inventario de asientos (TP4)** | `FLIGHT#{origen}#{destino}` | `DATE#{fecha}#FLIGHT#{vuelo_numero}#SEAT#{row}{letter}` | Ítem individual por asiento (120 por vuelo). Reserva atómica via ConditionExpression. Soporta soft-hold via `held_by` + `hold_expires_at`. |
 | **PNR canónico (TP4)** | `PNR#{pnr}` | `#METADATA` | Record locator (6 chars, ej `JS7K2P`) con `user_id`, `status`, `total`, `tarifa`, `pasajeros` |
 | **PNR segment (TP4)** | `PNR#{pnr}` | `SEGMENT#{seq}#{vuelo}#{fecha}` | Leg del PNR (incluye `gsi2pk` para "quién está en vuelo X") |
-| **PNR passenger (TP4)** | `PNR#{pnr}` | `PAX#{seq}` | Pasajero del PNR (incluye `gsi3pk` para buscar por DNI). Persiste `fecha_nacimiento` + `sexo`. |
+| **PNR passenger (TP4)** | `PNR#{pnr}` | `PAX#{seq}` | Pasajero del PNR. Persiste `fecha_nacimiento` + `sexo`. |
 | **PNR boarding pass (TP4)** | `PNR#{pnr}` | `BP#{seq}` | Referencia al BP en S3 (`s3_key`, `bp_url`, `issued_at`) |
 | **PNR extras (TP4 final)** | `PNR#{pnr}` | `EXTRA#{nn:02d}` | Cada extra contratado como ítem individual (`extra_type`, `amount`). Habilita auditoría por PNR. |
 | **User reservation pointer (TP4)** | `USER#{user_id}` | `RESERVATION#{pnr}` | Thin pointer denormalizado para "mis reservas" (vocabulario en español) |
@@ -70,11 +70,13 @@ Estado persistente del dominio. PK/SK, **2 GSIs**, **DynamoDB Stream habilitado*
 | GSI | HK (`gsi*pk`) | RK (`gsi*sk`) | Projection | Caller |
 |---|---|---|---|---|
 | **`ReservationsByFlight`** | `FLIGHT#{vuelo}#{fecha}` | `PNR#{pnr}` | INCLUDE (user_id, email, passenger_name, status) | `proactive_notifications` — "qué pasajeros tengo en el vuelo cancelado" |
-| **`ReservationsByPassenger`** | `DNI#{dni}` o `EMAIL#{email}` | `PNR#{pnr}` | KEYS_ONLY | call center / chatbot — buscar PNR por DNI/email del pasajero |
+> **El único GSI de TP4 final es `ReservationsByFlight`.** Sin él, encontrar "todos los PNRs en el vuelo JA203 del 2026-06-20" requiere Scan O(n) sobre la tabla entera. Con el GSI es una sola Query O(log n) — el atributo `gsi2pk` se estampa en cada SEGMENT# al crear el booking.
 
-> **El GSI clave de TP4 es `ReservationsByFlight`.** Sin él, encontrar "todos los PNRs en el vuelo JA203 del 2026-06-20" requiere Scan O(n) sobre la tabla entera. Con el GSI es una sola Query O(log n) — el atributo `gsi2pk` se estampa en cada SEGMENT# al crear el booking.
-
-> **Histórico:** TP4 inicial tenía un tercer GSI `FlightByNumber` para consultar vuelos por número+fecha desde el script `cancel_flight.py`. Al pasar el trigger a DynamoDB Streams (justificación #28) el GSI quedó sin consumidor en runtime. Eliminado para no replicar WCU a un índice ocioso. Los nombres `gsi2pk`/`gsi3pk` se mantienen tal cual para no requerir reescritura de ítems.
+> **Histórico:** TP4 inicial tenía dos GSIs adicionales que se eliminaron en TP4 final:
+> - `FlightByNumber`: lo usaba `scripts/cancel_flight.py`. Al volcar el trigger a DynamoDB Streams quedó sin consumidor en runtime.
+> - `ReservationsByPassenger`: pensado para un canal de call center que buscara PNRs por DNI/email. El canal nunca se implementó. El ítem `PAX#01#EMAILALIAS` que solo existía para alimentar este GSI también se eliminó.
+>
+> Ambos se sacaron para no replicar WCU a índices ociosos. El nombre lógico `gsi2pk` se mantiene tal cual para no requerir reescritura de ítems.
 
 ---
 
@@ -124,7 +126,7 @@ El modelo TP4 invierte la jerarquía: **el PNR es la entidad canónica**, y `USE
 |---|---|---|---|---|---|
 | AP17 | Crear PNR canónico (atomic, idempotente) | payment_processor (`reserve_booking`) | PutItem + `ConditionExpression: attribute_not_exists(PK)` | `PNR#{pnr}` | `#METADATA` |
 | AP18 | Crear SEGMENT del PNR (con gsi2pk para "quién está en vuelo X") | payment_processor (`reserve_booking`) | PutItem | `PNR#{pnr}` | `SEGMENT#{seq}#{vuelo}#{fecha}` |
-| AP19 | Crear PAX del PNR (con `fecha_nacimiento`, `sexo`, gsi3pk para buscar por DNI) | payment_processor (`reserve_booking`) | PutItem | `PNR#{pnr}` | `PAX#{seq}` |
+| AP19 | Crear PAX del PNR (`fecha_nacimiento`, `sexo`, `seat`, etc.) | payment_processor (`reserve_booking`) | PutItem | `PNR#{pnr}` | `PAX#{seq}` |
 | AP20 | Persistir extras del PNR (1 ítem por extra) | payment_processor (`reserve_booking`) | PutItem por extra | `PNR#{pnr}` | `EXTRA#{nn:02d}` |
 | AP21 | Crear thin pointer "mis reservas" | payment_processor (`reserve_booking`) | PutItem | `USER#{userId}` | `RESERVATION#{pnr}` |
 | AP22 | Upsert pasajero CRM + back-ref | payment_processor (`reserve_booking`) | UpdateItem + PutItem | `PASSENGER#{key}` | `#PROFILE` y `PNR#{pnr}` |
@@ -150,12 +152,7 @@ El modelo TP4 invierte la jerarquía: **el PNR es la entidad canónica**, y `USE
 | AP32 | Encontrar PNRs afectados por vuelo cancelado | proactive_notifications | **GSI Query** sobre `ReservationsByFlight` | `gsi2pk = FLIGHT#{vuelo}#{fecha}` | begins_with `PNR#` |
 | AP33 | Marcar PNR como AFFECTED_BY_CANCELLATION | proactive_notifications | UpdateItem | `PNR#{pnr}` | `#METADATA` |
 
-**Tabla business — operaciones de call center (futuro):**
-
-| # | Operación | Lambda | DynamoDB op | PK / Index | SK / condición |
-|---|---|---|---|---|---|
-| AP34 | Buscar PNR por DNI del pasajero | (call center, no implementado) | **GSI Query** sobre `ReservationsByPassenger` | `gsi3pk = DNI#{dni}` | begins_with `PNR#` |
-| AP35 | Buscar PNR por email del pasajero | (call center, no implementado) | **GSI Query** sobre `ReservationsByPassenger` | `gsi3pk = EMAIL#{email}` | begins_with `PNR#` |
+> **Nota:** los access patterns de call center "buscar PNR por DNI/email" (AP34/AP35 en versiones previas del doc) requerían el GSI `ReservationsByPassenger` que se eliminó en TP4 final (sin consumidor en runtime). Si en producción se agregara un canal de call center, se recreará el GSI o se implementará vía Scan + filter para volúmenes bajos.
 
 ---
 
@@ -307,8 +304,6 @@ phone            : teléfono de contacto
 seat             : ID de asiento asignado (ej "12A")
 fecha_nacimiento : "YYYY-MM-DD" — recolectado en PASO 5d para coherencia PSS/TSA
 sexo             : "Masculino" | "Femenino" | "Otro" — PASO 5c
-gsi3pk           : "DNI#{dni}" — para buscar PNR por DNI
-gsi3sk           : "PNR#{pnr}"
 ```
 > Validación server-side en `chat_handler._validate_passenger_input`: rechaza la reserva con error explícito si el formato no cumple. Como tokenizamos PII antes de mandar a Anthropic, Claude solo ve placeholders — la validación de formato es responsabilidad del server (justificación #27).
 
@@ -513,7 +508,7 @@ El PNR se genera con SHA-256 del `payment_id` en `chat_handler.py` ANTES de inic
 | Billing mode | PAY_PER_REQUEST | Tráfico irregular — no pagar por capacidad ociosa |
 | TTL attribute | No tiene | Datos del PSS son persistentes (sin TTL); las reservas no expiran |
 | Encriptación at-rest | AWS managed (`aws/dynamodb`) | KMS implícito, sin costo |
-| GSIs | 2 (ReservationsByFlight, ReservationsByPassenger) | Resuelven AP32-AP35 sin Scan |
+| GSIs | 1 (ReservationsByFlight) | Resuelve AP32 (fan-out de cancelaciones) sin Scan |
 | **Stream** | **Habilitado, `NEW_AND_OLD_IMAGES`** | Consumido por `flight_cancellation_detector` con filter_criteria. Permite comparar transiciones (no re-cancelaciones). |
 | Point-in-time recovery | Habilitado | Recuperación granular hasta 35 días atrás |
 | Backups | EventBridge cron diario → `ExportTableToPointInTime` → S3 `backups` | Retención larga (AFIP 10 años) — complementa PITR |
