@@ -37,7 +37,11 @@ MSG_TTL_SECONDS = 7 * 24 * 3600
 HANDOFF_TTL_SECONDS = 30 * 24 * 3600
 MAX_TOOL_ROUNDS = 5
 HOLD_TTL_SECONDS = 600  # 10 minutos — soft-hold de asiento mientras el user completa la reserva
-PII_TOKEN_SECRET = os.environ.get("PII_TOKEN_SECRET", "jetsmart-prod-pii-default-key-2026")  # HMAC key para tokens PII estables por sesión
+
+# HMAC key para tokens PII estables por sesión. Generada por random_password
+# en Terraform (terraform/infra/secrets.tf) e inyectada como env var.
+# Sin fallback: fail-fast en cold start si no está configurada.
+PII_TOKEN_SECRET = os.environ["PII_TOKEN_SECRET"]
 
 # Inicialización eager: ocurre en el cold start, no en el primer request.
 def _init_anthropic() -> anthropic.Anthropic:

@@ -31,6 +31,7 @@ module "chatbot_lambda" {
   environment           = var.environment
   frontend_url          = "http://${aws_s3_bucket_website_configuration.frontend.website_endpoint}"
   cognito_user_pool_arn = module.auth.user_pool_arn
+  pii_token_secret      = random_password.pii_token_secret.result
 
   depends_on = [
     aws_dynamodb_table.conversations,

@@ -59,3 +59,9 @@ variable "cognito_user_pool_arn" {
   description = "Cognito User Pool ARN — usado por el API Gateway Cognito Authorizer"
   type        = string
 }
+
+variable "pii_token_secret" {
+  description = "Clave HMAC para tokenizar PII en chat_handler antes de mandar a la API de Anthropic. Generada con random_password en el root module."
+  type        = string
+  sensitive   = true
+}
