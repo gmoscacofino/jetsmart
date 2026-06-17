@@ -30,9 +30,9 @@ Para llegar al demo presencial del 17/06 incorporamos cinco cambios que cierran 
 | Cambio | Detalle |
 |---|---|
 | **DynamoDB partida en dos tablas single-design** | `jetsmart-prod-conversations` (chatbot state) + `jetsmart-prod-business` (PSS-like). Ver `docs/07-data-layer.md` y justificación #13. |
-| **Reservas migran a PNR-céntrico** | PNR de 6 chars alfanumérico (à la Navitaire). Sub-items `SEGMENT#`, `PAX#`, `BP#`. 3 GSIs en business (`FlightByNumber`, `ReservationsByFlight`, `ReservationsByPassenger`). |
+| **Reservas migran a PNR-céntrico** | PNR de 6 chars alfanumérico (à la Navitaire). Sub-items `SEGMENT#`, `PAX#`, `BP#`, `EXTRA#`. 2 GSIs en business (`ReservationsByFlight`, `ReservationsByPassenger`). |
 | **Derivación a humano (TP1 feature)** | Nueva tool `escalate_to_human` en `chat_handler` → SQS `human-handoff` → Lambda `human_handoff_processor` (mock call center) → SNS notifications. Ver Flujo 7 en `docs/04-flujos.md`. |
-| **Notificaciones proactivas (TP1 feature)** | Script offline `scripts/cancel_flight.py` → SNS `flight-events` → SQS `proactive-notifications` → Lambda → Query GSI2 → fan-out de emails. Ver Flujo 8 en `docs/04-flujos.md`. **No se dispara en vivo durante la demo** — se ejecuta antes y se muestra en CloudWatch logs. |
+| **Notificaciones proactivas event-driven (TP1 feature)** | Ops cambia `estado_vuelo=CANCELADO` en business table → DynamoDB Stream → Lambda `flight_cancellation_detector` → SNS `flight-events` → SQS `proactive-notifications` → Lambda → Query GSI `ReservationsByFlight` → fan-out de emails. Ver Flujo 8 en `docs/04-flujos.md` y justificación #28. |
 | **Boarding pass async via SQS** | Step Functions PostBookingActions ya no invoca Lambda directo — publica a SQS `boarding-pass-generation`; nueva Lambda `boarding_pass_async` consume y graba `bp_url` en PNR. Fire-and-forget + DLQ. |
 | **3 SQS + DLQs nuevas + 1 SNS nuevo + 3 CloudWatch alarms** | Patrón consistente con el SQS de analytics. Ver `terraform/infra/messaging.tf` y `cloudwatch.tf`. |
 
@@ -125,16 +125,22 @@ En el chat: "quiero hablar con un humano"
    - Email recibido en la subscription de SNS notifications
 ```
 
-**2) Notificaciones proactivas (offline, antes del demo):**
+**2) Notificaciones proactivas (event-driven):**
 ```bash
-cd terraform/infra
-export BUSINESS_TABLE_NAME=$(terraform output -raw business_table_name)
-export SNS_FLIGHT_EVENTS_ARN=$(terraform output -raw sns_flight_events_arn)
-python3 ../../scripts/cancel_flight.py JA203 2026-06-20 "mal tiempo en Mendoza"
+# Cancelar el vuelo desde la consola DynamoDB o vía CLI: UpdateItem sobre el
+# master row FLIGHT# poniendo estado_vuelo=CANCELADO. El DynamoDB Stream
+# dispara el flujo completo automáticamente.
+aws dynamodb update-item \
+  --table-name jetsmart-prod-business --region us-east-1 \
+  --key '{"PK":{"S":"FLIGHT#AEP#MDZ"},"SK":{"S":"DATE#2026-06-22#FLIGHT#JA203"}}' \
+  --update-expression "SET estado_vuelo = :s, cancellation_reason = :r" \
+  --expression-attribute-values '{":s":{"S":"CANCELADO"},":r":{"S":"mal tiempo"}}'
+
 → Verificar:
-   - FLIGHTSTATUS actualizado en business table
+   - CloudWatch logs de /aws/lambda/jetsmart-prod-flight-cancellation-detector
+     ("Detected cancellation transition: JA203 ...")
    - CloudWatch logs de /aws/lambda/jetsmart-prod-proactive-notifications
-     mostrando "Query GSI2 ... N PNRs afectados"
+     mostrando "Query GSI ReservationsByFlight ... N PNRs afectados"
    - Emails recibidos por pasajeros con reservas en ese vuelo
 ```
 

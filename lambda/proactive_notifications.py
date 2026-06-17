@@ -6,11 +6,13 @@ cancelado/demorado, hace fan-out de notificaciones a todos los pasajeros con
 PNRs afectados.
 
 Flujo:
-  scripts/cancel_flight.py (o sistema PSS de ops)
+  Ops actualiza estado_vuelo=CANCELADO en business table (consola/dashboard)
+       → DynamoDB Stream
+       → Lambda flight_cancellation_detector
        → SNS flight-events (event_type=flight_cancelled, vuelo, fecha, reason)
        → SQS proactive-notifications
        → este Lambda:
-           1. Query GSI2 ReservationsByFlight con HK=FLIGHT#{vuelo}#{fecha}
+           1. Query GSI ReservationsByFlight con HK=FLIGHT#{vuelo}#{fecha}
               → lista de PNRs afectados (con user_id, email)
            2. Para cada PNR: marcar status=AFFECTED_BY_CANCELLATION
            3. Para cada email único: publicar email vía SNS notifications

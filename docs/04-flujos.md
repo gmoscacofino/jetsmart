@@ -287,7 +287,7 @@ En este TP el "POST al call center" se loguea en CloudWatch como `MOCK POST http
 
 Cuando un vuelo se cancela en el sistema de operaciones, todos los pasajeros afectados reciben automáticamente una notificación por email. Habilita el caso de uso "tormenta cancela vuelo → 5000 pasajeros enterados antes de llegar al aeropuerto".
 
-> **Cambio en TP4 (post-demo):** el trigger pasó de un script manual (`scripts/cancel_flight.py`) a un **DynamoDB Stream + Lambda detector**. Ops solo necesita cambiar el `estado_vuelo` del master row a `CANCELADO` desde la consola DynamoDB (o desde el dashboard interno que conectaría en producción) y el flujo se dispara automáticamente. El script queda como tool de testing local. Ver justificación #28.
+> **Trigger en TP4 final:** **DynamoDB Stream + Lambda detector**. Ops cambia el `estado_vuelo` del master row a `CANCELADO` desde la consola DynamoDB (o el dashboard interno que conectaría en producción) y el flujo se dispara automáticamente. Ver justificación #28.
 
 ```
 [Disparador en producción — sistema de ops o consola DynamoDB]

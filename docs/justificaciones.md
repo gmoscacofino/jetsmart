@@ -219,9 +219,9 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 - (b) Una Lambda cron que escanee la tabla buscando vuelos cancelados → carga el GSI innecesariamente y agrega latencia (los pasajeros se enteran cuando corre la cron, no cuando se canceló).
 - (c) **Event-driven push (elegida)** → el módulo de ops de la aerolínea publica un evento, los suscriptores se enteran al instante.
 
-**Por qué GSI2 ReservationsByFlight:** sin él, encontrar los pasajeros afectados requiere Scan de toda la business table — O(n) lineal. Con GSI2, una sola Query devuelve la lista — O(log n). Es **el habilitador técnico** del feature.
+**Por qué GSI `ReservationsByFlight`:** sin él, encontrar los pasajeros afectados requiere Scan de toda la business table — O(n) lineal. Con el GSI, una sola Query devuelve la lista — O(log n). Es **el habilitador técnico** del feature.
 
-**Demo offline:** el evento de `flight-events` lo publica el módulo de operaciones de la aerolínea cuando marca un vuelo como cancelado. En el TP, ese rol lo cumple el script CLI `scripts/cancel_flight.py` (mismo payload SNS, mismo `UpdateItem` sobre la tabla `business`). El flujo se prueba antes del demo y se muestra el resultado en CloudWatch logs durante la presentación, sin disparar en vivo.
+**Trigger en TP4:** el flujo se dispara automáticamente cuando ops cambia `estado_vuelo=CANCELADO` en el master row del vuelo (consola DynamoDB o dashboard interno). Un DynamoDB Stream sobre la tabla propaga el cambio a la Lambda `flight_cancellation_detector`, que publica al SNS `flight-events`. Ver justificación #28.
 
 ---
 
@@ -453,7 +453,7 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 **Decisión:** habilitamos un Stream en la tabla `business` (`NEW_AND_OLD_IMAGES`) y agregamos una Lambda `flight_cancellation_detector` que consume el stream con `filter_criteria` server-side. Cuando detecta un master row `FLIGHT#` con transición de estado a `CANCELADO`, publica al SNS `flight_events` existente. El resto del flujo downstream (SNS → SQS `proactive_notifications` → Lambda → fan-out de emails) queda intacto.
 
-**Antes:** un script local `scripts/cancel_flight.py` hacía el `UpdateItem` y publicaba al SNS. Trigger manual, fuera del sistema.
+**Antes (TP4 inicial):** un script local `scripts/cancel_flight.py` hacía el `UpdateItem` y publicaba al SNS. Trigger manual, fuera del sistema. **Eliminado en TP4 final** — el único trigger ahora es el Stream.
 
 **Alternativas evaluadas:**
 - (a) Script manual (TP3 → mitad de TP4) → no escala, requiere operador con creds, no se integra con un dashboard de ops real.
@@ -470,7 +470,7 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 **Trade-offs:**
 - ✅ Event-driven real: ahora ops cambia el estado desde cualquier interfaz (consola DynamoDB, otra Lambda, futuro dashboard) y el flujo se dispara solo.
 - ✅ Latencia <1 seg desde el `UpdateItem` hasta la publicación al SNS.
-- ✅ El script `cancel_flight.py` queda como tool de testing local (no se elimina — útil para probar end-to-end sin tocar la consola).
+- ✅ El script `cancel_flight.py` se eliminó: el Stream es ahora el único path. Para testear se hace `UpdateItem` directo desde la consola DynamoDB o CLI — más simple que mantener un script paralelo.
 - ❌ Costo de Stream: ~$0.02 por 100k read requests. Despreciable en sandbox.
 - ❌ Una Lambda más que mantener (16 totales).
 - ❌ El Stream emite TODOS los cambios de la tabla. El `filter_criteria` reduce las invocaciones a las que realmente importan, pero hay costo de read del Stream igualmente.

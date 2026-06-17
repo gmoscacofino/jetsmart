@@ -3,9 +3,9 @@ Flight cancellation detector — consume DynamoDB Stream de la business table
 y dispara el flujo de proactive notifications cuando un master row FLIGHT#
 cambia su estado_vuelo a CANCELADO.
 
-Reemplaza el trigger manual de scripts/cancel_flight.py (que queda como
-herramienta de testing local). En producción, ops cambia el estado del vuelo
-desde su dashboard/consola y el Stream propaga el cambio automáticamente.
+Es el único trigger del flujo proactive notifications en TP4 final. Ops
+cambia el estado del vuelo en la consola DynamoDB o desde su dashboard
+interno y el Stream propaga el cambio automáticamente.
 
 Trigger: DynamoDB Stream con filter_criteria en el event source mapping
 (reduce invocaciones). El handler hace un guard adicional para:

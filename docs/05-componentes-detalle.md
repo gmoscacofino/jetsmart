@@ -27,7 +27,7 @@ Lambda es el servicio de cómputo principal de este proyecto. Cada función Lamb
 | `analytics-processor` | SQS `analytics` | Escribe eventos crudos en S3 `analytics` como JSON Lines particionado por fecha (TP4: ya no escribe a RDS) |
 | `human-handoff-processor` | SQS `human-handoff` (publicado por chat-handler cuando el LLM invoca la tool `escalate_to_human`) | Simula el POST al sistema del call center y actualiza el ticket HANDOFF# en `conversations` a status=ACK |
 | `proactive-notifications` | SQS `proactive-notifications` (suscrita a SNS `flight-events`) | Ante cancelación de vuelo, hace Query a GSI2 para encontrar todos los PNRs afectados y publica un email por usuario |
-| `flight-cancellation-detector` (TP4) | **DynamoDB Stream** de `business` con filter_criteria (eventName=MODIFY, NewImage.estado_vuelo=CANCELADO) | Detecta transición a CANCELADO en master row FLIGHT#, publica `flight_cancelled` al SNS flight-events. Reemplaza el trigger manual de `scripts/cancel_flight.py` |
+| `flight-cancellation-detector` (TP4) | **DynamoDB Stream** de `business` con filter_criteria (eventName=MODIFY, NewImage.estado_vuelo=CANCELADO) | Detecta transición a CANCELADO en master row FLIGHT#, publica `flight_cancelled` al SNS flight-events. Único trigger del flujo en TP4 final. |
 | `auth-callback` | API Gateway GET /callback (bridge HTTPS del workaround) | Intercambia authorization code por tokens JWT y redirige al frontend |
 | `cognito-trigger` | Cognito post-registration | Asigna grupo `users` al usuario nuevo |
 | `backup-dynamodb` | EventBridge cron diario 03:00 UTC | Dispara `dynamodb:ExportTableToPointInTime` sobre `business`; el export queda en S3 `backups`. Mecanismo complementario a PITR (35d continuos), cubre retención AFIP de 10 años |
@@ -114,7 +114,7 @@ SNS es un servicio de pub/sub: un publicador manda un mensaje al topic y todos l
 |---|---|---|
 | `events` | `chat-handler` (mensajes de chat) y `payment-confirm` (compras completadas) | SQS `analytics` |
 | `notifications` | Lambdas (`notification`, `human-handoff-processor`, `proactive-notifications`, etc.) y CloudWatch Alarms | Endpoints email suscritos manualmente con `aws sns subscribe` (el topic acepta también SMS u otros protocolos sin cambios de código si se quisiera sumarlos) |
-| `flight-events` | Script ops `scripts/cancel_flight.py` cuando un vuelo cambia de estado (cancelado, demorado, gate change) | SQS `proactive-notifications` |
+| `flight-events` | Lambda `flight-cancellation-detector` cuando detecta una transición de `estado_vuelo` a CANCELADO vía DynamoDB Stream | SQS `proactive-notifications` |
 
 ### Por qué tres topics y no uno solo
 
@@ -122,7 +122,7 @@ Cada topic representa un **dominio de eventos** distinto y tiene consumidores di
 
 - `events` → analytics interno (data lake)
 - `notifications` → comunicación saliente al usuario y al equipo de operaciones (alarmas)
-- `flight-events` → publicado por el módulo de operaciones de la aerolínea cuando un vuelo cambia de estado (cancelación, demora, gate change). En el TP el publisher es el script `scripts/cancel_flight.py`.
+- `flight-events` → publicado por el módulo de operaciones de la aerolínea cuando un vuelo cambia de estado (cancelación, demora, gate change). En TP4 el publisher es la Lambda `flight-cancellation-detector` triggered por DynamoDB Stream: ops solo modifica el ítem en la tabla y el resto del flujo se dispara automáticamente.
 
 Unificar todo en un solo topic acoplaría dominios sin necesidad y haría que cada consumer tuviera que filtrar mensajes por `event_type` — antipatrón. Topics separados dejan que cada consumer se suscriba solo a lo que le importa.
 

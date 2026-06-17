@@ -60,15 +60,16 @@ Estado persistente del dominio. PK/SK, **3 GSIs**, sin TTL.
 | **Claim canónico (TP4)** | `CLAIM#{claim_id}` | `#METADATA` | Reclamo (movido desde USER#) |
 | **User claim pointer (TP4)** | `USER#{user_id}` | `CLAIM#{claim_id}` | Thin pointer "mis reclamos" |
 
-### GSIs de la business table (3)
+### GSIs de la business table (2)
 
 | GSI | HK (`gsi*pk`) | RK (`gsi*sk`) | Projection | Caller |
 |---|---|---|---|---|
-| **GSI1 `FlightByNumber`** | `vuelo_numero` | `fecha` | INCLUDE (estado_vuelo, puerta, demora, horario_real, origen, destino) | chat_handler para status, `cancel_flight.py` para localizar el FLIGHT a marcar |
-| **GSI2 `ReservationsByFlight`** | `FLIGHT#{vuelo}#{fecha}` | `PNR#{pnr}` | INCLUDE (user_id, email, passenger_name, status) | `proactive_notifications` — "qué pasajeros tengo en el vuelo cancelado" |
-| **GSI3 `ReservationsByPassenger`** | `DNI#{dni}` o `EMAIL#{email}` | `PNR#{pnr}` | KEYS_ONLY | call center / chatbot — buscar PNR por DNI/email del pasajero |
+| **`ReservationsByFlight`** | `FLIGHT#{vuelo}#{fecha}` | `PNR#{pnr}` | INCLUDE (user_id, email, passenger_name, status) | `proactive_notifications` — "qué pasajeros tengo en el vuelo cancelado" |
+| **`ReservationsByPassenger`** | `DNI#{dni}` o `EMAIL#{email}` | `PNR#{pnr}` | KEYS_ONLY | call center / chatbot — buscar PNR por DNI/email del pasajero |
 
-> **El GSI clave de TP4 es GSI2.** Sin él, encontrar "todos los PNRs en el vuelo JA203 del 2026-06-20" requiere Scan O(n) sobre la tabla entera. Con GSI2 es una sola Query O(log n) — el atributo `gsi2pk` se estampa en cada SEGMENT# al crear el booking.
+> **El GSI clave de TP4 es `ReservationsByFlight`.** Sin él, encontrar "todos los PNRs en el vuelo JA203 del 2026-06-20" requiere Scan O(n) sobre la tabla entera. Con el GSI es una sola Query O(log n) — el atributo `gsi2pk` se estampa en cada SEGMENT# al crear el booking.
+
+> **Histórico:** TP4 inicial tenía un tercer GSI `FlightByNumber` para consultar vuelos por número+fecha desde el script `cancel_flight.py`. Al pasar el trigger a DynamoDB Streams (justificación #28) el GSI quedó sin consumidor en runtime. Eliminado para no replicar WCU a un índice ocioso. Los nombres `gsi2pk`/`gsi3pk` se mantienen tal cual para no requerir reescritura de ítems.
 
 ---
 

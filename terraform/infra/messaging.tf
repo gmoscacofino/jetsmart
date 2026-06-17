@@ -27,9 +27,9 @@ resource "aws_sns_topic_subscription" "notifications_email" {
 
 # ── SNS: topic de eventos de operaciones (vuelos) ─────────────────────────────
 #
-# Publicado por el sistema de operaciones de JetSmart (en este TP: script
-# scripts/cancel_flight.py) cuando un vuelo cambia de estado (cancelado,
-# demorado, gate change). Consumido por la cola proactive-notifications, que
+# Publicado por la Lambda flight_cancellation_detector cuando el DynamoDB
+# Stream de business señala una transición de estado_vuelo a CANCELADO en
+# un master row FLIGHT#. Consumido por la cola proactive-notifications, que
 # dispara la Lambda proactive_notifications para hacer fan-out de emails a los
 # pasajeros afectados.
 

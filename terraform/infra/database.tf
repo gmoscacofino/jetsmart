@@ -59,10 +59,14 @@ resource "aws_dynamodb_table" "conversations" {
 #   CLAIM#{id}             / #METADATA                  — reclamo canónico
 #   USER#{id}              / CLAIM#{id}                  — thin pointer "mis reclamos"
 #
-# 3 GSIs:
-#   GSI1 FlightByNumber       — consulta status por número de vuelo + fecha
-#   GSI2 ReservationsByFlight — "quiénes están en el vuelo X del día Y" (proactive notifications)
-#   GSI3 ReservationsByPassenger — buscar PNR por DNI o email (call center)
+# 2 GSIs:
+#   GSI1 ReservationsByFlight — "quiénes están en el vuelo X del día Y" (proactive notifications)
+#   GSI2 ReservationsByPassenger — buscar PNR por DNI o email (call center)
+#
+# (En TP4 había un tercer GSI FlightByNumber para consultar vuelos por número +
+# fecha. Lo usaba el script cancel_flight.py — al volcar el trigger a DynamoDB
+# Streams el GSI quedó sin consumidor en runtime. Eliminado para no pagar WCU
+# de escrituras replicadas a un índice sin uso.)
 
 resource "aws_dynamodb_table" "business" {
   name         = "${local.name_prefix}-business"
@@ -87,18 +91,7 @@ resource "aws_dynamodb_table" "business" {
     type = "S"
   }
 
-  # GSI1: estado de vuelo por número + fecha
-  attribute {
-    name = "vuelo_numero"
-    type = "S"
-  }
-
-  attribute {
-    name = "fecha"
-    type = "S"
-  }
-
-  # GSI2: "quiénes están afectados por una cancelación de vuelo X / fecha Y"
+  # GSI1: "quiénes están afectados por una cancelación de vuelo X / fecha Y"
   attribute {
     name = "gsi2pk"
     type = "S"
@@ -109,7 +102,7 @@ resource "aws_dynamodb_table" "business" {
     type = "S"
   }
 
-  # GSI3: buscar PNR por identificador del pasajero (DNI o email)
+  # GSI2: buscar PNR por identificador del pasajero (DNI o email)
   attribute {
     name = "gsi3pk"
     type = "S"
@@ -120,20 +113,10 @@ resource "aws_dynamodb_table" "business" {
     type = "S"
   }
 
-  global_secondary_index {
-    name            = "FlightByNumber"
-    hash_key        = "vuelo_numero"
-    range_key       = "fecha"
-    projection_type = "INCLUDE"
-    non_key_attributes = [
-      "estado_vuelo",
-      "horario_salida_real",
-      "puerta",
-      "demora_minutos",
-      "origen",
-      "destino",
-    ]
-  }
+  # Nota: los nombres lógicos gsi2pk/gsi2sk/gsi3pk/gsi3sk se mantuvieron tras
+  # eliminar el GSI1 FlightByNumber para no requerir migración de los ítems
+  # ya escritos en la tabla. Renombrarlos a gsi1pk/gsi1sk implicaría
+  # reescribir todos los items con gsi2pk/gsi3pk — costo grande sin beneficio.
 
   global_secondary_index {
     name            = "ReservationsByFlight"

@@ -210,7 +210,7 @@ resource "aws_lambda_event_source_mapping" "proactive_notifications_sqs" {
 #
 # Consume el Stream de business table y publica al SNS flight-events cuando
 # detecta una transición de estado_vuelo a CANCELADO en un master row FLIGHT#.
-# Reemplaza el trigger manual de scripts/cancel_flight.py. El resto del flujo
+# Único trigger del flujo en TP4 final. El resto del flujo
 # (SNS → SQS proactive-notifications → Lambda → emails) queda igual.
 
 data "archive_file" "flight_cancellation_detector" {
