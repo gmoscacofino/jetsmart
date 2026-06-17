@@ -40,25 +40,30 @@ Estado efímero del chatbot. PK/SK, **sin GSIs**, TTL en todos los items.
 | Perfil chat-scoped | `USER#{user_id}` | `#METADATA` | 30d | Email + last_seen — fuente para el LLM context |
 | **Handoff ticket (TP4)** | `SESSION#{session_id}` | `HANDOFF#{ts}#{handoff_id}` | 30d | Ticket de derivación a humano (status=QUEUED → ACK) |
 | **Handoff pointer (TP4)** | `USER#{user_id}` | `HANDOFF#{handoff_id}` | 30d | Thin pointer para "mis tickets de soporte" |
+| **Token PII (TP4 final)** | `SESSION#{session_id}` | `TOKEN#<placeholder>` | 24h | Mapping reversible token→valor real para tokenización de PII hacia Anthropic. Ver justificación #27. |
 
 ---
 
 ### Tabla 2 — `jetsmart-prod-business` (PSS-like)
 
-Estado persistente del dominio. PK/SK, **3 GSIs**, sin TTL.
+Estado persistente del dominio. PK/SK, **2 GSIs**, **DynamoDB Stream habilitado** (`NEW_AND_OLD_IMAGES`), sin TTL.
 
 | Entidad | PK | SK | Descripción |
 |---|---|---|---|
-| Vuelo (inventario) | `FLIGHT#{origen}#{destino}` | `DATE#{fecha}#FLIGHT#{vuelo_numero}` | Schedule + status + asientos |
-| **PNR canónico (TP4)** | `PNR#{pnr}` | `#METADATA` | Record locator (6 chars, ej `JS7K2P`) con `user_id`, `status`, `total` |
+| **Vuelo — master row** | `FLIGHT#{origen}#{destino}` | `DATE#{fecha}#FLIGHT#{vuelo_numero}` | Schedule + status + precio. Disparador del Stream cuando `estado_vuelo` pasa a CANCELADO. |
+| **Vuelo — inventario de asientos (TP4)** | `FLIGHT#{origen}#{destino}` | `DATE#{fecha}#FLIGHT#{vuelo_numero}#SEAT#{row}{letter}` | Ítem individual por asiento (120 por vuelo). Reserva atómica via ConditionExpression. Soporta soft-hold via `held_by` + `hold_expires_at`. |
+| **PNR canónico (TP4)** | `PNR#{pnr}` | `#METADATA` | Record locator (6 chars, ej `JS7K2P`) con `user_id`, `status`, `total`, `tarifa`, `pasajeros` |
 | **PNR segment (TP4)** | `PNR#{pnr}` | `SEGMENT#{seq}#{vuelo}#{fecha}` | Leg del PNR (incluye `gsi2pk` para "quién está en vuelo X") |
-| **PNR passenger (TP4)** | `PNR#{pnr}` | `PAX#{seq}` | Pasajero del PNR (incluye `gsi3pk` para buscar por DNI) |
+| **PNR passenger (TP4)** | `PNR#{pnr}` | `PAX#{seq}` | Pasajero del PNR (incluye `gsi3pk` para buscar por DNI). Persiste `fecha_nacimiento` + `sexo`. |
 | **PNR boarding pass (TP4)** | `PNR#{pnr}` | `BP#{seq}` | Referencia al BP en S3 (`s3_key`, `bp_url`, `issued_at`) |
-| **User reservation pointer (TP4)** | `USER#{user_id}` | `RESERVATION#{pnr}` | Thin pointer denormalizado para "mis reservas" |
+| **PNR extras (TP4 final)** | `PNR#{pnr}` | `EXTRA#{nn:02d}` | Cada extra contratado como ítem individual (`extra_type`, `amount`). Habilita auditoría por PNR. |
+| **User reservation pointer (TP4)** | `USER#{user_id}` | `RESERVATION#{pnr}` | Thin pointer denormalizado para "mis reservas" (vocabulario en español) |
 | **Passenger CRM (TP4)** | `PASSENGER#{dni}` | `#PROFILE` | Frequent flyer canónico (full_name, email, phone, total_bookings) |
 | **Passenger booking history (TP4)** | `PASSENGER#{dni}` | `PNR#{pnr}` | Back-ref histórico |
 | **Claim canónico (TP4)** | `CLAIM#{claim_id}` | `#METADATA` | Reclamo (movido desde USER#) |
 | **User claim pointer (TP4)** | `USER#{user_id}` | `CLAIM#{claim_id}` | Thin pointer "mis reclamos" |
+
+> **DynamoDB Stream:** habilitado con `stream_view_type = NEW_AND_OLD_IMAGES`. Consumido por `flight_cancellation_detector` con `filter_criteria` para invocarse solo en transiciones `estado_vuelo → CANCELADO`. Ver justificación #28.
 
 ### GSIs de la business table (2)
 
@@ -87,24 +92,70 @@ El modelo TP4 invierte la jerarquía: **el PNR es la entidad canónica**, y `USE
 
 ### Access patterns — todas las operaciones de la aplicación
 
+**Tabla conversations:**
+
 | # | Operación | Lambda | DynamoDB op | PK | SK / condición |
 |---|---|---|---|---|---|
 | AP1 | Actualizar perfil (email, last_seen) | chat_handler | UpdateItem | `USER#{userId}` | `#METADATA` |
-| AP2 | Listar pasajeros guardados | chat_handler | Query | `USER#{userId}` | begins_with `PASSENGER#` |
-| AP3 | Auto-guardar pasajero al reservar | payment_processor (ReserveBooking) | UpdateItem | `USER#{userId}` | `PASSENGER#{key}` |
-| AP4 | Leer historial de chat (últimos 40 msgs) | chat_handler | Query | `SESSION#{sessionId}` | begins_with `MSG#`, Limit=40, DESC |
-| AP5 | Guardar mensaje en sesión | chat_handler | PutItem | `SESSION#{sessionId}` | `MSG#{ts}#{uuid}` |
-| AP6 | Obtener una reserva por ID | chat_handler | GetItem | `USER#{userId}` | `RESERVATION#{reservationId}` |
-| AP7 | Listar todas las reservas del usuario | chat_handler | Query | `USER#{userId}` | begins_with `RESERVATION#`, Limit=20, DESC |
-| AP8 | Hacer check-in (update de status) | chat_handler | UpdateItem | `USER#{userId}` | `RESERVATION#{reservationId}` |
-| AP9 | Obtener vuelos de una ruta en todas las fechas | chat_handler | Query | `FLIGHT#{origen}#{destino}` | begins_with `DATE#` |
-| AP10 | Obtener vuelo de una ruta en fecha específica | chat_handler / payment_processor | GetItem | `FLIGHT#{origen}#{destino}` | `DATE#{fecha}` |
-| AP11 | Guardar reclamo | chat_handler | PutItem | `USER#{userId}` | `CLAIM#{claimId}` |
-| AP12 | Crear reserva en estado PENDIENTE | payment_processor (ReserveBooking) | PutItem | `USER#{userId}` | `RESERVATION#{reservationId}` |
-| AP13 | Decrementar asientos (atómico) | payment_processor (ReserveFlight) | UpdateItem + ConditionExpression | `FLIGHT#{origen}#{destino}` | `DATE#{fecha}` |
-| AP14 | Confirmar reserva → CONFIRMADA | payment_processor (ConfirmBooking) | UpdateItem | `USER#{userId}` | `RESERVATION#{reservationId}` |
-| AP15 | Cancelar reserva → CANCELADA | payment_processor (CancelBooking) | UpdateItem | `USER#{userId}` | `RESERVATION#{reservationId}` |
-| AP16 | Liberar asientos (rollback) | payment_processor (ReleaseFlight) | UpdateItem | `FLIGHT#{origen}#{destino}` | `DATE#{fecha}` |
+| AP2 | Leer historial de chat (últimos 40 msgs) | chat_handler | Query | `SESSION#{sessionId}` | begins_with `MSG#`, Limit=40, DESC |
+| AP3 | Guardar mensaje en sesión | chat_handler | PutItem | `SESSION#{sessionId}` | `MSG#{ts}#{uuid}` |
+| AP4 | Persistir mapping token PII → valor real | chat_handler (tokenize) | PutItem + TTL 24h | `SESSION#{sessionId}` | `TOKEN#<token>` |
+| AP5 | Resolver token PII a valor real | chat_handler (detokenize) | GetItem | `SESSION#{sessionId}` | `TOKEN#<token>` |
+| AP6 | Guardar handoff ticket + thin pointer | chat_handler (escalate_to_human) | 2× PutItem | `SESSION#{sid}` y `USER#{userId}` | `HANDOFF#...` |
+
+**Tabla business — operaciones de vuelo y asientos:**
+
+| # | Operación | Lambda | DynamoDB op | PK | SK / condición |
+|---|---|---|---|---|---|
+| AP7 | Listar fechas con vuelos en una ruta | chat_handler (`list_flight_dates`) | Query + filtro Python para excluir SEAT# | `FLIGHT#{origen}#{destino}` | begins_with `DATE#` |
+| AP8 | Buscar vuelos de una ruta en fecha + COUNT real de asientos libres | chat_handler (`search_flights`) | Query (master rows) + Query `Select=COUNT` por SEAT# libre | `FLIGHT#{origen}#{destino}` | begins_with `DATE#{fecha}#`, filter `attribute_not_exists(reserved_by)` |
+| AP9 | Listar categorías de asientos libres | chat_handler (`list_available_seats`) | Query + `FilterExpression: attribute_not_exists(reserved_by)` | `FLIGHT#{origen}#{destino}` | begins_with `DATE#{fecha}#FLIGHT#{vuelo}#SEAT#` |
+| AP10 | Get master row del vuelo | payment_processor (`reserve_flight`) | GetItem | `FLIGHT#{origen}#{destino}` | `DATE#{fecha}#FLIGHT#{vuelo}` |
+| AP11 | Reservar seat específico (atómico) | payment_processor (`reserve_flight`) | UpdateItem + `ConditionExpression: attribute_not_exists(reserved_by) AND (attribute_not_exists(held_by) OR held_by = :user OR hold_expires_at <= :now)` | `FLIGHT#{o}#{d}` | `DATE#{f}#FLIGHT#{v}#SEAT#{seat_id}` |
+| AP12 | Hold temporal de seat (10 min TTL) | chat_handler (`hold_seat`) | UpdateItem + ConditionExpression | `FLIGHT#{o}#{d}` | `...#SEAT#{seat_id}` |
+| AP13 | Verificar estado del hold propio | chat_handler (`check_hold_status`) | GetItem | `FLIGHT#{o}#{d}` | `...#SEAT#{seat_id}` |
+| AP14 | Liberar hold (cambio de seat) | chat_handler (`release_hold`) | UpdateItem `REMOVE held_by, hold_expires_at` + ConditionExpression `held_by = :user` | `FLIGHT#{o}#{d}` | `...#SEAT#{seat_id}` |
+| AP15 | Liberar seat reservado (compensación Saga) | payment_processor (`release_flight`) | UpdateItem `REMOVE reserved_by, reserved_at` + ConditionExpression `reserved_by = :owned_pnr` | `FLIGHT#{o}#{d}` | `...#SEAT#{seat_id}` |
+| AP16 | Detectar cancelación de vuelo (Stream) | flight_cancellation_detector | DynamoDB Stream event | — | filter `eventName=MODIFY AND NewImage.estado_vuelo=CANCELADO` |
+
+**Tabla business — operaciones de reserva (PNR-céntrico):**
+
+| # | Operación | Lambda | DynamoDB op | PK | SK / condición |
+|---|---|---|---|---|---|
+| AP17 | Crear PNR canónico (atomic, idempotente) | payment_processor (`reserve_booking`) | PutItem + `ConditionExpression: attribute_not_exists(PK)` | `PNR#{pnr}` | `#METADATA` |
+| AP18 | Crear SEGMENT del PNR (con gsi2pk para "quién está en vuelo X") | payment_processor (`reserve_booking`) | PutItem | `PNR#{pnr}` | `SEGMENT#{seq}#{vuelo}#{fecha}` |
+| AP19 | Crear PAX del PNR (con `fecha_nacimiento`, `sexo`, gsi3pk para buscar por DNI) | payment_processor (`reserve_booking`) | PutItem | `PNR#{pnr}` | `PAX#{seq}` |
+| AP20 | Persistir extras del PNR (1 ítem por extra) | payment_processor (`reserve_booking`) | PutItem por extra | `PNR#{pnr}` | `EXTRA#{nn:02d}` |
+| AP21 | Crear thin pointer "mis reservas" | payment_processor (`reserve_booking`) | PutItem | `USER#{userId}` | `RESERVATION#{pnr}` |
+| AP22 | Upsert pasajero CRM + back-ref | payment_processor (`reserve_booking`) | UpdateItem + PutItem | `PASSENGER#{key}` | `#PROFILE` y `PNR#{pnr}` |
+| AP23 | Confirmar reserva (canónico + thin pointer) | payment_processor (`confirm_booking`) | 2× UpdateItem + `ConditionExpression: status = PENDIENTE AND user_id = :uid` | `PNR#{pnr}` y `USER#{userId}` | `#METADATA` y `RESERVATION#{pnr}` |
+| AP24 | Cancelar reserva (compensación) | payment_processor (`cancel_booking`) | 2× UpdateItem | `PNR#{pnr}` y `USER#{userId}` | `#METADATA` y `RESERVATION#{pnr}` |
+| AP25 | Crear BP del PNR | boarding_pass_async | PutItem | `PNR#{pnr}` | `BP#{seq}` |
+
+**Tabla business — operaciones de consulta del chat:**
+
+| # | Operación | Lambda | DynamoDB op | PK | SK / condición |
+|---|---|---|---|---|---|
+| AP26 | Listar reservas del usuario | chat_handler (`list_user_reservations`) | Query | `USER#{userId}` | begins_with `RESERVATION#`, Limit=20, DESC |
+| AP27 | Obtener una reserva (thin pointer) | chat_handler (`get_reservation`) | GetItem | `USER#{userId}` | `RESERVATION#{pnr}` |
+| AP28 | Hacer check-in (status) | chat_handler (`check_in`) | 2× UpdateItem | `USER#{userId}` y `PNR#{pnr}` | `RESERVATION#{pnr}` y `#METADATA` |
+| AP29 | Obtener boarding pass | chat_handler (`get_boarding_pass`) | GetItem | `PNR#{pnr}` | `BP#{seq}` |
+| AP30 | Listar pasajeros guardados del user | chat_handler (`list_saved_passengers`) | Query del thin pointer + group by passenger_name | `USER#{userId}` | begins_with `RESERVATION#` |
+| AP31 | Crear reclamo | chat_handler (`create_claim`) | 2× PutItem | `CLAIM#{claim_id}` y `USER#{userId}` | `#METADATA` y `CLAIM#{claim_id}` |
+
+**Tabla business — operaciones de notificación proactiva:**
+
+| # | Operación | Lambda | DynamoDB op | PK / Index | SK / condición |
+|---|---|---|---|---|---|
+| AP32 | Encontrar PNRs afectados por vuelo cancelado | proactive_notifications | **GSI Query** sobre `ReservationsByFlight` | `gsi2pk = FLIGHT#{vuelo}#{fecha}` | begins_with `PNR#` |
+| AP33 | Marcar PNR como AFFECTED_BY_CANCELLATION | proactive_notifications | UpdateItem | `PNR#{pnr}` | `#METADATA` |
+
+**Tabla business — operaciones de call center (futuro):**
+
+| # | Operación | Lambda | DynamoDB op | PK / Index | SK / condición |
+|---|---|---|---|---|---|
+| AP34 | Buscar PNR por DNI del pasajero | (call center, no implementado) | **GSI Query** sobre `ReservationsByPassenger` | `gsi3pk = DNI#{dni}` | begins_with `PNR#` |
+| AP35 | Buscar PNR por email del pasajero | (call center, no implementado) | **GSI Query** sobre `ReservationsByPassenger` | `gsi3pk = EMAIL#{email}` | begins_with `PNR#` |
 
 ---
 
@@ -144,6 +195,77 @@ created_at : ISO-8601
 ttl        : epoch seconds — 24h
 ```
 > Mapping reversible entre placeholders y valores reales para la tokenización de PII antes de mandar a la API de Anthropic. Tokens determinísticos por sesión (HMAC) — mismo dato en la misma sesión siempre da el mismo token. Ver justificación #27.
+
+**PNR canónico** (`PNR#{pnr}` / `#METADATA`)
+```
+pnr            : "JS7K2P"
+user_id        : sub del JWT
+status         : "PENDIENTE" → "CONFIRMADA" → "CHECK-IN" | "CANCELADA" | "AFFECTED_BY_CANCELLATION"
+total          : Decimal — calculado server-side via pricing.compute_total
+pasajeros      : entero
+tarifa         : "BASIC" | "LIGHT" | "SMART" | "FULL FLEX"
+email_contacto : email del JWT
+telefono       : teléfono de contacto
+payment_id     : UUID del Saga (para idempotencia y trazabilidad)
+transaction_id : "TX-..." — se setea al confirmar
+created_at     : ISO-8601
+```
+> Atomicidad: `PutItem` con `ConditionExpression: attribute_not_exists(PK)` previene colisión de PNR. Verificación de ownership (`user_id`, `payment_id`) antes de tratar como idempotente.
+
+**PNR segment** (`PNR#{pnr}` / `SEGMENT#{seq}#{vuelo}#{fecha}`)
+```
+seq            : 1 (1 segmento por reserva en TP4; multi-segmento queda como roadmap)
+origen         : código IATA
+destino        : código IATA
+fecha          : "YYYY-MM-DD"
+vuelo_numero   : "JA123"
+cabin          : "ECONOMY"
+fare_class     : "BASIC" | "LIGHT" | "SMART" | "FULL FLEX"
+status         : "PENDIENTE" → "CONFIRMADA"
+gsi2pk         : "FLIGHT#{vuelo}#{fecha}"  ← clave del GSI ReservationsByFlight
+gsi2sk         : "PNR#{pnr}"
+user_id        : sub del JWT (proyectado en el GSI)
+email          : email de contacto (proyectado)
+passenger_name : nombre del pax (proyectado)
+```
+> El GSI `ReservationsByFlight` indexa estos items para responder "quién está en este vuelo" en O(log n). Es el habilitador de las notificaciones proactivas (AP32).
+
+**PNR boarding pass** (`PNR#{pnr}` / `BP#{seq}`)
+```
+seq        : 1
+s3_key     : "PNR#JS7K2P/SEG#01/BP_001.txt"
+bp_url     : presigned S3 URL (no se expone al chat, solo a SES en futuro)
+issued_at  : ISO-8601
+```
+> Generado asincrónicamente por `boarding_pass_async` (Lambda triggered por SQS). Fire-and-forget — si falla, el PNR confirmado sigue siendo válido.
+
+**CRM Passenger** (`PASSENGER#{key}` / `#PROFILE`)
+```
+passenger_name    : nombre completo
+email             : email de contacto (último usado)
+phone             : teléfono (último usado)
+last_booking      : ISO-8601 — última reserva donde apareció este pasajero
+reservation_count : entero (ADD atómico, incrementa por reserva)
+```
+> `key` = `dni` si está disponible, sino `_passenger_key(passenger_name)` (slug). Upsert idempotente.
+
+**CRM Passenger booking history** (`PASSENGER#{key}` / `PNR#{pnr}`)
+```
+pnr : "JS7K2P"
+```
+> Back-ref minimalista: permite query `PASSENGER#{key} begins_with PNR#` para "todas las reservas de este pasajero".
+
+**Handoff ticket** (`SESSION#{sid}` / `HANDOFF#{ts}#{handoff_id}`)
+```
+handoff_id : "HO-XXXXXXXX"
+session_id : referencia a la sesión
+user_id    : sub del JWT
+reason     : motivo libre
+urgency    : "low" | "medium" | "high"
+status     : "QUEUED" → "ACK"
+created_at : ISO-8601
+ttl        : epoch — 30 días
+```
 
 **Thin pointer Reserva de usuario** (`USER#{userId}` / `RESERVATION#{pnr}`)
 ```
@@ -267,50 +389,134 @@ El PNR se genera con SHA-256 del `payment_id` en `chat_handler.py` ANTES de inic
 }
 ```
 
-**Reserva confirmada** (thin pointer en `USER#`; el ítem canónico vive en `PNR#JS7K2P/#METADATA`):
+**Reserva confirmada — thin pointer en `USER#`** (el ítem canónico vive en `PNR#JS7K2P/#METADATA`):
 ```json
 {
   "PK": "USER#us-east-1:a1b2c3d4-e5f6-...",
   "SK": "RESERVATION#JS7K2P",
   "pnr": "JS7K2P",
   "status": "CONFIRMADA",
-  "origin": "AEP",
-  "destination": "MDZ",
-  "flight_number": "JA101",
-  "flight_date": "2026-06-20",
-  "passenger_count": 1,
+  "origen": "AEP",
+  "destino": "MDZ",
+  "vuelo_numero": "JA203",
+  "fecha": "2026-06-22",
+  "pasajeros": 1,
   "tarifa": "SMART",
-  "total": "120",
-  "passenger_name": "Juan Pérez",
-  "created_at": "2026-05-15T14:35:00.123456+00:00"
+  "total": "120.00",
+  "nombre_pasajero": "Juan Pérez",
+  "telefono": "+5491112345678",
+  "email": "juan@example.com",
+  "seat": "12C",
+  "created_at": "2026-06-17T14:35:00.123456+00:00"
 }
 ```
 
-**Vuelo disponible:**
+**Vuelo disponible — master row:**
 ```json
 {
   "PK": "FLIGHT#AEP#MDZ",
-  "SK": "DATE#2026-06-20",
-  "vuelo_numero": "JA101",
-  "precio": "120",
-  "asientos_disponibles": 47,
-  "hora_salida": "08:00",
-  "hora_llegada": "10:10",
-  "duracion": "2h 10m",
-  "aerolinea": "JetSmart"
+  "SK": "DATE#2026-06-22#FLIGHT#JA203",
+  "vuelo_numero": "JA203",
+  "fecha": "2026-06-22",
+  "origen": "AEP",
+  "destino": "MDZ",
+  "precio": "59.00",
+  "hora_salida": "17:00",
+  "hora_llegada": "18:15",
+  "duracion": "1h 15m",
+  "estado_vuelo": "EN_HORARIO",
+  "puerta": "12"
+}
+```
+
+**Asiento libre:**
+```json
+{
+  "PK": "FLIGHT#AEP#MDZ",
+  "SK": "DATE#2026-06-22#FLIGHT#JA203#SEAT#12C",
+  "seat_id": "12C",
+  "row": 12,
+  "letter": "C",
+  "seat_type": "estandar",
+  "vuelo_numero": "JA203",
+  "fecha": "2026-06-22"
+}
+```
+
+**Asiento con hold temporal:**
+```json
+{
+  "PK": "FLIGHT#AEP#MDZ",
+  "SK": "DATE#2026-06-22#FLIGHT#JA203#SEAT#1A",
+  "seat_id": "1A",
+  "seat_type": "primera_fila",
+  "held_by": "USER#us-east-1:a1b2c3d4-...",
+  "hold_expires_at": 1750183200
+}
+```
+
+**Asiento reservado (con PNR confirmado):**
+```json
+{
+  "PK": "FLIGHT#AEP#MDZ",
+  "SK": "DATE#2026-06-22#FLIGHT#JA203#SEAT#12C",
+  "seat_id": "12C",
+  "seat_type": "estandar",
+  "reserved_by": "PNR#JS7K2P",
+  "reserved_at": "2026-06-17T14:35:00.123456+00:00"
+}
+```
+
+**Token PII (conversations):**
+```json
+{
+  "PK": "SESSION#sess-abc123",
+  "SK": "TOKEN#<EMAIL_a7b3c2f1d4>",
+  "token": "<EMAIL_a7b3c2f1d4>",
+  "kind": "EMAIL",
+  "value": "juan@example.com",
+  "created_at": "2026-06-17T14:30:00+00:00",
+  "ttl": 1750249800
+}
+```
+
+**Extra del PNR:**
+```json
+{
+  "PK": "PNR#JS7K2P",
+  "SK": "EXTRA#01",
+  "pnr": "JS7K2P",
+  "extra_type": "mascota",
+  "amount": "35.00",
+  "created_at": "2026-06-17T14:35:00+00:00"
 }
 ```
 
 ---
 
-### Configuración de la tabla
+### Configuración de las tablas
+
+**Tabla `conversations`:**
 
 | Parámetro | Valor | Razón |
 |---|---|---|
-| Billing mode | PAY_PER_REQUEST (on-demand) | Tráfico irregular — no pagar por capacidad ociosa |
-| TTL attribute | `ttl` | Mensajes de chat se eliminan solos a los 7 días |
-| Encriptación | AWS managed key (SSE) | Habilitado por defecto, sin costo adicional |
-| GSI | Ninguno | Todos los access patterns resueltos con PK+SK |
+| Billing mode | PAY_PER_REQUEST | Tráfico irregular — no pagar por capacidad ociosa |
+| TTL attribute | `ttl` | Mensajes 7d, perfiles 30d, handoff 30d, tokens PII 24h — limpieza automática |
+| Encriptación at-rest | AWS managed (`aws/dynamodb`) | KMS implícito, sin costo |
+| GSIs | Ninguno | Todos los access patterns resueltos con PK+SK |
+| Stream | Deshabilitado | Nadie escucha cambios en conversations |
+
+**Tabla `business`:**
+
+| Parámetro | Valor | Razón |
+|---|---|---|
+| Billing mode | PAY_PER_REQUEST | Tráfico irregular — no pagar por capacidad ociosa |
+| TTL attribute | No tiene | Datos del PSS son persistentes (sin TTL); las reservas no expiran |
+| Encriptación at-rest | AWS managed (`aws/dynamodb`) | KMS implícito, sin costo |
+| GSIs | 2 (ReservationsByFlight, ReservationsByPassenger) | Resuelven AP32-AP35 sin Scan |
+| **Stream** | **Habilitado, `NEW_AND_OLD_IMAGES`** | Consumido por `flight_cancellation_detector` con filter_criteria. Permite comparar transiciones (no re-cancelaciones). |
+| Point-in-time recovery | Habilitado | Recuperación granular hasta 35 días atrás |
+| Backups | EventBridge cron diario → `ExportTableToPointInTime` → S3 `backups` | Retención larga (AFIP 10 años) — complementa PITR |
 
 ---
 
