@@ -275,10 +275,12 @@ def reserve_booking_handler(event, context):
         raise ValueError(f"Error de pricing server-side: {e}")
     total = pricing["total"]
 
-    passenger_name = reservation_r.get("nombre_pasajero", "")
-    email          = reservation_r.get("email_contacto", "")
-    phone          = reservation_r.get("telefono", "")
-    dni            = reservation_r.get("dni", "") or _passenger_key(passenger_name)
+    passenger_name    = reservation_r.get("nombre_pasajero", "")
+    email             = reservation_r.get("email_contacto", "")
+    phone             = reservation_r.get("telefono", "")
+    dni               = reservation_r.get("dni", "") or _passenger_key(passenger_name)
+    fecha_nacimiento  = reservation_r.get("fecha_nacimiento", "")
+    sexo              = reservation_r.get("sexo", "")
 
     now = _now_iso()
     user_id = event["user_id"]
@@ -348,20 +350,23 @@ def reserve_booking_handler(event, context):
         "status":         "PENDIENTE",
     })
 
-    # PAX — stampa gsi3pk para "buscar PNR por DNI/email"
+    # PAX — stampa gsi3pk para "buscar PNR por DNI/email".
+    # fecha_nacimiento + sexo persisten regulación TSA (DOB/género en boarding pass).
     pax_item = {
-        "PK":             f"PNR#{pnr}",
-        "SK":             "PAX#01",
-        "pnr":            pnr,
-        "seq":            1,
-        "full_name":      passenger_name,
-        "dni":            dni,
-        "email":          email,
-        "phone":          phone,
-        "seat":           seat_id,
+        "PK":               f"PNR#{pnr}",
+        "SK":               "PAX#01",
+        "pnr":              pnr,
+        "seq":              1,
+        "full_name":        passenger_name,
+        "dni":              dni,
+        "email":            email,
+        "phone":            phone,
+        "seat":             seat_id,
+        "fecha_nacimiento": fecha_nacimiento,
+        "sexo":             sexo,
         # GSI3: ReservationsByPassenger — KEYS_ONLY, suficiente para resolver PNR
-        "gsi3pk":         f"DNI#{dni}",
-        "gsi3sk":         f"PNR#{pnr}",
+        "gsi3pk":           f"DNI#{dni}",
+        "gsi3sk":           f"PNR#{pnr}",
     }
     table.put_item(Item=pax_item)
 

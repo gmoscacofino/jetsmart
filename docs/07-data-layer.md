@@ -134,6 +134,16 @@ user_id       : sub del JWT — valida que la sesión pertenece al usuario
 ttl           : epoch seconds — 7 días desde la escritura (limpieza automática)
 ```
 
+**Token PII** (`SESSION#{sessionId}` / `TOKEN#<token>`)
+```
+token      : "<EMAIL_a7b3c2f1d4>" | "<DNI_..>" | "<DATE_..>" | "<PHONE_..>" | "<SEXO_..>"
+kind       : "EMAIL" | "DNI" | "DATE" | "PHONE" | "SEXO"
+value      : valor PII real
+created_at : ISO-8601
+ttl        : epoch seconds — 24h
+```
+> Mapping reversible entre placeholders y valores reales para la tokenización de PII antes de mandar a la API de Anthropic. Tokens determinísticos por sesión (HMAC) — mismo dato en la misma sesión siempre da el mismo token. Ver justificación #27.
+
 **Thin pointer Reserva de usuario** (`USER#{userId}` / `RESERVATION#{pnr}`)
 ```
 pnr             : PNR de 6 chars (charset PSS sin 0/1/I/O, ej: "JS7K2P")
@@ -163,6 +173,21 @@ amount     : Decimal — monto cobrado (0 si está incluido en la tarifa)
 created_at : ISO-8601
 ```
 > Los extras se persisten 1 ítem por extra contratado. Habilita auditoría por PNR ("qué llevó cada pasajero") y queries del estilo "cuántas mascotas viajaron este mes". Los nombres están en `lambda/pricing.py:EXTRAS_FIJOS`.
+
+**Pasajero del PNR** (`PNR#{pnr}` / `PAX#{seq}`)
+```
+seq              : entero — 1 = pasajero principal
+full_name        : nombre + apellido
+dni              : 7-8 dígitos numéricos sin puntos (validado server-side)
+email            : email de contacto (del JWT)
+phone            : teléfono de contacto
+seat             : ID de asiento asignado (ej "12A")
+fecha_nacimiento : "YYYY-MM-DD" — recolectado en PASO 5d para coherencia PSS/TSA
+sexo             : "Masculino" | "Femenino" | "Otro" — PASO 5c
+gsi3pk           : "DNI#{dni}" — para buscar PNR por DNI
+gsi3sk           : "PNR#{pnr}"
+```
+> Validación server-side en `chat_handler._validate_passenger_input`: rechaza la reserva con error explícito si el formato no cumple. Como tokenizamos PII antes de mandar a Anthropic, Claude solo ve placeholders — la validación de formato es responsabilidad del server (justificación #27).
 
 **Reclamo** (`USER#{userId}` / `CLAIM#{claimId}`)
 ```

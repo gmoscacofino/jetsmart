@@ -414,6 +414,41 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 ---
 
+## 27. Protección de PII frente a la API de Anthropic
+
+**Decisión:** tokenización en línea de PII del usuario antes de enviar mensajes a `api.anthropic.com`. El módulo `lambda/pii_tokenizer.py` detecta email, DNI, teléfono, fecha de nacimiento (ISO y DD/MM/YYYY) y sexo en el texto que el user escribe en el chat, y los reemplaza por placeholders del tipo `<EMAIL_xxxxxxxxxx>`, `<DNI_xxxxxxxxxx>`, etc. Claude ve solo los placeholders. Antes de invocar los handlers de tools, los placeholders se resuelven a los valores reales (look-up en `conversations` table).
+
+**Por qué importa:**
+- Cada llamada a `messages.create()` envía el system prompt, el array `messages` (historial + nuevo mensaje) y los `tools` schemas a infraestructura de Anthropic. Los servidores de Anthropic procesan transitivamente todo lo que el user escribió.
+- Aunque el contrato del plan API estipula que Anthropic no entrena modelos con esos datos, los logs internos podrían ser comprometidos.
+- Tokenizar reduce drásticamente la PII expuesta sin cambiar la UX del chat.
+
+**Implementación:**
+- Tokens determinísticos por sesión vía HMAC-SHA256 (`HMAC(kind|value|session_id, secret)[:10]`). Mismo dato en la misma sesión → mismo token (Claude puede razonar sobre identidad sin ver el valor).
+- Mappings guardados en `conversations` table: `PK = SESSION#<sid>`, `SK = TOKEN#<token>` con TTL 24h.
+- `tokenize_text` corre sobre el `content` de cada mensaje user antes del `messages.create()`. El system prompt no se tokeniza (no contiene PII, es info de negocio).
+- `detokenize_inputs` recorre recursivamente los `input` de tool_use que devuelve Claude y reemplaza placeholders por valores reales antes de invocar el handler.
+- El system prompt instruye a Claude a NUNCA reformular los placeholders — debe pasarlos exactamente como llegan.
+
+**Alternativas evaluadas:**
+- (a) Masking parcial (`ju***@gmail.com`) — más simple pero no reversible y rompe la capacidad de Claude de mostrarle al user su propio dato.
+- (b) AWS Comprehend — más cobertura de PII no estructurada pero +200ms latencia y costo adicional. Difícil con DNI argentino (lo confunde con número genérico).
+- (c) Migrar a AWS Bedrock — elimina la fuga total porque el modelo corre dentro de AWS. Pero Haiku 4.5 no está aún en Bedrock. Queda como roadmap.
+
+**Trade-off honesto:**
+- ❌ No tokenizamos NOMBRES (regex confiable para nombres en español es difícil y los falsos positivos romperían el chat). Los nombres pasan en cleartext.
+- ❌ No tokenizamos los `tool_results` (Claude necesita razonar sobre datos del vuelo; lo dejamos como evolución).
+- ✅ Tokenizamos los inputs PII más estructurados que sí tienen regex confiable.
+- ✅ Si Anthropic compromete sus logs, lo único directamente identificable serían nombres y partes del flujo conversacional, no DNIs ni emails ni fechas de nacimiento.
+
+**Validación server-side asociada:** como Claude solo ve tokens, no puede validar formato de DNI/teléfono/fecha. La validación es responsabilidad del server: `_validate_passenger_input` en `chat_handler.py` valida los valores reales después de detokenizar y rechaza con error explícito si el DNI no tiene 7-8 dígitos, la fecha no es válida, el sexo no está en el enum, etc.
+
+**Persistencia de fecha_nacimiento + sexo:** los pasos 5c y 5d del flujo de compra recolectan estos datos como exige cualquier PSS real (regulación TSA, identificación en boarding pass). Ahora se persisten en el item `PNR#<pnr>/PAX#01` junto con DNI, nombre, email, teléfono y seat. Antes se pedían pero no se guardaban — bug de coherencia que se cierra.
+
+**Pregunta esperable en oral:** *"¿Por qué no tokenizan también los tool_results?"* → porque Claude necesita razonar sobre los datos del vuelo (origen, destino, fecha, precio, asiento) para conversar. Esos no son PII directa. Tokenizar las PII reales que aparecen en algunos tool_results (email del user, nombre en list_saved_passengers) es el paso siguiente del roadmap. Lo dejamos parcial honesto: mitigamos el vector más grande (texto libre del user) y reconocemos el residual.
+
+---
+
 ## 12. Frontend HTTP (no HTTPS)
 
 **Decisión:** el frontend S3 sirve HTTP estático sin CloudFront.

@@ -7,6 +7,7 @@ from botocore.exceptions import ClientError
 import anthropic
 
 from pricing import validate_inputs, PricingError, EXTRAS_FIJOS
+from pii_tokenizer import tokenize_text, detokenize_inputs
 
 log = logging.getLogger()
 log.setLevel(logging.INFO)
@@ -36,6 +37,7 @@ MSG_TTL_SECONDS = 7 * 24 * 3600
 HANDOFF_TTL_SECONDS = 30 * 24 * 3600
 MAX_TOOL_ROUNDS = 5
 HOLD_TTL_SECONDS = 600  # 10 minutos — soft-hold de asiento mientras el user completa la reserva
+PII_TOKEN_SECRET = os.environ.get("PII_TOKEN_SECRET", "jetsmart-prod-pii-default-key-2026")  # HMAC key para tokens PII estables por sesión
 
 # Inicialización eager: ocurre en el cold start, no en el primer request.
 def _init_anthropic() -> anthropic.Anthropic:
@@ -399,11 +401,13 @@ TOOLS = [
                     "items": {"type": "string", "enum": list(EXTRAS_FIJOS.keys())},
                     "description": "Lista de extras contratados (vacía si no hay).",
                 },
-                "seat_id":         {"type": "string", "description": "ID asiento (ej '12A'). Vacío = sistema asigna aleatorio."},
-                "telefono":        {"type": "string"},
-                "nombre_pasajero": {"type": "string"},
-                "dni":             {"type": "string", "description": "DNI del pasajero principal (sin puntos)"},
-                "vuelo_numero":    {"type": "string", "description": "Número de vuelo (JA203, etc.)"},
+                "seat_id":          {"type": "string", "description": "ID asiento (ej '12A'). Vacío = sistema asigna aleatorio."},
+                "telefono":         {"type": "string"},
+                "nombre_pasajero":  {"type": "string"},
+                "dni":              {"type": "string", "description": "DNI del pasajero principal (sin puntos)"},
+                "fecha_nacimiento": {"type": "string", "description": "Fecha de nacimiento del pasajero principal (YYYY-MM-DD)"},
+                "sexo":             {"type": "string", "enum": ["Masculino", "Femenino", "Otro"]},
+                "vuelo_numero":     {"type": "string", "description": "Número de vuelo (JA203, etc.)"},
             },
             "required": ["origen", "destino", "fecha", "pasajeros", "tarifa", "vuelo_numero"],
         },
@@ -435,6 +439,63 @@ TOOLS = [
         },
     },
 ]
+
+
+# ── Validación server-side de datos de pasajero ───────────────────────────────
+#
+# Como tokenizamos PII antes de mandar a Anthropic, Claude solo ve placeholders
+# y no puede validar formato. La validación es responsabilidad del server.
+
+# Regex flexibles para inputs argentinos. Aceptan también nombres internacionales.
+_NAME_RE  = re.compile(r"^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ\s'\-]{1,80}$")
+_DNI_RE   = re.compile(r"^\d{7,8}$")
+_PHONE_RE = re.compile(r"^[\d\s+()\-]{8,20}$")
+_DOB_RE   = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_SEXO_OK  = {"Masculino", "Femenino", "Otro"}
+
+
+def _validate_passenger_input(inputs: dict) -> str | None:
+    """
+    Valida los campos PII del passenger que llegan a create_reservation.
+    Retorna None si todo OK, o un mensaje de error para que Claude le pida
+    al user corregir.
+    """
+    nombre = (inputs.get("nombre_pasajero") or "").strip()
+    if not nombre:
+        return "El nombre del pasajero es obligatorio."
+    if not _NAME_RE.match(nombre):
+        return "El nombre del pasajero solo puede contener letras, espacios, apóstrofes y guiones (1-80 caracteres)."
+
+    dni_raw = (inputs.get("dni") or "").replace(".", "").replace(" ", "").replace("-", "")
+    if not dni_raw:
+        return "El DNI del pasajero es obligatorio."
+    if not _DNI_RE.match(dni_raw):
+        return "El DNI debe tener entre 7 y 8 dígitos numéricos (sin puntos)."
+
+    telefono = (inputs.get("telefono") or "").strip()
+    if telefono and not _PHONE_RE.match(telefono):
+        return "El teléfono tiene un formato inválido."
+
+    dob = (inputs.get("fecha_nacimiento") or "").strip()
+    if dob:
+        if not _DOB_RE.match(dob):
+            return "La fecha de nacimiento debe estar en formato YYYY-MM-DD."
+        try:
+            dob_d = date.fromisoformat(dob)
+        except ValueError:
+            return "La fecha de nacimiento no es una fecha válida."
+        today = date.today()
+        if dob_d > today:
+            return "La fecha de nacimiento no puede ser futura."
+        age_years = (today - dob_d).days / 365.25
+        if age_years > 120:
+            return "La fecha de nacimiento no parece válida (edad mayor a 120 años)."
+
+    sexo = (inputs.get("sexo") or "").strip()
+    if sexo and sexo not in _SEXO_OK:
+        return f"El sexo debe ser uno de: {', '.join(sorted(_SEXO_OK))}."
+
+    return None
 
 
 def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "", user_email: str = "") -> str:
@@ -939,21 +1000,33 @@ def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "", u
         except PricingError as e:
             return json.dumps({"error": f"Datos de reserva inválidos: {e}"})
 
+        # Validar formato de datos del pasajero (DNI, nombre, teléfono, DOB, sexo).
+        # Server-side authoritative: como tokenizamos PII hacia Anthropic, Claude
+        # solo ve placeholders y no puede validar los valores reales.
+        pax_err = _validate_passenger_input(inputs)
+        if pax_err:
+            return json.dumps({"error": pax_err})
+
+        # Normalizar DNI (sacar puntos/espacios/guiones que pudo haber tipeado el user)
+        dni_clean = (inputs.get("dni") or "").replace(".", "").replace(" ", "").replace("-", "")
+
         payment_id = str(uuid.uuid4())
         pnr = _pnr_from_payment_id(payment_id)
         reservation_data = {
-            "origen":          inputs["origen"].upper(),
-            "destino":         inputs["destino"].upper(),
-            "fecha":           inputs["fecha"],
-            "pasajeros":       int(inputs.get("pasajeros", 1)),
-            "tarifa":          tarifa,
-            "extras":          extras,
-            "seat_id":         (inputs.get("seat_id") or "").upper(),
-            "email_contacto":  user_email or inputs.get("email_contacto", ""),
-            "telefono":        inputs.get("telefono", ""),
-            "nombre_pasajero": inputs.get("nombre_pasajero", ""),
-            "dni":             inputs.get("dni", ""),
-            "vuelo_numero":    inputs.get("vuelo_numero", ""),
+            "origen":           inputs["origen"].upper(),
+            "destino":          inputs["destino"].upper(),
+            "fecha":            inputs["fecha"],
+            "pasajeros":        int(inputs.get("pasajeros", 1)),
+            "tarifa":           tarifa,
+            "extras":           extras,
+            "seat_id":          (inputs.get("seat_id") or "").upper(),
+            "email_contacto":   user_email or inputs.get("email_contacto", ""),
+            "telefono":         inputs.get("telefono", ""),
+            "nombre_pasajero":  inputs.get("nombre_pasajero", "").strip(),
+            "dni":              dni_clean,
+            "fecha_nacimiento": inputs.get("fecha_nacimiento", "").strip(),
+            "sexo":             inputs.get("sexo", "").strip(),
+            "vuelo_numero":     inputs.get("vuelo_numero", ""),
         }
 
         log.info("create_reservation: %s→%s %s pnr=%s user=%s",
@@ -1083,11 +1156,16 @@ def _handle_chat(event: dict, user: dict) -> dict:
 
     try:
         for _ in range(MAX_TOOL_ROUNDS):
+            # Tokenizar PII en todos los mensajes user antes de mandar a Anthropic.
+            # El system prompt no contiene PII (info de negocio). Los tool_results
+            # quedan en cleartext porque Claude necesita razonar sobre datos del
+            # vuelo (no PII directa) — mitigación parcial pero significativa.
+            tokenized_messages = _tokenize_messages_for_anthropic(messages, session_id)
             resp = _anthropic_client.messages.create(
                 model      = "claude-haiku-4-5-20251001",
                 max_tokens = 1024,
                 system     = _build_system_prompt(),
-                messages   = messages,
+                messages   = tokenized_messages,
                 tools      = TOOLS,
             )
 
@@ -1105,7 +1183,10 @@ def _handle_chat(event: dict, user: dict) -> dict:
                     content_list.append({"type": "text", "text": b.text})
 
             for tc in tool_calls:
-                result = _execute_tool(tc.name, tc.input, user_id, session_id, user.get("email", ""))
+                # Detokenizar los args: el handler necesita los valores reales para
+                # validar y persistir. Claude vio tokens pero el server resuelve.
+                real_input = detokenize_inputs(tc.input, session_id, conv_table)
+                result = _execute_tool(tc.name, real_input, user_id, session_id, user.get("email", ""))
                 log.info("Tool %s → %s", tc.name, result[:120])
                 tool_results.append({
                     "type":        "tool_result",
@@ -1145,6 +1226,32 @@ def _handle_chat(event: dict, user: dict) -> dict:
     if response_metadata:
         body_out["metadata"] = response_metadata
     return _response(200, body_out)
+
+
+def _tokenize_messages_for_anthropic(messages: list, session_id: str) -> list:
+    """
+    Tokeniza PII en el `content` de cada mensaje user antes de mandarlo a Anthropic.
+    Preserva la estructura de tool_use / tool_result intactos (no son texto plano).
+    Los mensajes assistant nunca contienen PII generada por el LLM que no haya
+    venido del input — pero los procesamos por consistencia (idempotente).
+    """
+    out = []
+    for m in messages:
+        content = m.get("content")
+        new_content = content
+        if isinstance(content, str):
+            new_content = tokenize_text(content, session_id, conv_table, PII_TOKEN_SECRET)
+        elif isinstance(content, list):
+            new_content = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    block = {**block, "text": tokenize_text(block.get("text", ""), session_id, conv_table, PII_TOKEN_SECRET)}
+                # tool_use / tool_result quedan tal cual — los inputs ya están
+                # tokenizados desde la conversación anterior; los results no los
+                # tokenizamos por ahora (roadmap).
+                new_content.append(block)
+        out.append({**m, "content": new_content})
+    return out
 
 
 def _update_hold_metadata(metadata: dict, tool_name: str, raw_result: str) -> None:
