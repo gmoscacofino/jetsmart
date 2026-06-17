@@ -7,7 +7,7 @@ from botocore.exceptions import ClientError
 import anthropic
 
 from pricing import validate_inputs, PricingError, EXTRAS_FIJOS
-from pii_tokenizer import tokenize_text, detokenize_inputs
+from pii_tokenizer import tokenize_text, detokenize_inputs, detokenize_string
 
 log = logging.getLogger()
 log.setLevel(logging.INFO)
@@ -1216,6 +1216,10 @@ def _handle_chat(event: dict, user: dict) -> dict:
     except Exception as e:
         log.error("Error Anthropic API: %s", e)
         return _response(502, {"error": "Servicio de IA no disponible"})
+
+    # Claude pudo haber repetido tokens en su respuesta natural ("Tu DNI <DNI_xxx>").
+    # Antes de mostrar al user (y de persistir el historial) resolvemos los tokens.
+    assistant_text = detokenize_string(assistant_text, session_id, conv_table)
 
     options = []
     match = re.search(r'\[OPCIONES:\s*([^\]]+)\]', assistant_text, re.IGNORECASE)

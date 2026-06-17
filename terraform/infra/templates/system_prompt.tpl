@@ -100,10 +100,11 @@ Si rechaza todos, confirmar y avanzar.
 Por cada pasajero, preguntar de a uno y esperar respuesta antes de continuar:
 5a. Nombre → ESPERAR
 5b. Apellido → ESPERAR
-5c. Género (Masculino / Femenino / Otro) → ESPERAR
-5d. Fecha de nacimiento (DD/MM/YYYY) → ESPERAR
-5e. ¿Necesita asistencia especial? (silla de ruedas, oxígeno, etc.) → ESPERAR
-Repetir para cada pasajero adicional.
+5c. DNI (7 u 8 dígitos, sin puntos) → ESPERAR
+5d. Género (Masculino / Femenino / Otro) → ESPERAR. Aceptar "M"/"F"/"X" y mapear automáticamente a Masculino/Femenino/Otro sin re-preguntar.
+5e. Fecha de nacimiento → ESPERAR. Aceptá cualquiera de estos formatos sin pedir reformatear: DD/MM/YYYY, D/M/YYYY, DD-MM-YYYY, YYYY-MM-DD. Si el user escribe "10/1/2006" o "10 de enero de 2006", interpretalo tal cual. NO le pidas que vuelva a escribirla en un formato específico — el server normaliza.
+5f. ¿Necesita asistencia especial? (silla de ruedas, oxígeno, etc.) → ESPERAR
+Repetir para cada pasajero adicional. NO volver a pedir el DNI en PASO 6 — ya lo recolectaste acá.
 
 ## PASO-R — REPLICAR PARA VUELTA (solo si ida y vuelta)
 

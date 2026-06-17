@@ -45,9 +45,13 @@ _PHONE_RE = re.compile(
     r"(?:\+?54\s*9?\s*)?(?:\(?\d{2,4}\)?[\s\-]?)?\d{4}[\s\-]?\d{4}"
 )
 
-# Fecha YYYY-MM-DD (ISO) o DD/MM/YYYY (LATAM).
-_DATE_ISO_RE = re.compile(r"\b(19\d{2}|20\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b")
-_DATE_LATAM_RE = re.compile(r"\b(0[1-9]|[12]\d|3[01])/(0[1-9]|1[0-2])/(19\d{2}|20\d{2})\b")
+# Fecha — formatos aceptados:
+#   YYYY-MM-DD (ISO)
+#   DD/MM/YYYY o D/M/YYYY (LATAM, padding opcional)
+#   DD-MM-YYYY o D-M-YYYY (LATAM con guiones, padding opcional)
+# El padding es opcional para tolerar inputs naturales como "10/1/2006".
+_DATE_ISO_RE = re.compile(r"\b(19\d{2}|20\d{2})-(0?[1-9]|1[0-2])-(0?[1-9]|[12]\d|3[01])\b")
+_DATE_LATAM_RE = re.compile(r"\b(0?[1-9]|[12]\d|3[01])[/\-](0?[1-9]|1[0-2])[/\-](19\d{2}|20\d{2})\b")
 
 # Sexo / género escrito por user.
 _SEXO_RE = re.compile(
@@ -81,11 +85,16 @@ def _normalize_sexo(s: str) -> str:
 
 
 def _normalize_date(s: str) -> str:
-    """Normaliza dd/mm/yyyy → yyyy-mm-dd."""
+    """Normaliza cualquier formato LATAM (D/M/YYYY, DD-MM-YYYY, etc.) a ISO YYYY-MM-DD."""
     m = _DATE_LATAM_RE.fullmatch(s)
     if m:
         dd, mm, yyyy = m.groups()
-        return f"{yyyy}-{mm}-{dd}"
+        # Padding obligatorio para la salida ISO
+        return f"{yyyy}-{int(mm):02d}-{int(dd):02d}"
+    m_iso = _DATE_ISO_RE.fullmatch(s)
+    if m_iso:
+        yyyy, mm, dd = m_iso.groups()
+        return f"{yyyy}-{int(mm):02d}-{int(dd):02d}"
     return s
 
 
