@@ -283,22 +283,24 @@ En este TP el "POST al call center" se loguea en CloudWatch como `MOCK POST http
 
 ---
 
-## Flujo 8 — Notificaciones proactivas (TP4)
+## Flujo 8 — Notificaciones proactivas (TP4, event-driven)
 
 Cuando un vuelo se cancela en el sistema de operaciones, todos los pasajeros afectados reciben automáticamente una notificación por email. Habilita el caso de uso "tormenta cancela vuelo → 5000 pasajeros enterados antes de llegar al aeropuerto".
 
-> **Nota del demo:** este flujo NO se dispara en vivo durante la presentación. El disparador (`scripts/cancel_flight.py`) se ejecuta offline antes de la demo para validar que funcione, y en la defensa se muestra el diagrama + los logs en CloudWatch de la corrida previa.
+> **Cambio en TP4 (post-demo):** el trigger pasó de un script manual (`scripts/cancel_flight.py`) a un **DynamoDB Stream + Lambda detector**. Ops solo necesita cambiar el `estado_vuelo` del master row a `CANCELADO` desde la consola DynamoDB (o desde el dashboard interno que conectaría en producción) y el flujo se dispara automáticamente. El script queda como tool de testing local. Ver justificación #28.
 
 ```
-[Disparador — representa al módulo de operaciones de la aerolínea; en el TP es un script CLI]
-$ python3 scripts/cancel_flight.py JA203 2026-06-20 "mal tiempo en Mendoza"
+[Disparador en producción — sistema de ops o consola DynamoDB]
+   ops → UpdateItem master row FLIGHT#AEP#MDZ / DATE#2026-06-20#FLIGHT#JA203
+         SET estado_vuelo = "CANCELADO", cancellation_reason = "...", cancellation_at = "..."
         ↓
-Script:
-  1. Query GSI1 FlightByNumber (HK=JA203, RK=2026-06-20) → encuentra
-     el item FLIGHT#AEP#MDZ/DATE#2026-06-20#FLIGHT#JA203
-  2. UpdateItem: estado_vuelo=CANCELADO, cancellation_reason, cancellation_at
-  3. Publica evento a SNS flight-events:
-     { event_type: "flight_cancelled", vuelo_numero: "JA203", fecha: "2026-06-20", reason: "..." }
+DynamoDB Stream (NEW_AND_OLD_IMAGES)
+        ↓ event_source_mapping con filter_criteria (eventName=MODIFY, NewImage.estado_vuelo=CANCELADO)
+Lambda flight_cancellation_detector
+   1. Filtra master rows FLIGHT# (descarta SEAT#, PNR#, etc.)
+   2. Detecta transición real (OldImage.estado_vuelo != CANCELADO)
+   3. Publica al SNS flight_events:
+      { event_type: "flight_cancelled", vuelo_numero, fecha, reason }
         ↓ fan-out (subscription sqs)
 SQS proactive-notifications  (+ DLQ)
         ↓ trigger event_source_mapping (batch_size=5)

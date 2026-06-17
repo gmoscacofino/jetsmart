@@ -10,6 +10,8 @@ Lambda es el servicio de cómputo principal de este proyecto. Cada función Lamb
 
 ### Las 16 Lambdas del proyecto
 
+> Nota TP4 (event-driven proactive notifications): el trigger del flujo de cancelaciones cambió de script manual a DynamoDB Stream. La Lambda `flight-cancellation-detector` consume el stream de `business` y publica al SNS `flight-events` cuando detecta una transición a `estado_vuelo=CANCELADO` en un master row. Ver justificación #28.
+
 | Nombre | Trigger | Función |
 |---|---|---|
 | `chat-handler` | API Gateway (todos los paths, **detrás de Cognito Authorizer**) | Punto de entrada principal: chat con tool use, historial, reservas del usuario, inicio de pago. Lee claims ya validados de `event.requestContext.authorizer.claims` (sin validación JWT manual) |
@@ -24,7 +26,8 @@ Lambda es el servicio de cómputo principal de este proyecto. Cada función Lamb
 | `notification` | Step Functions (PostBookingActions + error path) | Envía confirmación al usuario (éxito o fracaso del pago) vía SNS `notifications` |
 | `analytics-processor` | SQS `analytics` | Escribe eventos crudos en S3 `analytics` como JSON Lines particionado por fecha (TP4: ya no escribe a RDS) |
 | `human-handoff-processor` | SQS `human-handoff` (publicado por chat-handler cuando el LLM invoca la tool `escalate_to_human`) | Simula el POST al sistema del call center y actualiza el ticket HANDOFF# en `conversations` a status=ACK |
-| `proactive-notifications` | SQS `proactive-notifications` (suscrita a SNS `flight-events` publicado por ops) | Ante cancelación de vuelo, hace Query a GSI2 para encontrar todos los PNRs afectados y publica un email por usuario |
+| `proactive-notifications` | SQS `proactive-notifications` (suscrita a SNS `flight-events`) | Ante cancelación de vuelo, hace Query a GSI2 para encontrar todos los PNRs afectados y publica un email por usuario |
+| `flight-cancellation-detector` (TP4) | **DynamoDB Stream** de `business` con filter_criteria (eventName=MODIFY, NewImage.estado_vuelo=CANCELADO) | Detecta transición a CANCELADO en master row FLIGHT#, publica `flight_cancelled` al SNS flight-events. Reemplaza el trigger manual de `scripts/cancel_flight.py` |
 | `auth-callback` | API Gateway GET /callback (bridge HTTPS del workaround) | Intercambia authorization code por tokens JWT y redirige al frontend |
 | `cognito-trigger` | Cognito post-registration | Asigna grupo `users` al usuario nuevo |
 | `backup-dynamodb` | EventBridge cron diario 03:00 UTC | Dispara `dynamodb:ExportTableToPointInTime` sobre `business`; el export queda en S3 `backups`. Mecanismo complementario a PITR (35d continuos), cubre retención AFIP de 10 años |

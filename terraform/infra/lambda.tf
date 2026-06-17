@@ -206,6 +206,62 @@ resource "aws_lambda_event_source_mapping" "proactive_notifications_sqs" {
   batch_size       = 5
 }
 
+# ── Lambda: Flight Cancellation Detector (DynamoDB Stream) ────────────────────
+#
+# Consume el Stream de business table y publica al SNS flight-events cuando
+# detecta una transición de estado_vuelo a CANCELADO en un master row FLIGHT#.
+# Reemplaza el trigger manual de scripts/cancel_flight.py. El resto del flujo
+# (SNS → SQS proactive-notifications → Lambda → emails) queda igual.
+
+data "archive_file" "flight_cancellation_detector" {
+  type        = "zip"
+  source_file = "${path.module}/../../lambda/flight_cancellation_detector.py"
+  output_path = "${path.module}/builds/flight_cancellation_detector.zip"
+}
+
+resource "aws_lambda_function" "flight_cancellation_detector" {
+  function_name    = "${local.name_prefix}-flight-cancellation-detector"
+  filename         = data.archive_file.flight_cancellation_detector.output_path
+  source_code_hash = data.archive_file.flight_cancellation_detector.output_base64sha256
+  runtime          = "python3.12"
+  handler          = "flight_cancellation_detector.handler"
+  role             = data.aws_iam_role.lab_role.arn
+  timeout          = var.lambda_timeout
+
+  environment {
+    variables = {
+      AWS_REGION_VAR        = var.aws_region
+      SNS_FLIGHT_EVENTS_ARN = aws_sns_topic.flight_events.arn
+    }
+  }
+}
+
+# Stream → Lambda con filter_criteria: solo invoca cuando un MODIFY pone
+# estado_vuelo=CANCELADO. Reduce drásticamente las invocaciones (no se ejecuta
+# por escrituras de PNR#, SEAT#, etc.). El handler igual valida que sea master
+# row FLIGHT# y que sea una transición real (no re-cancelación).
+resource "aws_lambda_event_source_mapping" "flight_cancellation_stream" {
+  event_source_arn  = aws_dynamodb_table.business.stream_arn
+  function_name     = aws_lambda_function.flight_cancellation_detector.arn
+  starting_position = "LATEST"
+  batch_size        = 10
+
+  filter_criteria {
+    filter {
+      pattern = jsonencode({
+        eventName = ["MODIFY"]
+        dynamodb = {
+          NewImage = {
+            estado_vuelo = {
+              S = ["CANCELADO"]
+            }
+          }
+        }
+      })
+    }
+  }
+}
+
 # ── Lambda: Notification ──────────────────────────────────────────────────────
 #
 # Invocada directamente por Step Functions en dos puntos:

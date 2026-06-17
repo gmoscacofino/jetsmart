@@ -449,6 +449,36 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 ---
 
+## 28. Proactive notifications event-driven (DynamoDB Stream → Lambda detector)
+
+**Decisión:** habilitamos un Stream en la tabla `business` (`NEW_AND_OLD_IMAGES`) y agregamos una Lambda `flight_cancellation_detector` que consume el stream con `filter_criteria` server-side. Cuando detecta un master row `FLIGHT#` con transición de estado a `CANCELADO`, publica al SNS `flight_events` existente. El resto del flujo downstream (SNS → SQS `proactive_notifications` → Lambda → fan-out de emails) queda intacto.
+
+**Antes:** un script local `scripts/cancel_flight.py` hacía el `UpdateItem` y publicaba al SNS. Trigger manual, fuera del sistema.
+
+**Alternativas evaluadas:**
+- (a) Script manual (TP3 → mitad de TP4) → no escala, requiere operador con creds, no se integra con un dashboard de ops real.
+- (b) **DynamoDB Stream → Lambda detector (elegida)** → cambia solo el origen del trigger sin tocar el patrón SNS→SQS→Lambda ya defendido como elasticidad. Latencia <1 seg.
+- (c) DynamoDB Stream → EventBridge Pipes → SNS (sin Lambda intermedia) → más declarativo, cero código de glue, pero los filter patterns de Pipes no permiten comparar `OldImage` vs `NewImage` para detectar transiciones. Habría falsos positivos cuando el ítem ya estaba CANCELADO y se modifica otro atributo. Además Pipes en LabRole no está garantizado disponible.
+- (d) Stream → Lambda detector → Lambda proactive directo (saltar SNS/SQS) → un componente menos pero perdés el buffer SQS con retry/DLQ. Acoplamiento más fuerte.
+
+**Implementación del detector:**
+- `filter_criteria` en el event_source_mapping: solo invoca cuando `eventName=MODIFY` y `NewImage.estado_vuelo.S=CANCELADO`. Evita procesamiento de cambios en ítems PNR#, SEAT#, etc.
+- Guard adicional en el handler: confirma que es master row `FLIGHT#` (no SEAT#, no PNR# que pudo matchear el filtro por coincidencia de atributo).
+- Detección de transición real: `OldImage.estado_vuelo != "CANCELADO"`. Si el ítem ya estaba cancelado y solo se actualizó otro campo (ej. `cancellation_reason`), no se re-publica.
+- Payload idéntico al que `proactive_notifications.py` ya esperaba (`event_type=flight_cancelled`, `vuelo_numero`, `fecha`, `reason`) — cero cambios downstream.
+
+**Trade-offs:**
+- ✅ Event-driven real: ahora ops cambia el estado desde cualquier interfaz (consola DynamoDB, otra Lambda, futuro dashboard) y el flujo se dispara solo.
+- ✅ Latencia <1 seg desde el `UpdateItem` hasta la publicación al SNS.
+- ✅ El script `cancel_flight.py` queda como tool de testing local (no se elimina — útil para probar end-to-end sin tocar la consola).
+- ❌ Costo de Stream: ~$0.02 por 100k read requests. Despreciable en sandbox.
+- ❌ Una Lambda más que mantener (16 totales).
+- ❌ El Stream emite TODOS los cambios de la tabla. El `filter_criteria` reduce las invocaciones a las que realmente importan, pero hay costo de read del Stream igualmente.
+
+**Pregunta esperable en oral:** *"¿Por qué Stream + Lambda y no EventBridge Pipes?"* → Pipes no permite comparar OldImage vs NewImage. Habría una invocación por cada modificación de un ítem que ya tenía estado_vuelo=CANCELADO (ej. actualización de `cancellation_reason`). Con Lambda intermedia hacemos esa comparación en código y el patrón es 100% compatible con LabRole.
+
+---
+
 ## 12. Frontend HTTP (no HTTPS)
 
 **Decisión:** el frontend S3 sirve HTTP estático sin CloudFront.

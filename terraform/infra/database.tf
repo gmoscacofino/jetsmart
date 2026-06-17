@@ -70,6 +70,13 @@ resource "aws_dynamodb_table" "business" {
   hash_key     = "PK"
   range_key    = "SK"
 
+  # Stream para event-driven proactive notifications: cuando ops cambia
+  # estado_vuelo a CANCELADO en un master row FLIGHT#, una Lambda detector
+  # consume el stream y publica al SNS flight-events. NEW_AND_OLD_IMAGES
+  # permite comparar transiciones (no re-cancelaciones).
+  stream_enabled   = true
+  stream_view_type = "NEW_AND_OLD_IMAGES"
+
   attribute {
     name = "PK"
     type = "S"

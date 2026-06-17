@@ -17,6 +17,7 @@ locals {
     lambda_analytics               = "/aws/lambda/${local.name_prefix}-analytics-processor"
     lambda_human_handoff           = "/aws/lambda/${local.name_prefix}-human-handoff-processor"
     lambda_proactive_notif         = "/aws/lambda/${local.name_prefix}-proactive-notifications"
+    lambda_cancellation_detector   = "/aws/lambda/${local.name_prefix}-flight-cancellation-detector"
   }
 }
 

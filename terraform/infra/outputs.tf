@@ -113,6 +113,16 @@ output "analytics_processor_function_name" {
   value       = aws_lambda_function.analytics_processor.function_name
 }
 
+output "flight_cancellation_detector_function_name" {
+  description = "Nombre de la Lambda detector de cancelaciones (consume DynamoDB Stream)"
+  value       = aws_lambda_function.flight_cancellation_detector.function_name
+}
+
+output "business_table_stream_arn" {
+  description = "ARN del stream de la business table (event source del detector)"
+  value       = aws_dynamodb_table.business.stream_arn
+}
+
 # ── Analytics: S3 + Glue + Athena ─────────────────────────────────────────────
 
 output "analytics_bucket" {

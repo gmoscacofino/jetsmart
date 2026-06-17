@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 """
-Script para simular una cancelación de vuelo en el sistema de operaciones de
-JetSmart. Dispara el flujo de notificaciones proactivas (SNS flight-events →
-SQS proactive-notifications → Lambda → emails a pasajeros afectados).
+Script de testing local para simular una cancelación de vuelo.
 
-En producción real, este disparador sería el sistema interno de ops de JetSmart
-(NOC / IROPS dashboard) cuando un vuelo se cancela. Acá lo emulamos con un
-script ejecutable manualmente, para mostrar el flow end-to-end fuera del demo
-en vivo.
+⚠ TP4: ya NO es el disparador del flujo de proactive notifications.
+El production trigger es el DynamoDB Stream de la business table:
+cuando un master row FLIGHT# tiene estado_vuelo cambiado a CANCELADO
+(por ops desde la consola, otra Lambda, etc.), la Lambda
+`flight_cancellation_detector` consume el stream y publica al SNS
+`flight_events` automáticamente.
+
+Este script queda como tool de testing local: hace 2 cosas idénticas a
+ops real — (1) UpdateItem sobre el FLIGHT# poniendo CANCELADO, (2)
+publica directo al SNS por si el detector está caído. El paso (2) es
+redundante en TP4 (el Stream ya lo dispara) pero lo mantenemos
+ejecutable sin riesgo: proactive_notifications.py filtra duplicados.
 
 Uso:
   export BUSINESS_TABLE_NAME=jetsmart-prod-business
   export SNS_FLIGHT_EVENTS_ARN=arn:aws:sns:us-east-1:<acct>:jetsmart-prod-flight-events
   python3 scripts/cancel_flight.py JA203 2026-06-20 "mal tiempo en Mendoza"
 
-O usando los outputs de Terraform directamente:
-  cd terraform/infra
-  export BUSINESS_TABLE_NAME=$(terraform output -raw business_table_name)
-  export SNS_FLIGHT_EVENTS_ARN=$(terraform output -raw sns_flight_events_arn)
-  python3 ../../scripts/cancel_flight.py JA203 2026-06-20 "mal tiempo"
+Para testear SOLO el Stream → detector, hacé el UpdateItem desde la consola
+DynamoDB en lugar de correr este script.
 """
 import sys, json, os
 from datetime import datetime, timezone
