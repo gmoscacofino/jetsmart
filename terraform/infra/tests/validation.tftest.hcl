@@ -17,6 +17,11 @@ mock_provider "aws" {
       user_id    = "AKIAIOSFODNN7EXAMPLE"
     }
   }
+  mock_data "aws_availability_zones" {
+    defaults = {
+      names = ["us-east-1a", "us-east-1b", "us-east-1c"]
+    }
+  }
 }
 
 mock_provider "archive" {}
@@ -27,6 +32,7 @@ run "rechaza_environment_invalido" {
 
   variables {
     anthropic_api_key   = "sk-ant-test-key"
+    weather_api_key     = "test-weather-key"
     state_bucket_suffix = "test"
     environment         = "production"
   }
@@ -40,6 +46,7 @@ run "acepta_environment_dev" {
 
   variables {
     anthropic_api_key   = "sk-ant-test-key"
+    weather_api_key     = "test-weather-key"
     state_bucket_suffix = "test"
     environment         = "dev"
   }
@@ -51,6 +58,7 @@ run "acepta_environment_staging" {
 
   variables {
     anthropic_api_key   = "sk-ant-test-key"
+    weather_api_key     = "test-weather-key"
     state_bucket_suffix = "test"
     environment         = "staging"
   }
@@ -62,6 +70,7 @@ run "acepta_environment_prod" {
 
   variables {
     anthropic_api_key   = "sk-ant-test-key"
+    weather_api_key     = "test-weather-key"
     state_bucket_suffix = "test"
     environment         = "prod"
   }

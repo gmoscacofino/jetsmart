@@ -8,9 +8,9 @@ PNRs afectados.
 Flujo:
   Ops actualiza estado_vuelo=CANCELADO en business table (consola/dashboard)
        → DynamoDB Stream
-       → Lambda flight_cancellation_detector
-       → SNS flight-events (event_type=flight_cancelled, vuelo, fecha, reason)
-       → SQS proactive-notifications
+       → Lambda stream_emitter
+       → SNS events (central) — event_type=flight_cancelled, vuelo, fecha, cancellation_reason
+       → SQS proactive-notifications (filter policy event_type=flight_cancelled)
        → este Lambda:
            1. Query GSI ReservationsByFlight con HK=FLIGHT#{vuelo}#{fecha}
               → lista de PNRs afectados (con user_id, email)
@@ -40,7 +40,9 @@ def _process_flight_event(event_body: dict) -> dict:
     event_type   = event_body.get("event_type", "")
     vuelo_numero = event_body.get("vuelo_numero", "")
     fecha        = event_body.get("fecha", "")
-    reason       = event_body.get("reason", "operational")
+    # El emitter (stream_emitter.py) publica `cancellation_reason`. Aceptamos
+    # `reason` como fallback por compatibilidad con payloads viejos.
+    reason       = event_body.get("cancellation_reason") or event_body.get("reason") or "operational"
 
     if not vuelo_numero or not fecha:
         log.warning("Evento sin vuelo/fecha — saltando: %s", event_body)
@@ -141,6 +143,9 @@ def _process_flight_event(event_body: dict) -> dict:
                     "timestamp":      datetime.now(timezone.utc).isoformat(),
                     "payload":        {"vuelo": vuelo_numero, "fecha": fecha},
                 }),
+                MessageAttributes={
+                    "event_type": {"DataType": "String", "StringValue": "flight_cancellation_notified"},
+                },
             )
         except Exception as e:
             log.warning("No se pudo emitir evento analytics: %s", e)
@@ -160,12 +165,12 @@ def handler(event, context):
     results = []
     for record in records:
         try:
-            sqs_body = json.loads(record["body"])
-            # SNS-wrapped: el body de la SQS contiene un JSON con {"Type":"Notification","Message":"<json>"}
-            if isinstance(sqs_body, dict) and "Message" in sqs_body:
-                flight_event = json.loads(sqs_body["Message"])
+            # SNS→Lambda directo: el evento llega bajo record["Sns"].
+            sns_msg = record["Sns"]
+            if isinstance(sns_msg, dict) and "Message" in sns_msg:
+                flight_event = json.loads(sns_msg["Message"])
             else:
-                flight_event = sqs_body
+                flight_event = sns_msg
             results.append(_process_flight_event(flight_event))
         except Exception as e:
             log.error("Error procesando record %s: %s", record.get("messageId"), e)

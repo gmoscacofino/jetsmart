@@ -1,52 +1,88 @@
-# ── Lambda: Analytics Processor ───────────────────────────────────────────────
+# ── Lambdas en VPC ────────────────────────────────────────────────────────────
 #
-# Disparada por SQS cuando llegan mensajes del SNS events (chat).
-# Escribe los eventos crudos en S3 (JSON Lines particionado por fecha) para que
-# Glue Crawler los catalogue y el equipo de business analytics los consulte vía
-# Athena con cliente SQL (DBeaver / DataGrip).
+# TP4 re-arquitectura: todo el cómputo Lambda de negocio corre en las subnets
+# privadas-lambda. Acceden a DynamoDB/S3 por Gateway Endpoint (gratis) y a
+# SNS/SQS/Secrets/StepFunctions por Interface Endpoint; salen a internet (si hace
+# falta) por NAT. auth_callback/cognito_trigger (módulo auth) y backup_dynamodb
+# quedan FUERA de la VPC — sólo tocan Cognito/DynamoDB regional.
 #
-# Sin VPC: la Lambda sólo necesita acceso a S3 y SQS — servicios regionales
-# accesibles directamente desde Lambda gestionada por AWS.
+# vpc_config se repite en cada función (es un bloque anidado, no parametrizable).
+# subnet_ids = private_lambda ; security_group_ids = [sg-lambda].
 
-data "archive_file" "analytics_processor" {
+# ── Lambda: Business Analytics Emitter (CDC → Firehose) ───────────────────────
+#
+# 2° consumer del Stream de business (el 1° es stream_emitter, operacional).
+# Clasifica PNR/FLIGHT/CLAIM, deriva transición Old→New, redacta PII y hace
+# PutRecord al Firehose de cada entidad → data lake. Ver analytics-arquitectura.md.
+
+data "archive_file" "business_analytics_emitter" {
   type        = "zip"
-  source_file = "${path.module}/../../lambda/analytics_processor.py"
-  output_path = "${path.module}/builds/analytics_processor.zip"
+  source_file = "${path.module}/../../lambda/business_analytics_emitter.py"
+  output_path = "${path.module}/builds/business_analytics_emitter.zip"
 }
 
-resource "aws_lambda_function" "analytics_processor" {
-  function_name    = "${local.name_prefix}-analytics-processor"
-  filename         = data.archive_file.analytics_processor.output_path
-  source_code_hash = data.archive_file.analytics_processor.output_base64sha256
+resource "aws_lambda_function" "business_analytics_emitter" {
+  function_name    = "${local.name_prefix}-business-analytics-emitter"
+  filename         = data.archive_file.business_analytics_emitter.output_path
+  source_code_hash = data.archive_file.business_analytics_emitter.output_base64sha256
   runtime          = "python3.12"
-  handler          = "analytics_processor.handler"
+  handler          = "business_analytics_emitter.handler"
   role             = data.aws_iam_role.lab_role.arn
-  timeout          = 120
+  timeout          = 60
 
   environment {
     variables = {
-      AWS_REGION_VAR   = var.aws_region
-      ANALYTICS_BUCKET = aws_s3_bucket.analytics.bucket
-      ANALYTICS_PREFIX = "events"
+      AWS_REGION_VAR       = var.aws_region
+      FIREHOSE_RESERVATION = aws_kinesis_firehose_delivery_stream.lake["reservation_events"].name
+      FIREHOSE_FLIGHT      = aws_kinesis_firehose_delivery_stream.lake["flight_events"].name
+      FIREHOSE_CLAIM       = aws_kinesis_firehose_delivery_stream.lake["claim_events"].name
     }
   }
 
-  depends_on = [aws_s3_bucket.analytics]
+  vpc_config {
+    subnet_ids         = aws_subnet.private_lambda[*].id
+    security_group_ids = [aws_security_group.lambda.id]
+  }
 }
 
-resource "aws_lambda_event_source_mapping" "analytics_sqs" {
-  event_source_arn = aws_sqs_queue.analytics.arn
-  function_name    = aws_lambda_function.analytics_processor.arn
-  batch_size       = 10
+# 2° ESM sobre el mismo Stream. Filtro coarse por prefijo de PK (INSERT+MODIFY);
+# el fine-filtering (master row, excluir SEAT#, PII) lo hace el código.
+resource "aws_lambda_event_source_mapping" "business_analytics_stream" {
+  event_source_arn  = aws_dynamodb_table.business.stream_arn
+  function_name     = aws_lambda_function.business_analytics_emitter.arn
+  starting_position = "LATEST"
+  batch_size        = 50
+
+  function_response_types = ["ReportBatchItemFailures"]
+
+  filter_criteria {
+    filter {
+      pattern = jsonencode({
+        eventName = ["INSERT", "MODIFY"]
+        dynamodb  = { Keys = { PK = { S = [{ prefix = "PNR#" }] } } }
+      })
+    }
+    # Solo master rows FLIGHT#: tienen estado_vuelo (los SEAT# no) → excluye el
+    # ruido de reservas de asiento sin invocar la Lambda.
+    filter {
+      pattern = jsonencode({
+        eventName = ["INSERT", "MODIFY"]
+        dynamodb = {
+          Keys     = { PK = { S = [{ prefix = "FLIGHT#" }] } }
+          NewImage = { estado_vuelo = { S = [{ exists = true }] } }
+        }
+      })
+    }
+    filter {
+      pattern = jsonencode({
+        eventName = ["INSERT", "MODIFY"]
+        dynamodb  = { Keys = { PK = { S = [{ prefix = "CLAIM#" }] } } }
+      })
+    }
+  }
 }
 
-# ── Lambda: Payment Steps (for_each — patrón Saga via Step Functions) ─────────
-#
-# Los 7 handlers del flujo de pago se crean desde el mismo ZIP con handlers
-# distintos. Step Functions los invoca directamente — sin SQS ni SNS entre pasos.
-#
-# Paso feliz:   reserve-flight → reserve-booking → collect → confirm
-# Compensación: refund → cancel → release-flight
+# ── Lambda: Payment Steps (Saga booking, invocadas por Step Functions) ────────
 
 locals {
   payment_handlers = {
@@ -64,9 +100,7 @@ data "archive_file" "payment_processor" {
   type        = "zip"
   source_dir  = "${path.module}/../../lambda"
   output_path = "${path.module}/builds/payment_processor.zip"
-  # payment_processor.py importa pricing.py — empaquetamos el dir entero.
-  # Los otros .py del dir se incluyen pero no se ejecutan (handler busca por nombre).
-  excludes = ["tests", "tests/__init__.py", "tests/test_pricing.py", "__pycache__"]
+  excludes    = ["tests", "tests/__init__.py", "tests/test_pricing.py", "__pycache__"]
 }
 
 resource "aws_lambda_function" "payment" {
@@ -88,6 +122,11 @@ resource "aws_lambda_function" "payment" {
     }
   }
 
+  vpc_config {
+    subnet_ids         = aws_subnet.private_lambda[*].id
+    security_group_ids = [aws_security_group.lambda.id]
+  }
+
   lifecycle {
     create_before_destroy = true
   }
@@ -95,11 +134,8 @@ resource "aws_lambda_function" "payment" {
 
 # ── Lambda: Boarding Pass Async ───────────────────────────────────────────────
 #
-# TP4: la generación del boarding pass se desacopló del Saga. Step Functions
-# publica un mensaje a SQS boarding-pass-generation (SDK sqs:sendMessage), y
-# esta Lambda lo consume async. Si la generación falla N veces, el mensaje
-# termina en la DLQ. La reserva ya está confirmada en este punto, así que un
-# fallo aquí no revierte el pago — sólo deja el BP pendiente de regenerar.
+# Ahora alimentada por el SNS central (filtro booking_confirmed) → cola
+# boarding-pass-generation. El mensaje llega envuelto en el envelope de SNS.
 
 data "archive_file" "boarding_pass_async" {
   type        = "zip"
@@ -123,19 +159,19 @@ resource "aws_lambda_function" "boarding_pass_async" {
       BOARDING_PASSES_BUCKET = aws_s3_bucket.boarding_passes.bucket
     }
   }
+
+  vpc_config {
+    subnet_ids         = aws_subnet.private_lambda[*].id
+    security_group_ids = [aws_security_group.lambda.id]
+  }
 }
 
-resource "aws_lambda_event_source_mapping" "boarding_pass_async_sqs" {
-  event_source_arn = aws_sqs_queue.boarding_pass_generation.arn
-  function_name    = aws_lambda_function.boarding_pass_async.arn
-  batch_size       = 1
-}
+# boarding-pass: SNS→Lambda directo (suscripción + permiso en messaging.tf).
 
 # ── Lambda: Human Handoff Processor ───────────────────────────────────────────
 #
-# Consume mensajes de la cola human-handoff cuando el chatbot deriva al usuario
-# a un agente humano. Hace un mock del POST al sistema del call center y
-# actualiza el ticket HANDOFF# en conversations table a status=ACK.
+# Ahora alimentada por el SNS central (filtro handoff_requested) → cola
+# human-handoff (antes el chat_handler hacía sqs:send_message directo).
 
 data "archive_file" "human_handoff_processor" {
   type        = "zip"
@@ -159,6 +195,11 @@ resource "aws_lambda_function" "human_handoff_processor" {
       SNS_NOTIFICATIONS_ARN    = aws_sns_topic.notifications.arn
     }
   }
+
+  vpc_config {
+    subnet_ids         = aws_subnet.private_lambda[*].id
+    security_group_ids = [aws_security_group.lambda.id]
+  }
 }
 
 resource "aws_lambda_event_source_mapping" "human_handoff_sqs" {
@@ -169,11 +210,8 @@ resource "aws_lambda_event_source_mapping" "human_handoff_sqs" {
 
 # ── Lambda: Proactive Notifications ───────────────────────────────────────────
 #
-# Consume mensajes de la cola proactive-notifications cuando el sistema de
-# operaciones publica un evento de cancelación/cambio de vuelo a SNS
-# flight-events. Hace Query a GSI2 ReservationsByFlight para encontrar todos
-# los PNRs afectados y publica un email personalizado por usuario via SNS
-# notifications.
+# Suscrita al SNS central (filtro flight_cancelled) → cola proactive-notifications.
+# Query a GSI ReservationsByFlight y fan-out de emails a los pasajeros afectados.
 
 data "archive_file" "proactive_notifications" {
   type        = "zip"
@@ -198,51 +236,52 @@ resource "aws_lambda_function" "proactive_notifications" {
       SNS_EVENTS_ARN        = aws_sns_topic.events.arn
     }
   }
+
+  vpc_config {
+    subnet_ids         = aws_subnet.private_lambda[*].id
+    security_group_ids = [aws_security_group.lambda.id]
+  }
 }
 
-resource "aws_lambda_event_source_mapping" "proactive_notifications_sqs" {
-  event_source_arn = aws_sqs_queue.proactive_notifications.arn
-  function_name    = aws_lambda_function.proactive_notifications.arn
-  batch_size       = 5
-}
+# proactive-notifications: SNS→Lambda directo (suscripción + permiso en messaging.tf).
 
-# ── Lambda: Flight Cancellation Detector (DynamoDB Stream) ────────────────────
+# ── Lambda: Stream Emitter (DynamoDB Stream → SNS central) ────────────────────
 #
-# Consume el Stream de business table y publica al SNS flight-events cuando
-# detecta una transición de estado_vuelo a CANCELADO en un master row FLIGHT#.
-# Único trigger del flujo en TP4 final. El resto del flujo
-# (SNS → SQS proactive-notifications → Lambda → emails) queda igual.
+# Consume el Stream de business (filter MODIFY + estado_vuelo=CANCELADO) y publica
+# flight_cancelled al SNS central con MessageAttribute event_type. Patrón CDC: el
+# evento se deriva del cambio comprometido — evita el dual-write del poller.
 
-data "archive_file" "flight_cancellation_detector" {
+data "archive_file" "stream_emitter" {
   type        = "zip"
-  source_file = "${path.module}/../../lambda/flight_cancellation_detector.py"
-  output_path = "${path.module}/builds/flight_cancellation_detector.zip"
+  source_file = "${path.module}/../../lambda/stream_emitter.py"
+  output_path = "${path.module}/builds/stream_emitter.zip"
 }
 
-resource "aws_lambda_function" "flight_cancellation_detector" {
-  function_name    = "${local.name_prefix}-flight-cancellation-detector"
-  filename         = data.archive_file.flight_cancellation_detector.output_path
-  source_code_hash = data.archive_file.flight_cancellation_detector.output_base64sha256
+resource "aws_lambda_function" "stream_emitter" {
+  function_name    = "${local.name_prefix}-stream-emitter"
+  filename         = data.archive_file.stream_emitter.output_path
+  source_code_hash = data.archive_file.stream_emitter.output_base64sha256
   runtime          = "python3.12"
-  handler          = "flight_cancellation_detector.handler"
+  handler          = "stream_emitter.handler"
   role             = data.aws_iam_role.lab_role.arn
   timeout          = var.lambda_timeout
 
   environment {
     variables = {
-      AWS_REGION_VAR        = var.aws_region
-      SNS_FLIGHT_EVENTS_ARN = aws_sns_topic.flight_events.arn
+      AWS_REGION_VAR = var.aws_region
+      SNS_EVENTS_ARN = aws_sns_topic.events.arn
     }
+  }
+
+  vpc_config {
+    subnet_ids         = aws_subnet.private_lambda[*].id
+    security_group_ids = [aws_security_group.lambda.id]
   }
 }
 
-# Stream → Lambda con filter_criteria: solo invoca cuando un MODIFY pone
-# estado_vuelo=CANCELADO. Reduce drásticamente las invocaciones (no se ejecuta
-# por escrituras de PNR#, SEAT#, etc.). El handler igual valida que sea master
-# row FLIGHT# y que sea una transición real (no re-cancelación).
-resource "aws_lambda_event_source_mapping" "flight_cancellation_stream" {
+resource "aws_lambda_event_source_mapping" "stream_emitter_stream" {
   event_source_arn  = aws_dynamodb_table.business.stream_arn
-  function_name     = aws_lambda_function.flight_cancellation_detector.arn
+  function_name     = aws_lambda_function.stream_emitter.arn
   starting_position = "LATEST"
   batch_size        = 10
 
@@ -264,10 +303,9 @@ resource "aws_lambda_event_source_mapping" "flight_cancellation_stream" {
 
 # ── Lambda: Notification ──────────────────────────────────────────────────────
 #
-# Invocada directamente por Step Functions en dos puntos:
-#   - PostBookingActions (branch Parallel) — booking_confirmed
-#   - NotifyBookingFailed — booking_failed
-# Recibe {event_type, data: <estado actual>}
+# TP4: pasa de invocación directa por Step Functions → consumidor SQS de la cola
+# `notification` (alimentada por el SNS central, filtro booking_confirmed/failed).
+# Publica el email al SNS notifications. Lee el mensaje del envelope de SNS.
 
 data "archive_file" "notification" {
   type        = "zip"
@@ -290,4 +328,96 @@ resource "aws_lambda_function" "notification" {
       SNS_NOTIFICATIONS_ARN = aws_sns_topic.notifications.arn
     }
   }
+
+  vpc_config {
+    subnet_ids         = aws_subnet.private_lambda[*].id
+    security_group_ids = [aws_security_group.lambda.id]
+  }
 }
+
+# notification: SNS→Lambda directo (suscripción + permiso en messaging.tf).
+
+# ── Lambda: Refund (refund Saga steps) ────────────────────────────────────────
+#
+# Empaquetadas desde el dir lambda (refund_processor.py puede reusar lógica de
+# payment_processor / pricing). Dos handlers invocados por la refund Saga:
+#   - get_affected_pnrs_handler → Query GSI ReservationsByFlight
+#   - refund_pnr_handler        → refund + marcar PNR CANCELADO (idempotente)
+
+locals {
+  refund_handlers = {
+    get-pnrs   = "refund_processor.get_affected_pnrs_handler"
+    refund-pnr = "refund_processor.refund_pnr_handler"
+  }
+}
+
+data "archive_file" "refund_processor" {
+  type        = "zip"
+  source_dir  = "${path.module}/../../lambda"
+  output_path = "${path.module}/builds/refund_processor.zip"
+  excludes    = ["tests", "tests/__init__.py", "tests/test_pricing.py", "__pycache__"]
+}
+
+resource "aws_lambda_function" "refund" {
+  for_each = local.refund_handlers
+
+  function_name    = "${local.name_prefix}-refund-${each.key}"
+  filename         = data.archive_file.refund_processor.output_path
+  source_code_hash = data.archive_file.refund_processor.output_base64sha256
+  runtime          = "python3.12"
+  handler          = each.value
+  role             = data.aws_iam_role.lab_role.arn
+  timeout          = var.lambda_timeout
+
+  environment {
+    variables = {
+      AWS_REGION_VAR      = var.aws_region
+      BUSINESS_TABLE_NAME = aws_dynamodb_table.business.name
+    }
+  }
+
+  vpc_config {
+    subnet_ids         = aws_subnet.private_lambda[*].id
+    security_group_ids = [aws_security_group.lambda.id]
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# ── Lambda: Refund Trigger (SQS refund → StartExecution refund Saga) ──────────
+#
+# Consume la cola refund (flight_cancelled filtrado) y arranca la refund Saga con
+# name=flight_id (idempotencia: StartExecution duplicado rechazado).
+
+data "archive_file" "refund_trigger" {
+  type        = "zip"
+  source_file = "${path.module}/../../lambda/refund_trigger.py"
+  output_path = "${path.module}/builds/refund_trigger.zip"
+}
+
+resource "aws_lambda_function" "refund_trigger" {
+  function_name    = "${local.name_prefix}-refund-trigger"
+  filename         = data.archive_file.refund_trigger.output_path
+  source_code_hash = data.archive_file.refund_trigger.output_base64sha256
+  runtime          = "python3.12"
+  handler          = "refund_trigger.handler"
+  role             = data.aws_iam_role.lab_role.arn
+  timeout          = var.lambda_timeout
+
+  environment {
+    variables = {
+      AWS_REGION_VAR      = var.aws_region
+      REFUND_SFN_ARN      = aws_sfn_state_machine.refund.arn
+      BUSINESS_TABLE_NAME = aws_dynamodb_table.business.name
+    }
+  }
+
+  vpc_config {
+    subnet_ids         = aws_subnet.private_lambda[*].id
+    security_group_ids = [aws_security_group.lambda.id]
+  }
+}
+
+# refund-trigger: SNS→Lambda directo (suscripción + permiso en messaging.tf).

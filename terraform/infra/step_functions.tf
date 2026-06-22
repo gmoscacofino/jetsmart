@@ -1,16 +1,15 @@
-# ── Step Functions: Flujo de Reserva y Pago (patrón Saga) ─────────────────────
+# ── Step Functions: Booking Saga ──────────────────────────────────────────────
 #
-# Orquesta 4 pasos de reserva en secuencia con compensaciones automáticas.
-# Si cualquier paso falla, el state machine ejecuta las acciones de rollback.
+# Orquesta la reserva con compensaciones. TP4 re-arquitectura: el post-procesado
+# (notificación + boarding pass) ya NO se hace con un Parallel interno — el estado
+# terminal de éxito PUBLICA `booking_confirmed` al SNS central, y el fan-out
+# (notification + boarding-pass + analytics) lo hacen las suscripciones con filtro.
+# El core de la Saga (reserve/collect/confirm/compensate) no cambió.
 #
-# Flujo exitoso:  ReserveFlight → ReserveBooking → CollectPayment → ConfirmBooking
-#                 → PostBookingActions (Parallel: Notify + BoardingPass)
-#                 → BookingConfirmed (Succeed)
-#
-# Flujo de error: cualquier paso → CancelBooking → ReleaseFlight
-#                 → NotifyBookingFailed → BookingDLQ → BookingFailed (Fail)
-#
-# Compensación:   ConfirmBooking falla → RefundPayment → CancelBooking → ...
+# Camino feliz:  ReserveFlight → ReserveBooking → CollectPayment → ConfirmBooking
+#                → PublishBookingConfirmed (sns:publish) → BookingConfirmed
+# Compensación:  <error> → [RefundPayment] → CancelBooking → ReleaseFlight
+#                → PublishBookingFailed (sns:publish) → BookingDLQ → BookingFailed
 
 resource "aws_sfn_state_machine" "booking" {
   name     = "${local.name_prefix}-booking-workflow"
@@ -21,8 +20,6 @@ resource "aws_sfn_state_machine" "booking" {
     StartAt = "ReserveFlight"
 
     States = {
-
-      # ── Camino exitoso ──────────────────────────────────────────────────────
 
       ReserveFlight = {
         Type     = "Task"
@@ -78,7 +75,7 @@ resource "aws_sfn_state_machine" "booking" {
       ConfirmBooking = {
         Type     = "Task"
         Resource = aws_lambda_function.payment["confirm"].arn
-        Next     = "PostBookingActions"
+        Next     = "PublishBookingConfirmed"
         Retry = [{
           ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"]
           IntervalSeconds = 2
@@ -92,56 +89,33 @@ resource "aws_sfn_state_machine" "booking" {
         }]
       }
 
-      # Notificación + encolado de boarding pass async (best-effort)
-      # TP4: boarding pass salió del path sync del Saga. PostBookingActions
-      # ahora encola un mensaje a SQS boarding-pass-generation y la Lambda
-      # boarding_pass_async lo consume y genera el BP en background, sin
-      # bloquear la confirmación de la reserva.
-      PostBookingActions = {
-        Type = "Parallel"
-        Next = "BookingConfirmed"
+      # Publica el HECHO booking_confirmed al backbone. event_type va como
+      # MessageAttribute (las filter policies operan sobre attributes).
+      # Best-effort: si el publish falla, la reserva ya está confirmada igual.
+      PublishBookingConfirmed = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::sns:publish"
+        Parameters = {
+          TopicArn    = aws_sns_topic.events.arn
+          "Message.$" = "States.JsonToString($)"
+          MessageAttributes = {
+            event_type = { DataType = "String", StringValue = "booking_confirmed" }
+          }
+        }
+        Next       = "BookingConfirmed"
+        ResultPath = "$.publish_result"
         Catch = [{
           ErrorEquals = ["States.ALL"]
           Next        = "BookingConfirmed"
-          ResultPath  = "$.post_actions_error"
+          ResultPath  = "$.publish_error"
         }]
-        Branches = [
-          {
-            StartAt = "NotifyBookingConfirmed"
-            States = {
-              NotifyBookingConfirmed = {
-                Type     = "Task"
-                Resource = aws_lambda_function.notification.arn
-                Parameters = {
-                  "event_type" = "booking_confirmed"
-                  "data.$"     = "$"
-                }
-                End = true
-              }
-            }
-          },
-          {
-            StartAt = "EnqueueBoardingPass"
-            States = {
-              EnqueueBoardingPass = {
-                Type     = "Task"
-                Resource = "arn:aws:states:::sqs:sendMessage"
-                Parameters = {
-                  QueueUrl        = aws_sqs_queue.boarding_pass_generation.url
-                  "MessageBody.$" = "States.JsonToString($)"
-                }
-                End = true
-              }
-            }
-          }
-        ]
       }
 
       BookingConfirmed = {
         Type = "Succeed"
       }
 
-      # ── Camino de compensación ──────────────────────────────────────────────
+      # ── Compensación ────────────────────────────────────────────────────────
 
       RefundPayment = {
         Type       = "Task"
@@ -170,32 +144,36 @@ resource "aws_sfn_state_machine" "booking" {
       ReleaseFlight = {
         Type       = "Task"
         Resource   = aws_lambda_function.payment["release-flight"].arn
-        Next       = "NotifyBookingFailed"
+        Next       = "PublishBookingFailed"
         ResultPath = "$.release"
         Catch = [{
           ErrorEquals = ["States.ALL"]
-          Next        = "NotifyBookingFailed"
+          Next        = "PublishBookingFailed"
           ResultPath  = "$.release_error"
         }]
       }
 
-      NotifyBookingFailed = {
+      # Publica booking_failed al backbone (notification + analytics por filtro).
+      PublishBookingFailed = {
         Type     = "Task"
-        Resource = aws_lambda_function.notification.arn
+        Resource = "arn:aws:states:::sns:publish"
         Parameters = {
-          "event_type" = "booking_failed"
-          "data.$"     = "$"
+          TopicArn    = aws_sns_topic.events.arn
+          "Message.$" = "States.JsonToString($)"
+          MessageAttributes = {
+            event_type = { DataType = "String", StringValue = "booking_failed" }
+          }
         }
         Next       = "BookingDLQ"
-        ResultPath = "$.notify_result"
+        ResultPath = "$.publish_result"
         Catch = [{
           ErrorEquals = ["States.ALL"]
           Next        = "BookingDLQ"
-          ResultPath  = "$.notify_error"
+          ResultPath  = "$.publish_error"
         }]
       }
 
-      # SDK integration: escribe directamente en SQS sin Lambda
+      # SDK integration: deja el caso fallido en la DLQ para revisión manual.
       BookingDLQ = {
         Type     = "Task"
         Resource = "arn:aws:states:::sqs:sendMessage"
@@ -228,5 +206,91 @@ resource "aws_sfn_state_machine" "booking" {
 
 resource "aws_cloudwatch_log_group" "step_functions" {
   name              = "/aws/states/${local.name_prefix}-booking-workflow"
+  retention_in_days = 30
+}
+
+# ── Step Functions: Refund Saga ───────────────────────────────────────────────
+#
+# Disparada por refund_trigger (StartExecution name=flight_id, idempotente) cuando
+# llega flight_cancelled. Fan-out por PNR con un Map de concurrencia acotada
+# (MaxConcurrency=5 protege la pasarela). Cada PNR se reembolsa de forma
+# idempotente; un fallo por PNR cae a refund-failures-dlq sin frenar al resto.
+
+resource "aws_sfn_state_machine" "refund" {
+  name     = "${local.name_prefix}-refund-workflow"
+  role_arn = data.aws_iam_role.lab_role.arn
+
+  definition = jsonencode({
+    Comment = "JetSmart — reembolso por vuelo cancelado (fan-out por PNR)"
+    StartAt = "GetAffectedPNRs"
+
+    States = {
+
+      GetAffectedPNRs = {
+        Type     = "Task"
+        Resource = aws_lambda_function.refund["get-pnrs"].arn
+        Next     = "RefundFanout"
+        Retry = [{
+          ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"]
+          IntervalSeconds = 2
+          MaxAttempts     = 3
+          BackoffRate     = 2
+        }]
+      }
+
+      RefundFanout = {
+        Type           = "Map"
+        ItemsPath      = "$.pnrs"
+        MaxConcurrency = 5
+        ResultPath     = "$.refund_results"
+        Next           = "RefundDone"
+        ItemProcessor = {
+          ProcessorConfig = { Mode = "INLINE" }
+          StartAt         = "RefundPNR"
+          States = {
+            RefundPNR = {
+              Type     = "Task"
+              Resource = aws_lambda_function.refund["refund-pnr"].arn
+              End      = true
+              Retry = [{
+                ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"]
+                IntervalSeconds = 2
+                MaxAttempts     = 3
+                BackoffRate     = 2
+              }]
+              Catch = [{
+                ErrorEquals = ["States.ALL"]
+                Next        = "RefundPNRFailed"
+                ResultPath  = "$.error"
+              }]
+            }
+            RefundPNRFailed = {
+              Type     = "Task"
+              Resource = "arn:aws:states:::sqs:sendMessage"
+              Parameters = {
+                QueueUrl        = aws_sqs_queue.refund_failures_dlq.url
+                "MessageBody.$" = "States.JsonToString($)"
+              }
+              End = true
+            }
+          }
+        }
+      }
+
+      RefundDone = {
+        Type = "Succeed"
+      }
+    }
+  })
+
+  logging_configuration {
+    log_destination        = "${aws_cloudwatch_log_group.refund_workflow.arn}:*"
+    include_execution_data = true
+    level                  = "ERROR"
+  }
+}
+
+resource "aws_cloudwatch_log_group" "refund_workflow" {
+  name              = "/aws/states/${local.name_prefix}-refund-workflow"
   retention_in_days = 30
 }

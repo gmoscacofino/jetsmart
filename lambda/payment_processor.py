@@ -546,6 +546,9 @@ def confirm_booking_handler(event, context):
                     "payload":        {"amount": event.get("total_pagado", 0)},
                 }),
                 Subject="purchase_complete",
+                MessageAttributes={
+                    "event_type": {"DataType": "String", "StringValue": "purchase_complete"},
+                },
             )
         except Exception as e:
             log.warning("Error publicando evento analytics: %s", e)

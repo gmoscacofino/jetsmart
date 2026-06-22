@@ -174,13 +174,18 @@ def _emit_event(event_type: str, payload: dict, user_id: str):
     try:
         sns.publish(
             TopicArn=SNS_TOPIC_ARN,
+            # Trailing "\n": al entregarse por SNS→Firehose (raw) al data lake,
+            # cada evento queda como una línea JSON válida (JSON Lines).
             Message=json.dumps({
                 "event_type": event_type,
                 "user_id":    user_id,
                 "timestamp":  datetime.now(timezone.utc).isoformat(),
                 "payload":    payload,
-            }),
+            }) + "\n",
             Subject=event_type,
+            MessageAttributes={
+                "event_type": {"DataType": "String", "StringValue": event_type},
+            },
         )
     except Exception as e:
         log.warning("SNS emit fallido: %s", e)
@@ -1092,29 +1097,33 @@ def _execute_tool(name: str, inputs: dict, user_id: str, session_id: str = "", u
             "ttl":         ttl,
         })
 
-        # Encolamos a la SQS — si el call center está caído, queda esperando
-        if HUMAN_HANDOFF_QUEUE_URL:
-            try:
-                sqs.send_message(
-                    QueueUrl=HUMAN_HANDOFF_QUEUE_URL,
-                    MessageBody=json.dumps({
-                        "handoff_id": handoff_id,
-                        "session_id": session_id,
-                        "user_id":    user_id,
-                        "reason":     reason,
-                        "urgency":    urgency,
-                        "created_at": now,
-                    }),
-                )
-            except Exception as e:
-                log.error("SQS send_message human-handoff falló: %s", e)
-                return json.dumps({
-                    "ok": False,
-                    "ticket_id": handoff_id,
-                    "mensaje": "Registramos tu pedido pero hubo un problema enviándolo al call center. Te contactaremos lo antes posible.",
-                })
-        else:
-            log.warning("HUMAN_HANDOFF_QUEUE_URL no configurado — handoff sólo persistido en DB")
+        # Publicamos al topic central `events` con event_type=handoff_requested.
+        # El fan-out a la cola human-handoff lo hace el topic via filter policy —
+        # si el call center está caído, el mensaje queda esperando en la cola.
+        handoff_dict = {
+            "handoff_id": handoff_id,
+            "session_id": session_id,
+            "user_id":    user_id,
+            "reason":     reason,
+            "urgency":    urgency,
+            "created_at": now,
+        }
+        try:
+            sns.publish(
+                TopicArn=SNS_TOPIC_ARN,
+                Subject=f"handoff_requested — {handoff_id}",
+                Message=json.dumps(handoff_dict) + "\n",
+                MessageAttributes={
+                    "event_type": {"DataType": "String", "StringValue": "handoff_requested"},
+                },
+            )
+        except Exception as e:
+            log.error("SNS publish handoff_requested falló: %s", e)
+            return json.dumps({
+                "ok": False,
+                "ticket_id": handoff_id,
+                "mensaje": "Registramos tu pedido pero hubo un problema enviándolo al call center. Te contactaremos lo antes posible.",
+            })
 
         _emit_event("handoff_escalated", {
             "handoff_id": handoff_id,

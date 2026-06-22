@@ -1,8 +1,11 @@
 """
 Notifica al usuario el resultado de su reserva via SNS email.
-Invocada directamente por Step Functions en dos puntos del workflow:
-  - PostBookingActions (Parallel branch) con event_type=booking_confirmed
-  - NotifyBookingFailed con event_type=booking_failed
+
+Trigger: SQS (cola `notification`), alimentada por el topic central `events`
+con filter policy event_type IN (booking_confirmed, booking_failed). Cada
+record es un envelope SNS entregado a SQS:
+  - MessageAttributes.event_type.Value  → booking_confirmed | booking_failed
+  - Message                             → estado del Saga (pnr, user_id, total, ...)
 """
 import os, json, logging
 
@@ -17,10 +20,7 @@ NOTIFICATION_ARN = os.environ.get("SNS_NOTIFICATIONS_ARN", "")
 sns = boto3.client("sns", region_name=REGION)
 
 
-def handler(event, context):
-    event_type = event.get("event_type", "booking_unknown")
-    data       = event.get("data", {})
-
+def _notify(event_type: str, data: dict) -> dict:
     reservation_id = data.get("reservation_id", "—")
     flight_info    = data.get("flight_info", {})
     reservation    = data.get("reservation", {})
@@ -66,3 +66,25 @@ def handler(event, context):
         log.error("Error enviando notificación SNS: %s", e)
 
     return {"notified": True, "event_type": event_type}
+
+
+def handler(event, context):
+    records = event.get("Records", [])
+    log.info("Processing %d notification record(s)", len(records))
+
+    results = []
+    for record in records:
+        try:
+            # SNS→Lambda directo: el evento llega bajo record["Sns"].
+            envelope   = record["Sns"]
+            attrs      = envelope.get("MessageAttributes", {})
+            event_type = (attrs.get("event_type") or {}).get("Value") or "booking_unknown"
+            data       = json.loads(envelope["Message"])
+            results.append(_notify(event_type, data))
+        except Exception as e:
+            log.error("Error procesando record: %s", e)
+            # Re-raise → SNS reintenta (async). Sin DLQ: visibilidad por alarma
+            # de Lambda Errors (pérdida del email tolerable, reserva en DynamoDB).
+            raise
+
+    return {"statusCode": 200, "results": results}

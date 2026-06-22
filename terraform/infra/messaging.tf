@@ -1,18 +1,25 @@
-# ── SNS: topic de eventos del chatbot (analytics) ─────────────────────────────
+# ── SNS: backbone de eventos (topic central) ──────────────────────────────────
+#
+# Un único topic central de dominio. Los publishers (chat-handler Fargate, Step
+# Functions de la Saga, stream-emitter) publican con el MessageAttribute
+# `event_type`; cada subscriber filtra por ese atributo.
+#
+# Subscribers (SNS→Lambda DIRECTO salvo human-handoff):
+#   chat_message / busqueda_… → Firehose interaction_events (comportamiento)
+#   handoff_requested  → SQS human-handoff → λ (downstream NO elástico)
+#   booking_confirmed  → λ notification + λ boarding-pass
+#   booking_failed     → λ notification
+#   flight_cancelled   → λ proactive-notifications + λ refund-trigger
+#
+# Solo human-handoff usa SQS: protege un downstream no elástico (call center).
+# El resto va SNS→λ directo + alarma de Lambda Errors (la pérdida es tolerable o
+# re-derivable desde DynamoDB) — no se ponen DLQs por agregar.
 
 resource "aws_sns_topic" "events" {
   name = "${local.name_prefix}-events"
 }
 
-# ── SNS: topic de notificaciones al usuario ────────────────────────────────────
-#
-# Recibe eventos de booking_confirmed / booking_failed / handoff_ack /
-# flight_cancellation desde varias Lambdas. Las suscripciones email se declaran
-# en la variable var.notification_email_subscribers.
-#
-# Atención: después del primer apply, AWS manda un mail "Confirm subscription"
-# a cada endpoint. Hasta que se clickee el link, la subscription queda en estado
-# "PendingConfirmation" y NO llegan los mails reales.
+# ── SNS: canal de email a usuarios (NO es el backbone) ────────────────────────
 
 resource "aws_sns_topic" "notifications" {
   name = "${local.name_prefix}-notifications"
@@ -25,56 +32,11 @@ resource "aws_sns_topic_subscription" "notifications_email" {
   endpoint  = each.value
 }
 
-# ── SNS: topic de eventos de operaciones (vuelos) ─────────────────────────────
+# ── SQS: única cola funcional — human-handoff ─────────────────────────────────
 #
-# Publicado por la Lambda flight_cancellation_detector cuando el DynamoDB
-# Stream de business señala una transición de estado_vuelo a CANCELADO en
-# un master row FLIGHT#. Consumido por la cola proactive-notifications, que
-# dispara la Lambda proactive_notifications para hacer fan-out de emails a los
-# pasajeros afectados.
-
-resource "aws_sns_topic" "flight_events" {
-  name = "${local.name_prefix}-flight-events"
-}
-
-# ── SQS: analytics ────────────────────────────────────────────────────────────
-
-resource "aws_sqs_queue" "analytics" {
-  name                       = "${local.name_prefix}-analytics"
-  message_retention_seconds  = 86400
-  visibility_timeout_seconds = 360 # 6× Lambda timeout (60s) per AWS recommendation
-  receive_wait_time_seconds  = 20
-
-  redrive_policy = jsonencode({
-    deadLetterTargetArn = aws_sqs_queue.analytics_dlq.arn
-    maxReceiveCount     = 3
-  })
-}
-
-resource "aws_sqs_queue" "analytics_dlq" {
-  name                      = "${local.name_prefix}-analytics-dlq"
-  message_retention_seconds = 1209600
-}
-
-# ── SQS: dead-letter queue de reservas fallidas ───────────────────────────────
-#
-# Recibe mensajes del estado BookingDLQ de Step Functions mediante SDK integration.
-# Permite revisar y reprocesar manualmente los flujos de pago que fallaron.
-
-resource "aws_sqs_queue" "booking_failed_dlq" {
-  name                      = "${local.name_prefix}-booking-failed-dlq"
-  message_retention_seconds = 1209600 # 14 días para investigar errores
-}
-
-# ── SQS: human-handoff ────────────────────────────────────────────────────────
-#
-# El chat_handler envía mensajes acá cuando el modelo invoca la tool
-# `escalate_to_human`. La Lambda human_handoff_processor los consume,
-# simula un POST al sistema del call center y actualiza el ticket HANDOFF#
-# en conversations table a status=ACK.
-#
-# Decopla el chatbot del call center: si el call center está caído, el chatbot
-# sigue respondiendo y el pedido queda esperando en la cola.
+# Justificación: el call center (mock) es un downstream NO elástico que se puede
+# caer; la cola desacopla y, si está caído, el pedido espera sin perderse. Su DLQ
+# captura el caso persistente (pedido de soporte que no se puede perder).
 
 resource "aws_sqs_queue" "human_handoff" {
   name                       = "${local.name_prefix}-human-handoff"
@@ -93,75 +55,35 @@ resource "aws_sqs_queue" "human_handoff_dlq" {
   message_retention_seconds = 1209600
 }
 
-# ── SQS: proactive-notifications ──────────────────────────────────────────────
+# ── DLQs de Step Functions (escritas por Catch, no son redrive de cola) ───────
 #
-# Suscrita al topic SNS flight-events. Cuando ops marca un vuelo como cancelado,
-# este flow dispara la Lambda proactive_notifications que hace Query a GSI2
-# para encontrar todos los PNRs afectados y publica un email por usuario.
+# Únicas DLQs además de human-handoff: ambas sobre paths de PLATA no recuperable.
 
-resource "aws_sqs_queue" "proactive_notifications" {
-  name                       = "${local.name_prefix}-proactive-notifications"
-  message_retention_seconds  = 86400
-  visibility_timeout_seconds = 360
-  receive_wait_time_seconds  = 20
-
-  redrive_policy = jsonencode({
-    deadLetterTargetArn = aws_sqs_queue.proactive_notifications_dlq.arn
-    maxReceiveCount     = 3
-  })
-}
-
-resource "aws_sqs_queue" "proactive_notifications_dlq" {
-  name                      = "${local.name_prefix}-proactive-notifications-dlq"
+# Refund Saga: un PNR cuyo reembolso falla tras los reintentos del Map → revisión
+# manual (es plata, no se puede dejar sin reembolsar en silencio).
+resource "aws_sqs_queue" "refund_failures_dlq" {
+  name                      = "${local.name_prefix}-refund-failures-dlq"
   message_retention_seconds = 1209600
 }
 
-# ── SQS: boarding-pass-generation ─────────────────────────────────────────────
-#
-# Step Functions (PostBookingActions Branch B) publica mensajes acá vía
-# SDK sqs:sendMessage. La Lambda boarding_pass_async consume, genera el PDF
-# (texto plano por simplicidad), sube a S3 y graba el bp_url en el PNR.
-#
-# Patron "fire-and-forget" desde el Saga: si la generación falla, no afecta
-# la reserva ya confirmada — sólo deja el BP pendiente en la DLQ para reintento.
-
-resource "aws_sqs_queue" "boarding_pass_generation" {
-  name                       = "${local.name_prefix}-boarding-pass-generation"
-  message_retention_seconds  = 86400
-  visibility_timeout_seconds = 360
-  receive_wait_time_seconds  = 20
-
-  redrive_policy = jsonencode({
-    deadLetterTargetArn = aws_sqs_queue.boarding_pass_generation_dlq.arn
-    maxReceiveCount     = 3
-  })
-}
-
-resource "aws_sqs_queue" "boarding_pass_generation_dlq" {
-  name                      = "${local.name_prefix}-boarding-pass-generation-dlq"
+# Booking Saga: reserva que falló (transacción de pago) → revisión manual
+# (¿se cobró?, ¿corrió la compensación completa?).
+resource "aws_sqs_queue" "booking_failed_dlq" {
+  name                      = "${local.name_prefix}-booking-failed-dlq"
   message_retention_seconds = 1209600
 }
 
-# ── Suscripción: eventos del chat → cola analytics ────────────────────────────
+# ── Suscripción SQS: handoff_requested → cola human-handoff ────────────────────
 
-resource "aws_sns_topic_subscription" "events_to_analytics" {
-  topic_arn = aws_sns_topic.events.arn
-  protocol  = "sqs"
-  endpoint  = aws_sqs_queue.analytics.arn
+resource "aws_sns_topic_subscription" "events_to_human_handoff" {
+  topic_arn     = aws_sns_topic.events.arn
+  protocol      = "sqs"
+  endpoint      = aws_sqs_queue.human_handoff.arn
+  filter_policy = jsonencode({ event_type = ["handoff_requested"] })
 }
 
-# ── Suscripción: flight-events → cola proactive-notifications ─────────────────
-
-resource "aws_sns_topic_subscription" "flight_events_to_proactive" {
-  topic_arn = aws_sns_topic.flight_events.arn
-  protocol  = "sqs"
-  endpoint  = aws_sqs_queue.proactive_notifications.arn
-}
-
-# ── Política SQS: analytics acepta mensajes del topic events ─────────────────
-
-resource "aws_sqs_queue_policy" "analytics" {
-  queue_url = aws_sqs_queue.analytics.id
+resource "aws_sqs_queue_policy" "human_handoff" {
+  queue_url = aws_sqs_queue.human_handoff.id
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -169,25 +91,77 @@ resource "aws_sqs_queue_policy" "analytics" {
       Effect    = "Allow"
       Principal = { Service = "sns.amazonaws.com" }
       Action    = "sqs:SendMessage"
-      Resource  = aws_sqs_queue.analytics.arn
+      Resource  = aws_sqs_queue.human_handoff.arn
       Condition = { ArnEquals = { "aws:SourceArn" = aws_sns_topic.events.arn } }
     }]
   })
 }
 
-# ── Política SQS: proactive-notifications acepta mensajes de flight-events ───
+# ── Suscripciones SNS → Lambda DIRECTO (sin SQS, sin DLQ) ─────────────────────
+#
+# El downstream es elástico o el resultado es recuperable desde DynamoDB → no se
+# justifica una cola amortiguadora ni una DLQ. La durabilidad/visibilidad la dan
+# el retry de SNS + una alarma de Lambda Errors (ver cloudwatch.tf).
 
-resource "aws_sqs_queue_policy" "proactive_notifications" {
-  queue_url = aws_sqs_queue.proactive_notifications.id
+locals {
+  lambda_subscribers = {
+    notification = {
+      arn    = aws_lambda_function.notification.arn
+      name   = aws_lambda_function.notification.function_name
+      filter = { event_type = ["booking_confirmed", "booking_failed"] }
+    }
+    boarding_pass = {
+      arn    = aws_lambda_function.boarding_pass_async.arn
+      name   = aws_lambda_function.boarding_pass_async.function_name
+      filter = { event_type = ["booking_confirmed"] }
+    }
+    proactive = {
+      arn    = aws_lambda_function.proactive_notifications.arn
+      name   = aws_lambda_function.proactive_notifications.function_name
+      filter = { event_type = ["flight_cancelled"] }
+    }
+    refund = {
+      arn    = aws_lambda_function.refund_trigger.arn
+      name   = aws_lambda_function.refund_trigger.function_name
+      filter = { event_type = ["flight_cancelled"] }
+    }
+  }
+}
 
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "sns.amazonaws.com" }
-      Action    = "sqs:SendMessage"
-      Resource  = aws_sqs_queue.proactive_notifications.arn
-      Condition = { ArnEquals = { "aws:SourceArn" = aws_sns_topic.flight_events.arn } }
-    }]
+resource "aws_sns_topic_subscription" "events_to_lambda" {
+  for_each = local.lambda_subscribers
+
+  topic_arn     = aws_sns_topic.events.arn
+  protocol      = "lambda"
+  endpoint      = each.value.arn
+  filter_policy = jsonencode(each.value.filter)
+}
+
+resource "aws_lambda_permission" "events_invoke" {
+  for_each = local.lambda_subscribers
+
+  statement_id  = "AllowSNSInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = each.value.name
+  principal     = "sns.amazonaws.com"
+  source_arn    = aws_sns_topic.events.arn
+}
+
+# ── Suscripción comportamiento: SNS central → Firehose interaction_events ──────
+#
+# Captura los eventos semánticos del chat (búsquedas, intents, handoff) para el
+# data lake. filter_policy = anything-but los event_type transaccionales (esos
+# vienen del CDC de business, no del bus → sin doble conteo). raw_message_delivery
+# para que Firehose reciba el JSON del evento, no el envelope de SNS.
+
+resource "aws_sns_topic_subscription" "events_to_firehose" {
+  topic_arn             = aws_sns_topic.events.arn
+  protocol              = "firehose"
+  endpoint              = aws_kinesis_firehose_delivery_stream.lake["interaction_events"].arn
+  subscription_role_arn = data.aws_iam_role.lab_role.arn
+  raw_message_delivery  = true
+
+  filter_policy = jsonencode({
+    event_type = [{ "anything-but" = ["booking_confirmed", "booking_failed", "flight_cancelled"] }]
   })
 }

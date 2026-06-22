@@ -11,7 +11,7 @@
     chatbot-api y al token endpoint de Cognito, bloqueando exfiltración de
     tokens hacia dominios atacantes incluso si se inyectara JS malicioso.
   -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https://*.execute-api.us-east-1.amazonaws.com https://*.auth.us-east-1.amazoncognito.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://*.auth.us-east-1.amazoncognito.com" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' http://*.elb.amazonaws.com https://*.execute-api.us-east-1.amazonaws.com https://*.auth.us-east-1.amazoncognito.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://*.auth.us-east-1.amazoncognito.com" />
   <title>JetSmart — Asistente Virtual</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />

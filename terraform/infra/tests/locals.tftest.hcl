@@ -17,6 +17,11 @@ mock_provider "aws" {
       user_id    = "AKIAIOSFODNN7EXAMPLE"
     }
   }
+  mock_data "aws_availability_zones" {
+    defaults = {
+      names = ["us-east-1a", "us-east-1b", "us-east-1c"]
+    }
+  }
 }
 
 mock_provider "archive" {}
@@ -26,6 +31,7 @@ run "name_prefix_se_compone_de_project_y_environment" {
 
   variables {
     anthropic_api_key   = "sk-ant-test-key"
+    weather_api_key     = "test-weather-key"
     state_bucket_suffix = "test"
     environment         = "prod"
   }
@@ -41,6 +47,7 @@ run "common_tags_contiene_managed_by_terraform" {
 
   variables {
     anthropic_api_key   = "sk-ant-test-key"
+    weather_api_key     = "test-weather-key"
     state_bucket_suffix = "test"
     environment         = "dev"
   }
@@ -61,6 +68,7 @@ run "table_names_son_distintos_y_bien_formados" {
 
   variables {
     anthropic_api_key   = "sk-ant-test-key"
+    weather_api_key     = "test-weather-key"
     state_bucket_suffix = "test"
     environment         = "prod"
   }

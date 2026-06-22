@@ -157,6 +157,37 @@ jobs:
             -backend-config="use_lockfile=true" \
             -backend-config="encrypt=true"
 
+      # Crea SÓLO los repos ECR primero (apply targeteado) — evita el chicken-and-egg:
+      # las imágenes se pushean a repos que ya existen, antes del apply completo
+      # que crea los ECS services que las pullean.
+      - name: Crear repos ECR (apply targeteado)
+        if: github.event.inputs.action == 'apply'
+        env:
+          TF_VAR_anthropic_api_key:   ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
+          TF_VAR_weather_api_key:     ${{ secrets.TF_VAR_WEATHER_API_KEY }}
+          TF_VAR_state_bucket_suffix: ${{ secrets.STATE_BUCKET_SUFFIX }}
+        run: |
+          terraform apply -auto-approve \
+            -target=aws_ecr_repository.chat_handler \
+            -target=aws_ecr_repository.weather_poller
+
+      # Build + push de las dos imágenes Fargate. chat-handler se buildea con
+      # contexto = repo root (copia lambda/*.py + el system prompt); weather-poller
+      # es self-contained.
+      - name: Build & push imágenes a ECR
+        if: github.event.inputs.action == 'apply'
+        working-directory: ${{ github.workspace }}
+        run: |
+          CHAT_REPO=$(terraform -chdir=terraform/infra output -raw ecr_chat_handler_url)
+          POLLER_REPO=$(terraform -chdir=terraform/infra output -raw ecr_weather_poller_url)
+          REGISTRY=$(echo "$CHAT_REPO" | cut -d/ -f1)
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} \
+            | docker login --username AWS --password-stdin "$REGISTRY"
+          docker build -f app/chat-handler/Dockerfile   -t "$CHAT_REPO:${{ github.sha }}"   .
+          docker build -f app/weather-poller/Dockerfile -t "$POLLER_REPO:${{ github.sha }}" app/weather-poller
+          docker push "$CHAT_REPO:${{ github.sha }}"
+          docker push "$POLLER_REPO:${{ github.sha }}"
+
       # Cleanup de secret Anthropic en estado pendiente de eliminación (de runs anteriores).
       # AWS Secrets Manager bloquea recrear un secret con el mismo nombre si está scheduled-for-deletion.
       - name: Cleanup secret Anthropic pendiente de eliminación
@@ -179,7 +210,9 @@ jobs:
       - name: Terraform Plan
         env:
           TF_VAR_anthropic_api_key:              ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
+          TF_VAR_weather_api_key:                ${{ secrets.TF_VAR_WEATHER_API_KEY }}
           TF_VAR_state_bucket_suffix:            ${{ secrets.STATE_BUCKET_SUFFIX }}
+          TF_VAR_image_tag:                      ${{ github.sha }}
           TF_VAR_notification_email_subscribers: '["gmoscacofino@itba.edu.ar"]'
         run: terraform plan -out=tfplan
 
@@ -194,6 +227,17 @@ jobs:
           # variables de tipo list (env var se reinterpreta de forma distinta
           # a como quedo guardada en el plan).
         run: terraform apply -auto-approve tfplan
+
+      # Espera a que las tasks de Fargate pulleen la imagen y queden healthy antes
+      # de seguir (si los endpoints/SG están mal, esto falla acá con un error claro).
+      - name: Esperar ECS services estables
+        if: github.event.inputs.action == 'apply'
+        run: |
+          CLUSTER=$(terraform output -raw ecs_cluster_name)
+          aws ecs wait services-stable \
+            --cluster "$CLUSTER" \
+            --services jetsmart-prod-chat-handler jetsmart-prod-weather-poller \
+            --region ${{ env.AWS_REGION }}
 
       - name: Inject Terraform outputs into config.js
         if: github.event.inputs.action == 'apply'
@@ -219,15 +263,8 @@ jobs:
           pip install boto3 -q
           python3 ${{ github.workspace }}/scripts/seed_flights.py "$TABLE"
 
-      # Disparo inicial del Glue Crawler — descubre el schema en cuanto haya eventos.
-      # Si el bucket todavía está vacío el crawler termina sin crear tablas (ok).
-      - name: Disparar Glue Crawler inicial
-        if: github.event.inputs.action == 'apply'
-        run: |
-          CRAWLER=$(terraform output -raw glue_crawler_name)
-          aws glue start-crawler --name "$CRAWLER" --region ${{ env.AWS_REGION }} 2>/dev/null \
-            && echo "Crawler iniciado: $CRAWLER" \
-            || echo "Crawler ya estaba en ejecución (ok)"
+      # Sin Glue Crawler: las tablas del lake usan partition projection (dt/hh),
+      # así que Athena ve las particiones nuevas sin crawler.
 
       - name: Show Outputs
         if: github.event.inputs.action == 'apply'
@@ -244,9 +281,8 @@ jobs:
             echo "## Capa de Analytics"
             echo "| Recurso | Nombre |"
             echo "|---------|--------|"
-            echo "| Bucket de eventos | $(terraform output -raw analytics_bucket) |"
+            echo "| Bucket del data lake | $(terraform output -raw analytics_bucket) |"
             echo "| Glue Database | $(terraform output -raw glue_database_name) |"
-            echo "| Glue Crawler | $(terraform output -raw glue_crawler_name) |"
             echo "| Athena Workgroup | $(terraform output -raw athena_workgroup) |"
           } >> $GITHUB_STEP_SUMMARY
 
@@ -308,8 +344,19 @@ jobs:
             aws s3 rm "s3://${BUCKET}" --recursive --region "${{ env.AWS_REGION }}" 2>/dev/null || true
           done
 
+      # Escala los ECS services a 0 antes de destruir — drena las tasks/ENIs para
+      # que el teardown de la VPC (NAT, endpoints) no se trabe por ENIs en uso.
+      - name: Escalar ECS services a 0
+        run: |
+          CLUSTER="jetsmart-prod-cluster"
+          for SVC in jetsmart-prod-chat-handler jetsmart-prod-weather-poller; do
+            aws ecs update-service --cluster "$CLUSTER" --service "$SVC" \
+              --desired-count 0 --region ${{ env.AWS_REGION }} 2>/dev/null || true
+          done
+
       - name: Terraform Destroy
         env:
           TF_VAR_anthropic_api_key:   ${{ secrets.TF_VAR_ANTHROPIC_API_KEY }}
+          TF_VAR_weather_api_key:     ${{ secrets.TF_VAR_WEATHER_API_KEY }}
           TF_VAR_state_bucket_suffix: ${{ secrets.STATE_BUCKET_SUFFIX }}
         run: terraform destroy -auto-approve

@@ -37,6 +37,48 @@ variable "anthropic_api_key" {
   sensitive   = true
 }
 
+variable "weather_api_key" {
+  description = "climAPI key for the weather-poller (Fargate)."
+  type        = string
+  sensitive   = true
+}
+
+# ── Networking ────────────────────────────────────────────────────────────────
+
+variable "vpc_cidr" {
+  description = "CIDR block de la VPC"
+  type        = string
+  default     = "10.0.0.0/16"
+}
+
+# ── Fargate / ECR ─────────────────────────────────────────────────────────────
+
+variable "image_tag" {
+  description = "Tag de las imágenes ECR (chat-handler / weather-poller). El workflow pasa github.sha."
+  type        = string
+  default     = "latest"
+}
+
+# ── Weather poller ────────────────────────────────────────────────────────────
+
+variable "clima_api_base" {
+  description = "Base URL de la API de clima externa (climAPI). Ajustar al endpoint real."
+  type        = string
+  default     = "https://api.climapi.example"
+}
+
+variable "weather_poll_interval_seconds" {
+  description = "Intervalo del loop del weather-poller en segundos"
+  type        = number
+  default     = 1800
+}
+
+variable "force_cancel" {
+  description = "Modo demo: el weather-poller cancela un vuelo elegible por ciclo, sin pegarle a climAPI"
+  type        = bool
+  default     = false
+}
+
 # ── Chatbot ───────────────────────────────────────────────────────────────────
 
 variable "rutas_disponibles" {

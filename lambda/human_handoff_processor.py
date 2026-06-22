@@ -115,8 +115,12 @@ def handler(event, context):
 
     for record in records:
         try:
-            body = json.loads(record["body"])
-            _process_record(body)
+            # La cola ahora la alimenta el topic central `events` (filter
+            # handoff_requested): cada record es un envelope SNS. El payload del
+            # handoff viaja dentro de Message (CONTRATO central).
+            envelope = json.loads(record["body"])
+            handoff  = json.loads(envelope["Message"])
+            _process_record(handoff)
         except Exception as e:
             log.error("Error procesando record %s: %s", record.get("messageId"), e)
             # Re-raise para que SQS lo reintente (eventualmente cae a DLQ)

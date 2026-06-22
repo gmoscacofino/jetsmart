@@ -99,10 +99,13 @@ def handler(event, context):
     results = []
     for record in records:
         try:
-            saga_state = json.loads(record["body"])
+            # SNS→Lambda directo (filter booking_confirmed): el estado del Saga
+            # viaja dentro de record["Sns"]["Message"].
+            envelope   = record["Sns"]
+            saga_state = json.loads(envelope["Message"])
             results.append(_generate_bp(saga_state))
         except Exception as e:
-            log.error("Error generando BP en record %s: %s", record.get("messageId"), e)
+            log.error("Error generando BP en record: %s", e)
             raise  # SQS reintenta hasta DLQ
 
     return {"statusCode": 200, "generated": results}

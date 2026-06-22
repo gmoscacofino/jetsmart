@@ -1,6 +1,26 @@
 output "chatbot_api_url" {
-  description = "URL base del chatbot API Gateway (usarla en frontend/js/config.js)"
-  value       = module.chatbot_lambda.api_url
+  description = "URL base del chatbot (ALB HTTP — usarla en frontend/js/config.js)"
+  value       = "http://${aws_lb.main.dns_name}"
+}
+
+output "alb_dns_name" {
+  description = "DNS del Application Load Balancer del chat-handler"
+  value       = aws_lb.main.dns_name
+}
+
+output "ecr_chat_handler_url" {
+  description = "URL del repo ECR de la imagen chat-handler"
+  value       = aws_ecr_repository.chat_handler.repository_url
+}
+
+output "ecr_weather_poller_url" {
+  description = "URL del repo ECR de la imagen weather-poller"
+  value       = aws_ecr_repository.weather_poller.repository_url
+}
+
+output "ecs_cluster_name" {
+  description = "Nombre del cluster ECS (para aws ecs wait services-stable)"
+  value       = aws_ecs_cluster.main.name
 }
 
 output "auth_callback_url" {
@@ -63,11 +83,6 @@ output "business_table_arn" {
   value       = aws_dynamodb_table.business.arn
 }
 
-output "sqs_analytics_url" {
-  description = "URL de la cola SQS de analytics"
-  value       = aws_sqs_queue.analytics.url
-}
-
 output "sqs_booking_failed_dlq_url" {
   description = "URL de la DLQ de reservas fallidas"
   value       = aws_sqs_queue.booking_failed_dlq.url
@@ -83,50 +98,35 @@ output "sqs_human_handoff_dlq_url" {
   value       = aws_sqs_queue.human_handoff_dlq.url
 }
 
-output "sqs_proactive_notifications_url" {
-  description = "URL de la cola SQS de notificaciones proactivas"
-  value       = aws_sqs_queue.proactive_notifications.url
+output "sqs_refund_failures_dlq_url" {
+  description = "URL de la DLQ de reembolsos fallidos (refund Saga)"
+  value       = aws_sqs_queue.refund_failures_dlq.url
 }
 
-output "sqs_proactive_notifications_dlq_url" {
-  description = "URL de la DLQ de notificaciones proactivas"
-  value       = aws_sqs_queue.proactive_notifications_dlq.url
+output "business_analytics_emitter_function_name" {
+  description = "Nombre de la Lambda business-analytics-emitter (CDC → Firehose)"
+  value       = aws_lambda_function.business_analytics_emitter.function_name
 }
 
-output "sqs_boarding_pass_generation_url" {
-  description = "URL de la cola SQS de generación async de boarding pass"
-  value       = aws_sqs_queue.boarding_pass_generation.url
+output "stream_emitter_function_name" {
+  description = "Nombre de la Lambda stream-emitter (DynamoDB Stream → SNS central)"
+  value       = aws_lambda_function.stream_emitter.function_name
 }
 
-output "sqs_boarding_pass_generation_dlq_url" {
-  description = "URL de la DLQ de boarding pass generation"
-  value       = aws_sqs_queue.boarding_pass_generation_dlq.url
-}
-
-output "sns_flight_events_arn" {
-  description = "ARN del topic SNS de eventos de operaciones (cancelaciones, demoras)"
-  value       = aws_sns_topic.flight_events.arn
-}
-
-output "analytics_processor_function_name" {
-  description = "Nombre de la Lambda analytics-processor"
-  value       = aws_lambda_function.analytics_processor.function_name
-}
-
-output "flight_cancellation_detector_function_name" {
-  description = "Nombre de la Lambda detector de cancelaciones (consume DynamoDB Stream)"
-  value       = aws_lambda_function.flight_cancellation_detector.function_name
+output "refund_workflow_arn" {
+  description = "ARN del state machine de refund (fan-out por PNR)"
+  value       = aws_sfn_state_machine.refund.arn
 }
 
 output "business_table_stream_arn" {
-  description = "ARN del stream de la business table (event source del detector)"
+  description = "ARN del stream de la business table (event source del stream-emitter)"
   value       = aws_dynamodb_table.business.stream_arn
 }
 
 # ── Analytics: S3 + Glue + Athena ─────────────────────────────────────────────
 
 output "analytics_bucket" {
-  description = "Bucket S3 donde analytics-processor escribe los eventos crudos"
+  description = "Bucket S3 del data lake (Firehose escribe en lake/<tabla>/)"
   value       = aws_s3_bucket.analytics.bucket
 }
 
@@ -135,9 +135,9 @@ output "glue_database_name" {
   value       = aws_glue_catalog_database.analytics.name
 }
 
-output "glue_crawler_name" {
-  description = "Nombre del Glue Crawler (start-crawler para refrescar schema)"
-  value       = aws_glue_crawler.events.name
+output "lake_tables" {
+  description = "Tablas del data lake en el Glue Catalog"
+  value       = keys(local.lake_tables)
 }
 
 output "athena_workgroup" {
