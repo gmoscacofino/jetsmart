@@ -15,7 +15,7 @@
 
 resource "aws_security_group" "alb" {
   name        = "${local.name_prefix}-sg-alb"
-  description = "ALB público — HTTP 80 desde internet"
+  description = "ALB publico - HTTP 80 desde internet"
   vpc_id      = aws_vpc.main.id
 
   tags = { Name = "${local.name_prefix}-sg-alb" }
@@ -43,7 +43,7 @@ resource "aws_vpc_security_group_egress_rule" "alb_to_chat" {
 
 resource "aws_security_group" "chat" {
   name        = "${local.name_prefix}-sg-chat"
-  description = "Fargate chat-handler — inbound sólo desde el ALB"
+  description = "Fargate chat-handler - inbound solo desde el ALB"
   vpc_id      = aws_vpc.main.id
 
   tags = { Name = "${local.name_prefix}-sg-chat" }
@@ -51,7 +51,7 @@ resource "aws_security_group" "chat" {
 
 resource "aws_vpc_security_group_ingress_rule" "chat_from_alb" {
   security_group_id            = aws_security_group.chat.id
-  description                  = "Tráfico del ALB al contenedor"
+  description                  = "Trafico del ALB al contenedor"
   ip_protocol                  = "tcp"
   from_port                    = 8000
   to_port                      = 8000
@@ -69,7 +69,7 @@ resource "aws_vpc_security_group_egress_rule" "chat_all" {
 
 resource "aws_security_group" "poller" {
   name        = "${local.name_prefix}-sg-poller"
-  description = "Fargate weather-poller — solo egress (sin inbound)"
+  description = "Fargate weather-poller - solo egress (sin inbound)"
   vpc_id      = aws_vpc.main.id
 
   tags = { Name = "${local.name_prefix}-sg-poller" }
@@ -86,7 +86,7 @@ resource "aws_vpc_security_group_egress_rule" "poller_all" {
 
 resource "aws_security_group" "lambda" {
   name        = "${local.name_prefix}-sg-lambda"
-  description = "Lambdas en subnets privadas — solo egress"
+  description = "Lambdas en subnets privadas - solo egress"
   vpc_id      = aws_vpc.main.id
 
   tags = { Name = "${local.name_prefix}-sg-lambda" }
@@ -103,7 +103,7 @@ resource "aws_vpc_security_group_egress_rule" "lambda_all" {
 
 resource "aws_security_group" "endpoints" {
   name        = "${local.name_prefix}-sg-endpoints"
-  description = "Interface endpoints — 443 desde el cómputo de la VPC"
+  description = "Interface endpoints - 443 desde el computo de la VPC"
   vpc_id      = aws_vpc.main.id
 
   tags = { Name = "${local.name_prefix}-sg-endpoints" }
