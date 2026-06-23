@@ -23,7 +23,7 @@ Cada tabla **sí** mantiene single-table design dentro de su contexto — distin
 
 - **Failure isolation**: si la tabla de chat se satura/throttle, no afecta las reservas. Y viceversa.
 - **Retention independiente**: TTL agresivo en conversations (7d msgs, 30d handoffs) vs persistencia en business.
-- **Backup window independiente**: ambas tienen PITR + export diario, pero podrían divergir.
+- **Backup window independiente**: ambas tienen PITR (35 días), pero podrían divergir.
 - **Cost attribution**: cuánto cuesta operar el canal chatbot vs el core de negocio.
 - **Encryption key independiente**: hoy ambas usan SSE-S3, pero podrían usar KMS distintas (compliance segmentation).
 - **Reemplazabilidad del chatbot**: la conversation table es completamente desechable si se reemplaza el canal.
@@ -511,7 +511,6 @@ El PNR se genera con SHA-256 del `payment_id` en el chat-handler (`app/chat-hand
 | GSIs | 1 (ReservationsByFlight) | Resuelve AP32 (fan-out de cancelaciones) sin Scan |
 | **Stream** | **Habilitado, `NEW_AND_OLD_IMAGES`** | Consumido por la Lambda `stream-emitter` con filter_criteria. Permite comparar transiciones (no re-cancelaciones) y publicar `flight_cancelled` al SNS `events`. |
 | Point-in-time recovery | Habilitado | Recuperación granular hasta 35 días atrás |
-| Backups | EventBridge cron diario → `ExportTableToPointInTime` → S3 `backups` | Retención larga (AFIP 10 años) — complementa PITR |
 
 ---
 

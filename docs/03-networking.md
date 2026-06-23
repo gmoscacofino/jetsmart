@@ -138,7 +138,6 @@ Ningún recurso de datos tiene acceso público:
 
 ### Auditoría
 
-- **CloudTrail** — registra toda API call del cómputo a otros servicios AWS (quién por su execution role, cuándo, qué operación, parámetros, resultado). Activo por default.
 - **CloudWatch Logs** — logs aplicativos de Fargate (`awslogs`, log groups `/ecs/...-chat-handler` y `/ecs/...-weather-poller`, retención 30 días) y de las Lambdas.
 - Con la VPC desplegada, **VPC Flow Logs** vuelve a ser viable para detección de comportamiento anómalo de red L3/L4 (no estaba disponible en el diseño sin VPC).
 

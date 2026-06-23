@@ -28,7 +28,6 @@ El chatbot usa inteligencia artificial (Claude de Anthropic) para entender lengu
 | **Implementadas notificaciones proactivas (event-driven)**: trigger por **DynamoDB Stream** sobre `business` → Lambda `stream-emitter` (detecta la transición a CANCELADO) → publica `flight_cancelled` al SNS central `events` → Lambda `proactive_notifications` (suscripción SNS→Lambda directo con filter policy) → fan-out de emails vía SNS `notifications` | Completa la feature de TP1. Ops cambia `estado_vuelo=CANCELADO` en el master row del vuelo (consola DynamoDB o dashboard interno) y el Stream propaga. Ver justificación #28. |
 | **Boarding pass async vía SNS→Lambda directo**: el Saga ya no invoca la Lambda de boarding pass directamente — el estado terminal de éxito publica `booking_confirmed` al SNS central `events` y la Lambda `boarding_pass_async` (suscripción con filter policy `booking_confirmed`) lo consume | Desacopla el path sync del Saga del trabajo de generación del PDF. Fire-and-forget: la reserva ya quedó confirmada antes del fan-out. |
 | **Backbone de eventos: UN solo SNS topic `events`** con fan-out por filter policy (SNS→Lambda directo salvo `human-handoff`) | La única cola funcional es `human-handoff` (protege un downstream no elástico: el call center). Las demás suscripciones van SNS→Lambda directo con alarma de Lambda Errors; el resto de DLQs (`booking-failed-dlq`, `refund-failures-dlq`) son sinks de revisión manual escritos por los Catch de las Step Functions. |
-| **CloudTrail multi-region** con sink S3 dedicado, log file validation y lifecycle 90 días | Capa de auditoría de gobernanza: traza todas las API calls del management plane (IAM, cambios de config de Lambda/SNS/SQS/DynamoDB). Sin CloudWatch Logs (restricción Academy) y sin Glue/Athena (el JSON classifier default no parsea bien la estructura wrapped de CloudTrail — en producción iría con custom classifier o un SIEM). Consulta ad-hoc vía `aws s3 cp` + `jq`. Compensa la pérdida de VPC Flow Logs. |
 
 ### Bounded contexts: Conversations vs PSS Business
 
@@ -57,9 +56,9 @@ El core del chatbot (`chat-handler` y `weather-poller`) corre en **contenedores 
 - **1 NAT Gateway** (egress de las tasks hacia internet, p.ej. la API del clima),
 - **2 gateway endpoints** (S3, DynamoDB) + **8 interface endpoints** (sns, sqs, secretsmanager, states, ecr.api, ecr.dkr, logs, kinesis-firehose) para alcanzar servicios AWS sin salir por NAT.
 
-**Las 9 Lambdas de negocio corren en la VPC** (subnets `private-lambda`, `vpc_config`) y alcanzan DynamoDB/SNS/SQS/Step Functions/S3/Secrets por los **VPC endpoints**. Solo `auth-callback`, `cognito-trigger` y `backup-dynamodb` quedan regionales (sin VPC). Así, todo el cómputo del chatbot —Fargate y Lambdas— vive dentro de la VPC.
+**Las 9 Lambdas de negocio corren en la VPC** (subnets `private-lambda`, `vpc_config`) y alcanzan DynamoDB/SNS/SQS/Step Functions/S3/Secrets por los **VPC endpoints**. Solo `auth-callback` y `cognito-trigger` quedan regionales (sin VPC). Así, todo el cómputo del chatbot —Fargate y Lambdas— vive dentro de la VPC.
 
-Trade-off: a cambio del NAT Gateway y los endpoints que hay que mantener, ganamos aislamiento de red real para el core del chatbot (subnets privadas, sin IP pública). La auditoría se mantiene vía **CloudTrail** (multi-region, todas las API calls del management plane sinkeadas a S3 — consulta ad-hoc vía CLI) y **X-Ray** (tracing distribuido).
+Trade-off: a cambio del NAT Gateway y los endpoints que hay que mantener, ganamos aislamiento de red real para el core del chatbot (subnets privadas, sin IP pública). El tracing distribuido se mantiene vía **X-Ray**.
 
 ### Step Functions con patrón Saga para reservas
 
@@ -148,7 +147,6 @@ Las **4 tablas Glue son estáticas y tipadas** (declaradas en Terraform): el sch
 | 1 | S3 — frontend | Storage / Edge | Archivos estáticos del sitio web (HTML/CSS/JS). HTTP. |
 | 2 | S3 — boarding-passes | Storage | Boarding passes generados por la Lambda `boarding-pass-async`. (Renombrado desde `assets` en TP4: el system prompt se movió a una Lambda Layer.) |
 | 3 | S3 — analytics | Storage / Data lake | Eventos crudos en JSON Lines, particionado por `dt=YYYY-MM-DD/hh=HH`. |
-| 3b | S3 — backups | Storage / Backup | Exports diarios de DynamoDB (Hive-path `dynamodb/YYYY-MM-DD/...`). Lifecycle: 90d STANDARD → GLACIER → expira a 365d. |
 | 4 | Cognito User Pool | Auth | Registro y login con Hosted UI. |
 | 5 | Cognito Groups | Auth | `users` (chatbot). |
 | 6 | ALB — chatbot | Cómputo / Edge | Application Load Balancer internet-facing (HTTP:80). Enruta `/api/*` al servicio Fargate chat-handler; health check sobre `/health`. **No hay Cognito Authorizer — el JWT se valida in-app.** |
@@ -167,11 +165,9 @@ Las **4 tablas Glue son estáticas y tipadas** (declaradas en Terraform): el sch
 | 18 | Lambda — business-analytics-emitter | Cómputo | Emite eventos de negocio a Kinesis Data Firehose (PutRecord); Firehose batchea nativo y escribe S3 JSON Lines (sin Lambda de transformación). |
 | 19 | Lambda — auth-callback | Cómputo | Bridge HTTPS del workaround. Intercambia code por tokens. |
 | 20 | Lambda — cognito-trigger | Cómputo | Post-registro: asigna grupo `users`. |
-| 20b | Lambda — backup-dynamodb | Cómputo | Disparada por EventBridge cron diario. Exporta sólo la tabla `business` al bucket de backups (la `conversations` es efímera por TTL y queda cubierta por PITR). |
 | 20c | **Lambda — human-handoff-processor (TP4)** | Cómputo | Consume SQS human-handoff, mock POST al call center, actualiza ticket HANDOFF# y notifica al usuario por email. |
 | 20d | **Lambda — proactive-notifications (TP4)** | Cómputo | Suscripción SNS→Lambda directo al topic `events` (filter `flight_cancelled`); Query a GSI ReservationsByFlight, fan-out de emails vía SNS notifications. |
 | 21 | Step Functions | Orquestación | State machine del patrón Saga. TP4: el estado terminal de éxito publica `booking_confirmed` al SNS central `events` en lugar de un Parallel interno; el fan-out post-booking lo hacen las suscripciones con filtro. |
-| 21b | EventBridge Rule — backup-dynamodb-daily | Orquestación / Scheduling | Cron `0 3 * * ? *` (03:00 UTC). Único trigger basado en tiempo del sistema. |
 | 22 | SNS — events | Mensajería | Topic central (backbone). Publishers: chat-handler, Step Functions (booking_confirmed/booking_failed), stream-emitter (flight_cancelled). Fan-out por filter policy (`event_type`): SNS→Lambda directo (notification, boarding_pass_async, proactive_notifications, refund_trigger), SQS human-handoff (handoff_requested) y Firehose interaction_events (comportamiento, anything-but transaccionales). |
 | 23 | SNS — notifications | Mensajería | Notificaciones al usuario (booking confirmado / fallido / handoff ack / cancelación de vuelo). |
 | 23b | **Lambda — stream-emitter (TP4)** | Cómputo | Consume el DynamoDB Stream de `business`. Detecta la transición a estado_vuelo=CANCELADO en master rows FLIGHT# (OldImage≠CANCELADO, NewImage=CANCELADO) y publica `flight_cancelled` al SNS central `events`. También emite el CDC de negocio al data lake. |
@@ -250,24 +246,9 @@ Las **4 tablas Glue son estáticas y tipadas** (declaradas en Terraform): el sch
                                                               ↓ SQL (jetsmart_prod_analytics.<tabla>)
                                               Equipo Business Analytics
                                               (DBeaver / DataGrip)
-
-                          Backups de DynamoDB:
-                          EventBridge cron(0 3 * * ? *)
-                                  │ invoke
-                                  ↓
-                          Lambda backup-dynamodb
-                                  │ ExportTableToPointInTime (async)
-                                  ↓
-                          DynamoDB service (lee PITR)
-                                  │ put_object
-                                  ↓
-                          S3 jetsmart-backups/dynamodb/YYYY-MM-DD/...
-                                  │ lifecycle
-                                  ↓
-                          90d → GLACIER → 365d expira
 ```
 
-**VPC para el cómputo en contenedor.** El core del chatbot (Fargate: chat-handler + weather-poller) corre en subnets privadas dentro de la VPC `10.0.0.0/16`, y las 9 Lambdas de negocio también (subnets `private-lambda`); solo auth-callback, cognito-trigger y backup-dynamodb quedan regionales. La seguridad la garantizan: aislamiento de red (subnets privadas, SGs, NAT, VPC endpoints), IAM (LabRole con least-privilege por servicio), Cognito (autenticación), validación JWT in-app en el contenedor (autorización), encriptación en tránsito (TLS de servicios AWS) y en reposo (S3 SSE-S3, DynamoDB SSE).
+**VPC para el cómputo en contenedor.** El core del chatbot (Fargate: chat-handler + weather-poller) corre en subnets privadas dentro de la VPC `10.0.0.0/16`, y las 9 Lambdas de negocio también (subnets `private-lambda`); solo auth-callback y cognito-trigger quedan regionales. La seguridad la garantizan: aislamiento de red (subnets privadas, SGs, NAT, VPC endpoints), IAM (LabRole con least-privilege por servicio), Cognito (autenticación), validación JWT in-app en el contenedor (autorización), encriptación en tránsito (TLS de servicios AWS) y en reposo (S3 SSE-S3, DynamoDB SSE).
 
 ---
 

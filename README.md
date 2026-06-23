@@ -36,7 +36,7 @@ Para llegar al demo presencial del 17/06 incorporamos cinco cambios que cierran 
 | **Boarding pass async event-driven** | La Booking Saga ya no invoca Lambda directo — su estado terminal de éxito publica `event_type=booking_confirmed` al SNS central `events`; la Lambda `boarding_pass_async` (suscripción SNS→Lambda directo, filter `booking_confirmed`) genera el BP y graba `bp_url` en el PNR. Fire-and-forget. No hay SQS `boarding-pass-generation`. |
 | **Fan-out por SNS + DLQs de paths de plata + CloudWatch alarms** | El fan-out post-booking y de cancelación es SNS→Lambda directo con filter policies sobre un único topic `events`; la única SQS funcional es `human-handoff` (protege un downstream no elástico). DLQs reales: `human-handoff-dlq` (redrive de la cola) + `booking_failed_dlq` + `refund_failures_dlq` (sinks de los Catch de las Step Functions, revisión manual). Ver `terraform/infra/messaging.tf` y `cloudwatch.tf`. |
 
-Total Lambdas desplegadas: **19** (incluye las 7 de la Booking Saga y las 2 de la Refund Saga, expandidas con `for_each`; más `business-analytics-emitter`, `stream-emitter`, `boarding-pass-async`, `human-handoff-processor`, `proactive-notifications`, `notification`, `refund-trigger`, `backup-dynamodb`, `auth-callback` y `cognito-trigger`).
+Total Lambdas desplegadas: **18** (incluye las 7 de la Booking Saga y las 2 de la Refund Saga, expandidas con `for_each`; más `business-analytics-emitter`, `stream-emitter`, `boarding-pass-async`, `human-handoff-processor`, `proactive-notifications`, `notification`, `refund-trigger`, `auth-callback` y `cognito-trigger`).
 
 ## Requerimientos
 

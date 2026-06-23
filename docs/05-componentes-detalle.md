@@ -89,17 +89,16 @@ Lambda es el servicio de cómputo de los flujos asíncronos y de orquestación. 
 | `refund-trigger` | SNS `events` (filtro `event_type=flight_cancelled`, SNS→Lambda directo) | Arranca la refund Saga (StartExecution con name=flight_id para idempotencia) |
 | `auth-callback` | API Gateway GET /callback (bridge HTTPS del workaround) | Intercambia authorization code por tokens JWT y redirige al frontend |
 | `cognito-trigger` | Cognito post-registration | Asigna grupo `users` al usuario nuevo |
-| `backup-dynamodb` | EventBridge cron diario 03:00 UTC | Dispara `dynamodb:ExportTableToPointInTime` sobre `business`; el export queda en S3 `backups`. Mecanismo complementario a PITR (35d continuos), cubre retención AFIP de 10 años |
 
 ### Runtime y configuración
 
-Todas las Lambdas usan **Python 3.12**. El timeout configurable es de 30 segundos por defecto (variable `lambda_timeout`), con algunas excepciones explícitas en código: `backup-dynamodb` y `business-analytics-emitter` usan 60s para tolerar batches grandes. (El `chat-handler` ya no es Lambda — corre en Fargate sin límite de timeout de Lambda.)
+Todas las Lambdas usan **Python 3.12**. El timeout configurable es de 30 segundos por defecto (variable `lambda_timeout`), con algunas excepciones explícitas en código: `business-analytics-emitter` usa 60s para tolerar batches grandes. (El `chat-handler` ya no es Lambda — corre en Fargate sin límite de timeout de Lambda.)
 
 ### Las Lambdas de negocio corren en la VPC
 
 Las **9 Lambdas de negocio** (payment Saga, refund, notification, stream-emitter, business-analytics-emitter, human-handoff, proactive-notifications, boarding-pass-async, refund-trigger) se configuran con `vpc_config` apuntando a las subnets **`private-lambda`** — están **dentro de la VPC**, igual que Fargate. Alcanzan los servicios AWS por los **VPC endpoints** (DynamoDB/S3 por Gateway Endpoint; SNS/SQS/Secrets/Step Functions/Firehose por Interface Endpoint), sin salir por NAT. Esto completa la respuesta al feedback de Faustino: ya no hay Lambdas sueltas fuera de la VPC.
 
-`auth-callback`, `cognito-trigger` y `backup-dynamodb` quedan **fuera de la VPC** — solo tocan Cognito/DynamoDB regional.
+`auth-callback` y `cognito-trigger` quedan **fuera de la VPC** — solo tocan Cognito/DynamoDB regional.
 
 ---
 
@@ -399,7 +398,6 @@ Recibe los logs de las Lambdas (un log group por Lambda) y de los servicios Farg
 | `/aws/lambda/jetsmart-prod-proactive-notifications` | proactive-notifications |
 | `/aws/lambda/jetsmart-prod-auth-callback` | auth-callback |
 | `/aws/lambda/jetsmart-prod-cognito-trigger` | cognito-trigger |
-| `/aws/lambda/jetsmart-prod-backup-dynamodb` | backup-dynamodb |
 | `/aws/states/jetsmart-prod-booking-workflow` | Step Functions state machine |
 
 Retención configurada en 30 días para todos los log groups.
@@ -420,7 +418,7 @@ Alarmas conectadas al SNS topic `notifications`. Una de Lambda Errors sobre el e
 
 ## S3
 
-Cuatro buckets con propósitos distintos:
+Tres buckets con propósitos distintos:
 
 ### `jetsmart-prod-<account-id>-frontend`
 - Archivos estáticos del sitio web (HTML, CSS, JS)
@@ -446,26 +444,6 @@ Cuatro buckets con propósitos distintos:
 - Resultados de queries Athena en `athena-results/`
 - Privado con `public_access_block` activo
 - Lifecycle: archivar particiones a Glacier después de 90 días; expirar resultados Athena a los 14 días
-- Encriptación SSE-S3
-
-### `jetsmart-prod-<account-id>-backups`
-- Exports diarios de la tabla DynamoDB `business` generados por la Lambda `backup-dynamodb`
-- Estructura: `dynamodb/business/YYYY-MM-DD/AWSDynamoDB/<export-id>/data/*.json.gz`
-- Privado con `public_access_block` activo
-- **Versionado ON** — defensa contra `DELETE`/`PUT` accidental sobre exports
-- Lifecycle progresivo (alineado a retención AFIP RG 1415, 10 años):
-
-| Edad | Storage class |
-|---|---|
-| 0–29 días | `STANDARD` |
-| 30–89 días | `STANDARD_IA` (acceso esporádico, retrieval inmediato) |
-| 90–364 días | `GLACIER` (retrieval 3–5 h) |
-| 365–3649 días | `DEEP_ARCHIVE` (retrieval 12 h, costo mínimo) |
-| 3650 días | expira |
-
-- Lifecycle de versiones non-current: transición a `GLACIER` a los 30 días, expiran a los 90
-- Cleanup automático de delete markers huérfanos con `expired_object_delete_marker = true`
-- Bucket policy permite a `dynamodb.amazonaws.com` hacer `PutObject` (export funciona)
 - Encriptación SSE-S3
 
 ## Dependencias del chat-handler: imagen Docker (no Lambda Layers)

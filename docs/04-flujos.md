@@ -1,6 +1,6 @@
 # 04 — Flujos del sistema
 
-> Refleja la arquitectura desplegada: el core del chatbot (chat-handler) corre como servicio FastAPI en ECS Fargate (subnets privadas de la VPC) detrás de un ALB internet-facing; las Lambdas de negocio también corren en la VPC (subnets `private-lambda`), salvo auth-callback/cognito-trigger/backup-dynamodb que son regionales; sin RDS, sin bastion. El JWT de Cognito se valida in-app en el contenedor (no Cognito Authorizer), Saga orquestada con Step Functions, analytics como data lake (S3 + Glue + Athena).
+> Refleja la arquitectura desplegada: el core del chatbot (chat-handler) corre como servicio FastAPI en ECS Fargate (subnets privadas de la VPC) detrás de un ALB internet-facing; las Lambdas de negocio también corren en la VPC (subnets `private-lambda`), salvo auth-callback/cognito-trigger que son regionales; sin RDS, sin bastion. El JWT de Cognito se valida in-app en el contenedor (no Cognito Authorizer), Saga orquestada con Step Functions, analytics como data lake (S3 + Glue + Athena).
 
 ## Flujo 1 — Autenticación (login con Cognito)
 
@@ -417,48 +417,17 @@ Filtrar siempre por `dt` (y `hh` si aplica) acota las particiones escaneadas y, 
 
 ---
 
-## Flujo 6 — Backups
+## Flujo 6 — Backups (PITR continuo)
 
-DynamoDB es el único datastore persistente del sistema. La estrategia tiene dos capas complementarias:
+DynamoDB es el único datastore persistente del sistema. La protección de datos se apoya en **PITR (point-in-time recovery)**, habilitado en ambas tablas.
 
 | Capa | Mecanismo | Cobertura | Cuándo se usa |
 |---|---|---|---|
 | Continuo (PITR) | `point_in_time_recovery` en la tabla | Últimos 35 días, restauración a cualquier segundo | Recuperación operacional: borrado accidental, corrupción reciente |
-| Archivo (Export) | EventBridge cron diario → Lambda → Export a S3 | 1 año, retención de archivo | Pérdida catastrófica de la tabla, PITR deshabilitado, análisis histórico |
 
-### Export diario automatizado a S3
+### PITR — recuperación continua
 
-```
-EventBridge Rule  cron(0 3 * * ? *)        (03:00 UTC = 00:00 ART, hora valle)
-        ↓ invoke
-Lambda backup-dynamodb
-        ↓ dynamodb:ExportTableToPointInTime
-        ↓ (async — el export corre en background, no bloquea la Lambda)
-DynamoDB service ejecuta el export consumiendo PITR
-        ↓ put_object
-S3 bucket jetsmart-prod-<account-id>-backups
-  dynamodb/YYYY-MM-DD/AWSDynamoDB/<export-id>/data/*.json.gz
-        ↓ lifecycle
-0–90 días:   STANDARD
-90–365 días: GLACIER (acceso poco frecuente, restore 3-5h)
-365 días:    expira
-```
-
-La Lambda **no espera** el resultado del export — `ExportTableToPointInTime` devuelve un `exportArn` inmediatamente y DynamoDB hace el trabajo en background (puede tardar varios minutos según el tamaño de la tabla). El estado del export se consulta con `describe_export` si fuera necesario, pero para el flujo diario es fire-and-forget: si falla, la Lambda loguea el error en CloudWatch y al día siguiente reintenta el cron.
-
-### Permisos: bucket policy explícita
-
-El bucket de backups tiene una **bucket policy** que permite a `dynamodb.amazonaws.com` hacer `s3:PutObject` y `s3:AbortMultipartUpload`, con `Condition: aws:SourceAccount = <account propio>` para mitigar el confused deputy. Sin esa policy, el export falla con AccessDenied al intentar escribir el archivo.
-
-### Por qué bucket dedicado y no prefix en `assets/`
-
-- **Lifecycle independiente** — los backups quieren retención larga (365 días + archivo en Glacier); los boarding passes y backups del system prompt quieren expiración corta. Mezclar prefijos en un solo bucket complica el razonamiento de costos y la trazabilidad.
-- **Bucket policy específica para DynamoDB** — escribir desde un service principal externo (DynamoDB) requiere policy bucket-level. Tenerla en `assets` ampliaría el blast radius de esa policy a otros prefijos que no la necesitan.
-- **Trazabilidad** — `jetsmart-prod-<account>-backups` es nombre auto-explicativo. En auditoría / Cost Explorer separa cleanly del resto.
-
-### Por qué Glacier a los 90 días y no antes
-
-PITR cubre los últimos 35 días. Los exports diarios duplican esa cobertura hasta el día 35, pero a partir de ahí son la única protección. Glacier a partir del día 90 deja una ventana de ~2 meses de **restore inmediato post-PITR** antes de pasar al tier frío.
+`point_in_time_recovery` está activo en las tablas `conversations` y `business` (ver `database.tf`). DynamoDB mantiene backups continuos automáticos de los últimos 35 días: ante un borrado accidental o una corrupción reciente, se restaura la tabla a cualquier segundo dentro de esa ventana sin intervención manual ni infraestructura adicional.
 
 ### Resto del sistema
 

@@ -144,15 +144,3 @@ output "athena_workgroup" {
   description = "Workgroup de Athena del equipo de business analytics"
   value       = aws_athena_workgroup.analytics.name
 }
-
-# ── CloudTrail ────────────────────────────────────────────────────────────────
-
-output "cloudtrail_arn" {
-  description = "ARN del trail multi-region de auditoría"
-  value       = aws_cloudtrail.this.arn
-}
-
-output "cloudtrail_bucket" {
-  description = "Bucket S3 donde CloudTrail deposita los logs (consulta ad-hoc vía aws s3 cp + jq)"
-  value       = aws_s3_bucket.cloudtrail.bucket
-}

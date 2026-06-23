@@ -3,8 +3,8 @@
 # TP4 re-arquitectura: todo el cómputo Lambda de negocio corre en las subnets
 # privadas-lambda. Acceden a DynamoDB/S3 por Gateway Endpoint (gratis) y a
 # SNS/SQS/Secrets/StepFunctions por Interface Endpoint; salen a internet (si hace
-# falta) por NAT. auth_callback/cognito_trigger (módulo auth) y backup_dynamodb
-# quedan FUERA de la VPC — sólo tocan Cognito/DynamoDB regional.
+# falta) por NAT. auth_callback/cognito_trigger (módulo auth) quedan FUERA de la
+# VPC — sólo tocan Cognito/DynamoDB regional.
 #
 # vpc_config se repite en cada función (es un bloque anidado, no parametrizable).
 # subnet_ids = private_lambda ; security_group_ids = [sg-lambda].
