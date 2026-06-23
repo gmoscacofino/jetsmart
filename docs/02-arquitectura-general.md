@@ -12,10 +12,10 @@ El chatbot usa inteligencia artificial (Claude de Anthropic) para entender lengu
 
 | Decisión TP3 | Decisión TP4 | Razón |
 |---|---|---|
-| Lambda `analytics-processor` escribe a RDS PostgreSQL via RDS Proxy | Escribe a S3 en JSON Lines particionado | El equipo de business analytics consume Athena con cliente SQL — patrón data lake estándar |
+| Lambda `analytics-processor` escribe a RDS PostgreSQL via RDS Proxy | `business-analytics-emitter` emite a Kinesis Data Firehose → S3 en JSON Lines particionado (sin Lambda de transformación) | El equipo de business analytics consume Athena con cliente SQL — patrón data lake estándar |
 | Bastion EC2 en subnet pública para acceso a RDS | Eliminado | Sin RDS, no hay caso de uso |
-| VPC con subnets públicas/privadas/datos, NAT Gateway, VPC Endpoints | Eliminada | Sin RDS ni EC2 no hay recursos persistentes que aislar — todas las Lambdas son regionales |
-| Validación JWT manual con `python-jose` dentro de `chat-handler` | Cognito Authorizer en API Gateway | Mueve la validación al perímetro, libera código aplicativo, rechaza requests inválidas antes de invocar Lambda |
+| VPC con subnets públicas/privadas/datos, NAT Gateway, VPC Endpoints | **VPC `10.0.0.0/16`** con subnets públicas (ALB + NAT), privadas-fargate y privadas-lambda, 1 NAT Gateway y VPC Endpoints | El core del chatbot pasó a contenedores Fargate (post-feedback Faustino): el cómputo en contenedor vive DENTRO de la VPC, en subnets privadas |
+| Validación JWT manual con `python-jose` dentro de `chat-handler` | **Validación JWT in-app** en el contenedor Fargate (`server.py` valida la firma contra el JWKS del Cognito User Pool) | El chatbot ya no es Lambda detrás de API Gateway: es un servicio FastAPI detrás de un ALB, y valida el token dentro del contenedor antes de invocar la lógica |
 | `auth-callback` Lambda como bridge HTTPS | **Idéntica** (workaround invariable) | Frontend está en S3 HTTP; Cognito requiere redirect HTTPS — la Lambda detrás de API GW es el único bridge HTTPS posible |
 
 ### Cambios introducidos en TP4 (demostración final, post-presentación)
@@ -47,11 +47,19 @@ La separación habilita decisiones independientes de:
 
 ## Decisiones de arquitectura
 
-### Serverless puro, sin VPC
+### VPC para el cómputo en contenedor (Fargate) y las Lambdas de negocio
 
-Para tener una VPC con sentido se necesitan recursos con identidad de red persistente (EC2, RDS, ElastiCache, contenedores). Cuando la arquitectura es 100% Lambda + servicios managed regionales (DynamoDB, SNS, SQS, Step Functions, S3, Cognito), la VPC sólo agrega complejidad sin beneficio.
+El core del chatbot (`chat-handler` y `weather-poller`) corre en **contenedores Fargate** — recursos con identidad de red persistente que justifican una VPC. Por eso existe una **VPC `10.0.0.0/16`** con:
 
-Trade-off: perdemos la visibilidad de **VPC Flow Logs** a nivel de red. Ganamos: cold start mínimo, sin endpoints que mantener, sin SGs, sin route tables, sin NAT Gateway. La auditoría se mantiene vía **CloudTrail** (multi-region, todas las API calls del management plane sinkeadas a S3 — consulta ad-hoc vía CLI) y **X-Ray** (tracing distribuido).
+- **subnets públicas** → ALB internet-facing + NAT Gateway,
+- **subnets privadas-fargate** → tasks Fargate (`assign_public_ip=false`),
+- **subnets privadas-lambda** → las 9 Lambdas de negocio (`vpc_config`),
+- **1 NAT Gateway** (egress de las tasks hacia internet, p.ej. la API del clima),
+- **2 gateway endpoints** (S3, DynamoDB) + **8 interface endpoints** (sns, sqs, secretsmanager, states, ecr.api, ecr.dkr, logs, kinesis-firehose) para alcanzar servicios AWS sin salir por NAT.
+
+**Las 9 Lambdas de negocio corren en la VPC** (subnets `private-lambda`, `vpc_config`) y alcanzan DynamoDB/SNS/SQS/Step Functions/S3/Secrets por los **VPC endpoints**. Solo `auth-callback`, `cognito-trigger` y `backup-dynamodb` quedan regionales (sin VPC). Así, todo el cómputo del chatbot —Fargate y Lambdas— vive dentro de la VPC.
+
+Trade-off: a cambio del NAT Gateway y los endpoints que hay que mantener, ganamos aislamiento de red real para el core del chatbot (subnets privadas, sin IP pública). La auditoría se mantiene vía **CloudTrail** (multi-region, todas las API calls del management plane sinkeadas a S3 — consulta ad-hoc vía CLI) y **X-Ray** (tracing distribuido).
 
 ### Step Functions con patrón Saga para reservas
 
@@ -93,8 +101,8 @@ La tabla `business` no es un mock que se reemplazaría por otra cosa — es el P
 - Reservas y reclamos de usuarios
 
 **S3 + Athena** — analytics histórico para el equipo de business analytics:
-- Eventos de negocio (mensajes de chat, compras, check-ins, reclamos) que llegan via SNS→SQS
-- `analytics-processor` Lambda los escribe como JSON Lines particionado por `dt=YYYY-MM-DD/hh=HH`
+- Eventos de negocio (mensajes de chat, compras, check-ins, reclamos) emitidos por `business-analytics-emitter`
+- **Kinesis Data Firehose** los batchea de forma nativa (sin Lambda de transformación) y los escribe como JSON Lines particionado por `dt=YYYY-MM-DD/hh=HH` en S3
 - Glue Crawler descubre el schema automáticamente (corre cada hora)
 - El equipo consume Athena vía cliente SQL externo (DBeaver / DataGrip con driver JDBC)
 
@@ -102,13 +110,13 @@ La tabla `business` no es un mock que se reemplazaría por otra cosa — es el P
 
 **Por qué no QuickSight:** AWS Academy no lo habilita con LabRole. El equipo de analytics queda con cliente SQL (DBeaver/DataGrip) — funcional pero más manual.
 
-### Cognito Authorizer en API Gateway
+### Validación del JWT in-app (en el contenedor Fargate)
 
-`chat-handler` ya **no** valida JWT internamente. El API Gateway lo hace con un **Cognito Authorizer** (recurso `aws_api_gateway_authorizer` tipo `COGNITO_USER_POOLS`). Si el token es inválido o falta, API GW devuelve `401` antes de invocar Lambda.
+El chatbot entra por un **ALB internet-facing (HTTP:80)** que enruta al servicio Fargate `chat-handler`. No hay API Gateway ni Cognito Authorizer en este path. El propio contenedor valida el **JWT de Cognito in-app**: `server.py` verifica la firma del token contra el **JWKS** del User Pool (issuer, expiración) y pasa los claims a la lógica. Las rutas (`POST /api/chat`, `GET /api/reservations`, `POST /api/payment`) requieren token; `GET /health` no (lo usa el health check del target group).
 
-**Ganancia:** menos código aplicativo, validación canónica de AWS, rechazo en el perímetro sin gastar invocación de Lambda.
+**Por qué in-app y no Cognito Authorizer:** el chatbot ya no es Lambda detrás de API Gateway — es un servicio FastAPI nativo detrás de un ALB. Academy no habilita ACM, así que no hay listener HTTPS ni auth Cognito nativa del ALB; la validación vive en el contenedor. En producción real iría ACM + listener 443 + auth Cognito en el ALB.
 
-**Excepción documentada:** el API GW de `auth-callback` queda con `authorization = "NONE"` porque es Cognito quien redirige a ese endpoint con el `code` en query string — no manda Authorization header. Es parte del **workaround documentado en** `teoria/notas-de-clase/workaround-cognito.md`.
+**Único API Gateway que queda:** el de `auth-callback` (`jetsmart-prod-auth-api`), bridge OAuth del Cognito Hosted UI, con `authorization = "NONE"` porque es Cognito quien redirige a `/callback` con el `code` en query string — no manda Authorization header. Es parte del **workaround documentado en** `teoria/notas-de-clase/workaround-cognito.md`.
 
 ### Workaround del redirect HTTPS
 
@@ -118,13 +126,13 @@ El frontend está en S3 HTTP. Cognito sólo redirige a URLs HTTPS. La Lambda `au
 2. Intercambia el code por tokens contra el token endpoint de Cognito.
 3. Hace un `302` al frontend con `#id_token=...`.
 
-El frontend lee el token del fragment y lo guarda en localStorage. Después, todas las requests al chatbot llevan `Authorization: Bearer <token>` que API Gateway valida con el Cognito Authorizer.
+El frontend lee el token del fragment y lo guarda en localStorage. Después, todas las requests al chatbot llevan `Authorization: Bearer <token>` que el servicio Fargate valida in-app (contra el JWKS del User Pool) detrás del ALB.
 
-### Pipeline de analytics: SNS → SQS → Lambda → S3
+### Pipeline de analytics: eventos → Firehose → S3
 
-Los eventos del chat (mensajes, compras, check-ins, reclamos) se publican en un SNS topic. SQS suscribe ese topic — actúa como buffer que suaviza picos de tráfico. La Lambda `analytics-processor` consume la cola de a 10 mensajes por invocación y los escribe como JSON Lines en S3.
+Los eventos del chat (mensajes, compras, check-ins, reclamos) los emite la Lambda `business-analytics-emitter` a **Kinesis Data Firehose**. Firehose batchea de forma nativa (sin Lambda de transformación) y los entrega como JSON Lines particionado en S3.
 
-Si S3 falla (caso muy raro), el mensaje vuelve a SQS para reintento. Después de 3 intentos va a la DLQ `analytics-dlq`.
+El buffering de Firehose (por tamaño y por tiempo) absorbe los picos de tráfico; los reintentos de entrega a S3 los maneja el propio Firehose.
 
 ---
 
@@ -138,9 +146,10 @@ Si S3 falla (caso muy raro), el mensaje vuelve a SQS para reintento. Después de
 | 3b | S3 — backups | Storage / Backup | Exports diarios de DynamoDB (Hive-path `dynamodb/YYYY-MM-DD/...`). Lifecycle: 90d STANDARD → GLACIER → expira a 365d. |
 | 4 | Cognito User Pool | Auth | Registro y login con Hosted UI. |
 | 5 | Cognito Groups | Auth | `users` (chatbot). |
-| 6 | API Gateway — chatbot | Cómputo / Edge | Endpoint HTTPS `/api/*` → invoca chat-handler. **Protegido por Cognito Authorizer.** |
-| 7 | API Gateway — auth | Cómputo / Edge | Endpoint HTTPS `/callback` → invoca auth-callback (bridge del workaround). |
-| 8 | Lambda — chat-handler | Cómputo | Chat con tool use, historial, inicio de reserva. Lee claims del Cognito Authorizer. |
+| 6 | ALB — chatbot | Cómputo / Edge | Application Load Balancer internet-facing (HTTP:80). Enruta `/api/*` al servicio Fargate chat-handler; health check sobre `/health`. **No hay Cognito Authorizer — el JWT se valida in-app.** |
+| 7 | API Gateway — auth | Cómputo / Edge | `jetsmart-prod-auth-api`. Único API Gateway. Endpoint HTTPS `/callback` (+`/logout`) → invoca auth-callback (bridge del workaround). |
+| 8 | Fargate — chat-handler | Cómputo | Servicio FastAPI nativo en ECS Fargate (2 tasks Multi-AZ, Auto Scaling 2→6 por CPU 60%), en subnets privadas detrás del ALB. Chat con tool use, historial, inicio de reserva. Valida el JWT de Cognito in-app (JWKS) y usa los claims. |
+| 8b | Fargate — weather-poller | Cómputo | Task Fargate (desired 1) en subnets privadas, egress por NAT. Detecta condiciones climáticas y cancela vuelos afectados. |
 | 9 | Lambda — payment-reserve-flight | Cómputo | Paso 1 Saga: bloquea asientos (decremento atómico DynamoDB). |
 | 10 | Lambda — payment-reserve-booking | Cómputo | Paso 2 Saga: crea reserva PENDIENTE. |
 | 11 | Lambda — payment-collect | Cómputo | Paso 3 Saga: procesa el cobro. |
@@ -150,7 +159,7 @@ Si S3 falla (caso muy raro), el mensaje vuelve a SQS para reintento. Después de
 | 15 | Lambda — payment-release-flight | Cómputo | Compensación: libera los asientos. |
 | 16 | Lambda — boarding-pass-async | Cómputo | TP4: consume SQS boarding-pass-generation, genera BP en S3 y graba bp_url en PNR. |
 | 17 | Lambda — notification | Cómputo | PostBookingActions + error path: notifica al usuario. |
-| 18 | Lambda — analytics-processor | Cómputo | Consume SQS, escribe S3 JSON Lines. |
+| 18 | Lambda — business-analytics-emitter | Cómputo | Emite eventos de negocio a Kinesis Data Firehose (PutRecord); Firehose batchea nativo y escribe S3 JSON Lines (sin Lambda de transformación). |
 | 19 | Lambda — auth-callback | Cómputo | Bridge HTTPS del workaround. Intercambia code por tokens. |
 | 20 | Lambda — cognito-trigger | Cómputo | Post-registro: asigna grupo `users`. |
 | 20b | Lambda — backup-dynamodb | Cómputo | Disparada por EventBridge cron diario. Exporta sólo la tabla `business` al bucket de backups (la `conversations` es efímera por TTL y queda cubierta por PITR). |
@@ -158,12 +167,11 @@ Si S3 falla (caso muy raro), el mensaje vuelve a SQS para reintento. Después de
 | 20d | **Lambda — proactive-notifications (TP4)** | Cómputo | Consume SQS proactive-notifications, Query a GSI2 ReservationsByFlight, fan-out de emails vía SNS notifications. |
 | 21 | Step Functions | Orquestación | State machine del patrón Saga. TP4: PostBookingActions Branch B ahora publica a SQS en lugar de invocar Lambda directo. |
 | 21b | EventBridge Rule — backup-dynamodb-daily | Orquestación / Scheduling | Cron `0 3 * * ? *` (03:00 UTC). Único trigger basado en tiempo del sistema. |
-| 22 | SNS — events | Mensajería | Eventos del chat (mensajes, compras, handoffs) → fan-out a SQS analytics. |
+| 22 | SNS — events | Mensajería | Eventos del chat (mensajes, compras, handoffs) → fan-out a SQS human-handoff y a Kinesis Data Firehose (analytics). |
 | 23 | SNS — notifications | Mensajería | Notificaciones al usuario (booking confirmado / fallido / handoff ack / cancelación de vuelo). |
 | 23b | **SNS — flight-events (TP4)** | Mensajería | Publicado por `flight_cancellation_detector` (Lambda triggered por DynamoDB Stream) cuando un master row pasa a estado_vuelo=CANCELADO. → SQS proactive-notifications. |
 | 23c | **Lambda — flight-cancellation-detector (TP4)** | Cómputo | Consume DynamoDB Stream de `business`. Filter criteria server-side (eventName=MODIFY, NewImage.estado_vuelo=CANCELADO). Filtra master rows FLIGHT# + valida transición real (no re-publica). Publica al SNS flight-events. |
-| 24 | SQS — analytics | Mensajería | Buffer de eventos hacia analytics-processor. |
-| 25 | SQS — analytics-dlq | Mensajería | DLQ: eventos que fallaron 3 veces de escritura S3. |
+| 25 | SQS — refund-failures-dlq | Mensajería | DLQ: ejecuciones de refund que no pudieron completarse. |
 | 26 | SQS — booking-failed-dlq | Mensajería | DLQ: flujos Saga que no pudieron completarse. |
 | 26a | **SQS — human-handoff + DLQ (TP4)** | Mensajería | Chat → call center mock. DLQ retiene 14d para reintento manual. |
 | 26b | **SQS — proactive-notifications + DLQ (TP4)** | Mensajería | SNS flight-events → fan-out de emails. DLQ con CloudWatch alarm. |
@@ -176,7 +184,7 @@ Si S3 falla (caso muy raro), el mensaje vuelve a SQS para reintento. Después de
 | 31 | Secrets Manager | Seguridad | API key Anthropic. |
 | 32 | Lambda Layer — anthropic | Cómputo | SDK de Anthropic compilado para Python 3.12. |
 | 33 | IAM — LabRole | Seguridad | Rol preexistente de AWS Academy — compartido por todas las Lambdas. |
-| 34 | CloudWatch (17 log groups + 4 alarms) | Observabilidad | Logs de las 16 Lambdas + 1 log group del state machine de Step Functions, todos con retención 30d. Alarms: analytics-processor errors + 3 DLQ depth alarms (human-handoff, proactive-notifications, boarding-pass-generation). |
+| 34 | CloudWatch (17 log groups + 4 alarms) | Observabilidad | Logs de las 16 Lambdas + 1 log group del state machine de Step Functions, todos con retención 30d. Alarms: business-analytics-emitter errors (fallo de PutRecord a Firehose) + DLQ depth alarms + alarmas de error de los consumers SNS→Lambda directo. |
 
 ---
 
@@ -200,11 +208,12 @@ Si S3 falla (caso muy raro), el mensaje vuelve a SQS para reintento. Después de
                           Browser guarda token en localStorage           │
                                  │                                       │
                                  ↓ Authorization: Bearer <token>         │
-                          API Gateway /api/* (HTTPS)                     │
+                          ALB internet-facing (HTTP:80) /api/*           │
                                  │                                       │
-                                 ↓ Cognito Authorizer valida JWT         │
-                                 ↓ (sin token válido → 401, no invoca)   │
-                          Lambda chat-handler                            │
+                                 ↓ forward al target group               │
+                          Fargate chat-handler (subnets privadas)        │
+                                 ↓ valida JWT in-app (JWKS Cognito)       │
+                                 ↓ (sin token válido → 401)               │
                                  ├─→ DynamoDB (sesiones / vuelos / reservas)
                                  ├─→ Secrets Manager (Anthropic API key)
                                  ├─→ Anthropic API (HTTPS externo)       │
@@ -214,18 +223,15 @@ Si S3 falla (caso muy raro), el mensaje vuelve a SQS para reintento. Después de
                                           └─→ notification               │
 
                           Pipeline analytics:
-                          chat-handler          → SNS events ─┐
-                          payment-confirm       → SNS events ─┤
-                          proactive-notifications → SNS events ─┘
+                          chat-handler             → SNS events ─┐
+                          payment-confirm          → SNS events ─┤
+                          business-analytics-emitter ────────────┘
                                                               │
-                                                              ↓ fan-out
-                                                          SQS analytics (+ DLQ)
+                                                              ↓ PutRecord
+                                                  Kinesis Data Firehose
                                                               │
-                                                              ↓ batch 10
-                                                       Lambda analytics-processor
-                                                              │
-                                                              ↓ put_object
-                                              S3 jetsmart-analytics/events/
+                                                              ↓ batch nativo (tamaño/tiempo)
+                                              S3 jetsmart-analytics/lake/
                                                   dt=YYYY-MM-DD/hh=HH/<uuid>.jsonl
                                                               │
                                                               ↓ corre cada 1h
@@ -257,7 +263,7 @@ Si S3 falla (caso muy raro), el mensaje vuelve a SQS para reintento. Después de
                           90d → GLACIER → 365d expira
 ```
 
-**Sin VPC.** Toda la seguridad la garantizan: IAM (LabRole con least-privilege por servicio), Cognito (autenticación), Cognito Authorizer (autorización a nivel de API), encriptación en tránsito (HTTPS de API Gateway, TLS de servicios AWS), encriptación en reposo (S3 SSE-S3, DynamoDB SSE).
+**VPC para el cómputo en contenedor.** El core del chatbot (Fargate: chat-handler + weather-poller) corre en subnets privadas dentro de la VPC `10.0.0.0/16`, y las 9 Lambdas de negocio también (subnets `private-lambda`); solo auth-callback, cognito-trigger y backup-dynamodb quedan regionales. La seguridad la garantizan: aislamiento de red (subnets privadas, SGs, NAT, VPC endpoints), IAM (LabRole con least-privilege por servicio), Cognito (autenticación), validación JWT in-app en el contenedor (autorización), encriptación en tránsito (TLS de servicios AWS) y en reposo (S3 SSE-S3, DynamoDB SSE).
 
 ---
 

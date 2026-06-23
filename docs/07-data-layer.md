@@ -365,7 +365,7 @@ table.update_item(
 
 Si dos usuarios intentan reservar el mismo asiento, DynamoDB ejecuta sólo uno. El otro recibe `ConditionalCheckFailedException` y Step Functions dispara la compensación. La liberación (compensación) usa `ConditionExpression: reserved_by = :owned_pnr` para evitar liberar asientos de otros PNRs.
 
-El PNR se genera con SHA-256 del `payment_id` en `chat_handler.py` ANTES de iniciar el Saga (ver justificación #22), lo que permite que cada paso del Saga sea idempotente y que la compensación libere exactamente el seat de este PNR.
+El PNR se genera con SHA-256 del `payment_id` en el chat-handler (`app/chat-handler/chat_core.py`) ANTES de iniciar el Saga (ver justificación #22), lo que permite que cada paso del Saga sea idempotente y que la compensación libere exactamente el seat de este PNR.
 
 ---
 
@@ -524,19 +524,16 @@ El PNR se genera con SHA-256 del `payment_id` en `chat_handler.py` ANTES de inic
 Los eventos del chatbot se acumulan en S3 para consumo offline del equipo de business analytics:
 
 ```
-chat_handler / confirm_booking_handler / cancel_booking_handler / ...
-        ↓ SNS publish (event_type, user_id, timestamp, payload)
-    SNS events topic
-        ↓ fan-out
-    SQS analytics (buffer, batch_size=10, DLQ)
-        ↓ trigger
-analytics_processor Lambda (regional, sin VPC)
-        ↓ put_object (JSON Lines)
-    s3://...-analytics/events/dt=YYYY-MM-DD/hh=HH/<uuid>.jsonl
-        ↓ cron(0 * * * ? *) (cada hora)
-    Glue Crawler
-        ↓ descubre schema + particiones
-    Glue Data Catalog (database: jetsmart_prod_analytics, table: events)
+chat-handler (Fargate) / confirm_booking_handler / cancel_booking_handler / ...
+        ↓ SNS publish (event_type, user_id, timestamp, payload)  — eventos semánticos del chat
+    SNS events topic                                business_analytics_emitter (CDC del Stream)
+        ↓ suscripción                                       ↓ PutRecord
+    Kinesis Data Firehose (delivery streams: interaction / reservation / flight / claim)
+        ↓ batch NATIVO por tamaño/tiempo (5 MB / 60 s), sin Lambda de transformación
+        ↓ JSON Lines gzip
+    s3://...-analytics/lake/<entidad>/dt=YYYY-MM-DD/hh=HH/<uuid>.gz
+        ↓ partition projection (sin crawler)
+    Glue Data Catalog (database: jetsmart_prod_analytics, tablas: reservation/flight/claim/interaction_events)
         ↓
     Athena Workgroup
         ↓ JDBC
@@ -545,9 +542,9 @@ analytics_processor Lambda (regional, sin VPC)
 
 ---
 
-### Esquema descubierto por el Glue Crawler
+### Esquema de las tablas del Glue Data Catalog (partition projection, sin crawler)
 
-El crawler inspecciona los `.jsonl` y crea la tabla `events` con columnas inferidas:
+Las tablas se definen estáticamente en el Glue Data Catalog (una por entidad: `reservation_events` / `flight_events` / `claim_events` / `interaction_events`) con **partition projection** sobre `dt`/`hh` — no hay Glue Crawler. Columnas:
 
 | Columna | Tipo Athena | Origen |
 |---|---|---|
@@ -555,7 +552,7 @@ El crawler inspecciona los `.jsonl` y crea la tabla `events` con columnas inferi
 | `user_id` | string | Campo `user_id` |
 | `timestamp` | string (ISO-8601) | Campo `timestamp` |
 | `payload` | struct (anidado) | Campo `payload` (estructura variable según tipo de evento) |
-| `ingested_at` | string (ISO-8601) | Agregado por `analytics-processor` en el momento de la escritura |
+| `ingested_at` | string (ISO-8601) | Agregado por el `business_analytics_emitter` / productor del evento antes del PutRecord a Firehose |
 | `dt` | string (partition) | `YYYY-MM-DD` — particionada del path S3 |
 | `hh` | string (partition) | `HH` — particionada del path S3 |
 
@@ -623,11 +620,11 @@ LIMIT 10;
 
 | Parámetro | Valor | Razón |
 |---|---|---|
-| Formato | JSON Lines (`.jsonl`) | Simple, sin layers extras; Athena lo lee nativo |
-| Particionamiento | `dt=YYYY-MM-DD/hh=HH` | Partition pruning automático |
+| Formato | JSON Lines gzip (`.gz`) | Firehose escribe JSON Lines comprimido; Athena lo lee nativo |
+| Particionamiento | `dt=YYYY-MM-DD/hh=HH` | Partition pruning automático (partition projection, sin crawler) |
 | Encriptación at rest | AES-256 (SSE-S3) | Sin costo adicional |
 | Lifecycle | Glacier después de 90 días | Costo mínimo para retención histórica |
-| Crawler schedule | `cron(0 * * * ? *)` | Cada hora — balance entre frescura y costo |
+| Ingesta | Kinesis Data Firehose (batch nativo 5 MB / 60 s) | Sin Lambda de transformación intermedia |
 | Athena Workgroup | `jetsmart-prod-analytics` | Aislamiento de results y cost tracking del equipo |
 | Result location | `s3://...-analytics/athena-results/` | Resultados expiran a los 14 días |
-| Acceso | LabRole (Lambda) + LabRole (Crawler) + cliente SQL externo | IAM least-privilege |
+| Acceso | LabRole (Firehose + emitter) + cliente SQL externo | IAM least-privilege |

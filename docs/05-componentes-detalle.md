@@ -1,20 +1,78 @@
 # 05 — Componentes en detalle
 
+## ECS Fargate — Cómputo en contenedor (el core)
+
+> **Cambio de arquitectura (TP4, post-defensa 17/06):** el core del chatbot dejó de ser una Lambda y pasó a ser un **servicio FastAPI nativo en ECS Fargate**, dentro de la VPC. Es la respuesta al feedback de la defensa: el cómputo del chatbot ahora vive en subnets privadas, no en Lambdas sueltas. Ver `docs/03-networking.md`.
+
+Dos workloads en contenedor corren en Fargate (`ecs.tf`), ambos en subnets privadas con `assign_public_ip=false`:
+
+| Servicio | Entrada | Auto Scaling | CPU/Mem |
+|---|---|---|---|
+| `chat-handler` | ALB internet-facing (HTTP:80) → target group puerto 8000 | 2 → 6 tasks (target tracking CPU 60%) | 256 / 512 |
+| `weather-poller` | Sin ALB — solo egress por NAT a la clima API | desired_count = 1 (fijo) | 256 / 512 |
+
+### `chat-handler` — servicio FastAPI nativo
+
+El punto de entrada principal del chatbot. **No es una Lambda**: es un contenedor Docker (imagen en ECR, pulleada por Fargate) que corre FastAPI nativo. Código en `app/chat-handler/`:
+
+- `server.py` — el router FastAPI. Por cada request: valida el JWT, rutea método/path a la función de negocio, traduce el `(status, payload)` a respuesta HTTP.
+- `chat_core.py` — la lógica de negocio: bucle de tool use de Anthropic, acceso a DynamoDB, tokenización PII, inicio del Saga de pago.
+
+Rutas expuestas:
+
+| Método + path | Auth | Función |
+|---|---|---|
+| `POST /api/chat` | JWT | Chat con tool use, historial, contexto del usuario |
+| `GET /api/reservations` | JWT | Reservas del usuario autenticado |
+| `POST /api/payment` | JWT | Inicia el Saga de pago (StartExecution de Step Functions) |
+| `GET /health` | sin auth | Health check del ALB target group |
+
+**Topología:** 2 tasks Multi-AZ (1 por subnet privada / AZ) detrás del ALB, con Auto Scaling 2→6 por target tracking de CPU al 60%. El ALB es HTTP:80 (Academy no habilita ACM/HTTPS; en producción real iría listener 443 con ACM).
+
+#### Validación de JWT in-app (no Cognito Authorizer)
+
+`chat-handler` valida el **JWT de Cognito dentro del contenedor** (`server.py`), no en el perímetro:
+
+- Descarga el JWKS del User Pool (cacheado en memoria, refresca ante `kid` desconocido por rotación de claves).
+- Verifica firma **RS256**, `issuer` y `exp`; valida `aud` si hay `COGNITO_CLIENT_ID` seteado.
+- Pasa los claims (la identidad del usuario, `sub`) a `chat_core` como contexto.
+- Si el token es inválido → `401` antes de ejecutar lógica de negocio. El preflight `OPTIONS` sale sin auth (CORS).
+
+> **Evolución del manejo de auth:** TP3 validaba el JWT manualmente con `python-jose` dentro de la Lambda. El diseño serverless intermedio (rechazado) proponía delegar la validación a un **Cognito Authorizer** en API Gateway. La arquitectura final **no usa Cognito Authorizer**: el contenedor valida el JWT in-app contra el JWKS (RS256). Conceptualmente es lo mismo que hacía la Lambda en TP3, ahora en un servicio web nativo.
+
+### Tool use en chat-handler
+
+`chat-handler` no llama al LLM una sola vez — implementa un **bucle de tool use** de hasta 5 rondas (`MAX_TOOL_ROUNDS = 5`). Claude puede pausar su respuesta y pedir que el servicio ejecute funciones reales para obtener datos antes de responder:
+
+- `search_flights` — consulta disponibilidad de vuelos en la tabla `business` (el PSS de la aerolínea)
+- `get_reservation` — consulta el estado de una reserva del usuario
+
+La tabla `business` es la fuente única de verdad: la consultan tanto el chatbot como (en una arquitectura completa) la web, la app móvil y el call center.
+
+Ver explicación completa en [01 — Cómo funciona un chatbot](./01-como-funciona-chatbot.md#tool-use-cómo-el-chatbot-consulta-datos-reales).
+
+### `weather-poller` — task Fargate de operaciones
+
+Task Fargate `desired_count=1` (sin ALB), también en subnet privada. Sale por NAT a la clima API externa, detecta condiciones de cancelación y escribe la transición a `estado_vuelo=CANCELADO` en la tabla `business`. A partir de ahí el flujo proactivo se dispara por DynamoDB Stream (ver `stream-emitter` más abajo).
+
+---
+
 ## Lambda — Funciones serverless
 
-Lambda es el servicio de cómputo principal de este proyecto. Cada función Lambda:
-- Se ejecuta en respuesta a un trigger (API Gateway, SQS, Cognito, SNS)
+Lambda es el servicio de cómputo de los flujos asíncronos y de orquestación. Cada función Lambda:
+- Se ejecuta en respuesta a un trigger (SQS, Cognito, SNS, Step Functions, DynamoDB Stream)
 - Corre de 0 a N instancias en paralelo según la demanda
 - Se cobra por invocación y por milisegundos de ejecución
 - No requiere provisionar servidores ni administrar infraestructura
 
-### Las 16 Lambdas del proyecto
+> El core del chatbot (`chat-handler`) **ya no es una Lambda** — es el servicio Fargate documentado arriba. Las Lambdas de abajo cubren el Saga de pago/refund, las notificaciones y los consumers de stream.
 
-> Nota TP4 (event-driven proactive notifications): el trigger del flujo de cancelaciones cambió de script manual a DynamoDB Stream. La Lambda `flight-cancellation-detector` consume el stream de `business` y publica al SNS `flight-events` cuando detecta una transición a `estado_vuelo=CANCELADO` en un master row. Ver justificación #28.
+### Las Lambdas del proyecto
+
+> Nota TP4 (event-driven proactive notifications): el flujo de cancelaciones se dispara por DynamoDB Stream. La Lambda `stream-emitter` consume el stream de `business` y publica al SNS central (`flight_cancelled`) cuando detecta una transición a `estado_vuelo=CANCELADO` en un master row FLIGHT#.
 
 | Nombre | Trigger | Función |
 |---|---|---|
-| `chat-handler` | API Gateway (todos los paths, **detrás de Cognito Authorizer**) | Punto de entrada principal: chat con tool use, historial, reservas del usuario, inicio de pago. Lee claims ya validados de `event.requestContext.authorizer.claims` (sin validación JWT manual) |
 | `payment-reserve-flight` | Step Functions (estado ReserveFlight) | Verifica disponibilidad y bloquea asientos en DynamoDB (decremento atómico con ConditionExpression) |
 | `payment-reserve-booking` | Step Functions (estado ReserveBooking) | Crea la reserva en DynamoDB con estado PENDIENTE |
 | `payment-collect` | Step Functions (estado CollectPayment) | Procesa el cobro (mock; en producción llama al gateway de pagos) |
@@ -24,81 +82,45 @@ Lambda es el servicio de cómputo principal de este proyecto. Cada función Lamb
 | `payment-release-flight` | Step Functions (compensación) | Libera los asientos bloqueados si ReserveFlight se ejecutó |
 | `boarding-pass-async` | SQS `boarding-pass-generation` (publicado por Step Functions PostBookingActions) | Consume mensajes encolados, genera el boarding pass, lo sube a S3 `boarding-passes` y graba `bp_url` en el PNR. Fire-and-forget: si falla, no afecta la reserva confirmada |
 | `notification` | Step Functions (PostBookingActions + error path) | Envía confirmación al usuario (éxito o fracaso del pago) vía SNS `notifications` |
-| `analytics-processor` | SQS `analytics` | Escribe eventos crudos en S3 `analytics` como JSON Lines particionado por fecha (TP4: ya no escribe a RDS) |
-| `human-handoff-processor` | SQS `human-handoff` (publicado por chat-handler cuando el LLM invoca la tool `escalate_to_human`) | Simula el POST al sistema del call center y actualiza el ticket HANDOFF# en `conversations` a status=ACK |
-| `proactive-notifications` | SQS `proactive-notifications` (suscrita a SNS `flight-events`) | Ante cancelación de vuelo, hace Query a GSI2 para encontrar todos los PNRs afectados y publica un email por usuario |
-| `flight-cancellation-detector` (TP4) | **DynamoDB Stream** de `business` con filter_criteria (eventName=MODIFY, NewImage.estado_vuelo=CANCELADO) | Detecta transición a CANCELADO en master row FLIGHT#, publica `flight_cancelled` al SNS flight-events. Único trigger del flujo en TP4 final. |
+| `business-analytics-emitter` | **DynamoDB Stream** de `business` (filtro PNR#/FLIGHT#/CLAIM#) | CDC hacia el data lake: clasifica la entidad, deriva la transición Old→New, redacta PII y hace `PutRecord` al Firehose correspondiente. Reemplaza al `analytics-processor` del diseño viejo — Firehose batchea nativo, sin Lambda de transformación |
+| `human-handoff-processor` | SQS `human-handoff` (alimentada por el SNS central, filtro `handoff_requested`, que publica `chat-handler`) | Simula el POST al sistema del call center y actualiza el ticket HANDOFF# en `conversations` a status=ACK |
+| `proactive-notifications` | SQS `proactive-notifications` (suscrita al SNS central, filtro `flight_cancelled`) | Ante cancelación de vuelo, hace Query al GSI ReservationsByFlight para encontrar todos los PNRs afectados y publica un email por usuario |
+| `stream-emitter` | **DynamoDB Stream** de `business` con filter_criteria (eventName=MODIFY, NewImage.estado_vuelo=CANCELADO) | Detecta transición a CANCELADO en master row FLIGHT#, publica `flight_cancelled` al SNS central. Patrón CDC: el evento se deriva del cambio comprometido, evita el dual-write del poller |
+| `refund-trigger` | SQS `refund` (suscrita al SNS central, filtro `flight_cancelled`) | Arranca la refund Saga (StartExecution con name=flight_id para idempotencia) |
 | `auth-callback` | API Gateway GET /callback (bridge HTTPS del workaround) | Intercambia authorization code por tokens JWT y redirige al frontend |
 | `cognito-trigger` | Cognito post-registration | Asigna grupo `users` al usuario nuevo |
 | `backup-dynamodb` | EventBridge cron diario 03:00 UTC | Dispara `dynamodb:ExportTableToPointInTime` sobre `business`; el export queda en S3 `backups`. Mecanismo complementario a PITR (35d continuos), cubre retención AFIP de 10 años |
 
-### Tool use en chat-handler
-
-`chat-handler` no llama al LLM una sola vez — implementa un **bucle de tool use** de hasta 5 rondas. Claude puede pausar su respuesta y pedir que la Lambda ejecute funciones reales para obtener datos antes de responder:
-
-- `search_flights` — consulta disponibilidad de vuelos en la tabla `business` (el PSS de la aerolínea)
-- `get_reservation` — consulta el estado de una reserva del usuario
-
-La tabla `business` es la fuente única de verdad: la consultan tanto el chatbot como (en una arquitectura completa) la web, la app móvil y el call center.
-
-Ver explicación completa en [01 — Cómo funciona un chatbot](./01-como-funciona-chatbot.md#tool-use-cómo-el-chatbot-consulta-datos-reales).
-
 ### Runtime y configuración
 
-Todas las Lambdas usan **Python 3.12**. El timeout configurable es de 30 segundos por defecto (variable `lambda_timeout`), con algunas excepciones explícitas en código: `chat-handler` y `backup-dynamodb` usan 60s, y `analytics-processor` usa 120s para tolerar batches grandes hacia S3.
+Todas las Lambdas usan **Python 3.12**. El timeout configurable es de 30 segundos por defecto (variable `lambda_timeout`), con algunas excepciones explícitas en código: `backup-dynamodb` y `business-analytics-emitter` usan 60s para tolerar batches grandes. (El `chat-handler` ya no es Lambda — corre en Fargate sin límite de timeout de Lambda.)
 
-### Todas las Lambdas regionales (sin VPC)
+### Las Lambdas de negocio corren en la VPC
 
-En el TP4 **ninguna Lambda usa VPC**. La justificación está en `docs/03-networking.md`: sin recursos persistentes (RDS, EC2), la VPC era over-engineering. Las Lambdas acceden a DynamoDB, SNS, SQS, Step Functions, S3, Secrets Manager directamente por endpoints regionales de AWS — el tráfico va por la red interna de AWS, encriptado con TLS.
+Las **9 Lambdas de negocio** (payment Saga, refund, notification, stream-emitter, business-analytics-emitter, human-handoff, proactive-notifications, boarding-pass-async, refund-trigger) se configuran con `vpc_config` apuntando a las subnets **`private-lambda`** — están **dentro de la VPC**, igual que Fargate. Alcanzan los servicios AWS por los **VPC endpoints** (DynamoDB/S3 por Gateway Endpoint; SNS/SQS/Secrets/Step Functions/Firehose por Interface Endpoint), sin salir por NAT. Esto completa la respuesta al feedback de Faustino: ya no hay Lambdas sueltas fuera de la VPC.
 
-Ganancia concreta: cold start ~200ms en lugar de 500ms-2s.
+`auth-callback`, `cognito-trigger` y `backup-dynamodb` quedan **fuera de la VPC** — solo tocan Cognito/DynamoDB regional.
 
 ---
 
 ## API Gateway
 
-API Gateway es el punto de entrada HTTP del sistema. Lambda no tiene URL propia — API Gateway recibe las requests HTTPS del navegador y las traduce en invocaciones de Lambda.
+Queda **una sola instancia de API Gateway**: la del flujo de auth (callback/logout). El chatbot **ya no entra por API Gateway** — entra por el **ALB** que enruta a Fargate (ver sección ECS Fargate). El API Gateway del chatbot del diseño viejo fue reemplazado por el ALB.
 
-### Dos instancias de API Gateway
+### API de auth (callback) — bridge del workaround Cognito
 
-**1. API principal (chatbot) — protegida por Cognito Authorizer**
-- Maneja: `POST /api/chat`, `GET /api/reservations`, `POST /api/payment`.
-- Usa un recurso `{proxy+}` que captura todos los paths y los enruta a `chat-handler`.
-- Método `ANY /{proxy+}` con `authorization = "COGNITO_USER_POOLS"` y un `aws_api_gateway_authorizer` que valida el JWT contra el User Pool.
-- Método `OPTIONS /{proxy+}` con `authorization = "NONE"` y `MOCK` integration para servir el preflight CORS sin invocar Lambda.
-- Método `ANY /` con `authorization = "NONE"` para exponer `/health` sin auth.
-
-**2. API de auth (callback) — bridge del workaround Cognito**
-- Maneja: `GET /callback`.
+`jetsmart-prod-auth-api` (`modules/auth`):
+- Maneja: `GET /callback` y `GET /logout`.
 - Invoca exclusivamente la Lambda `auth-callback`.
-- Es el redirect URI registrado en el Cognito App Client.
-- `authorization = "NONE"` porque Cognito redirige con `?code=...` en query string (sin Authorization header). Está documentado en `teoria/notas-de-clase/workaround-cognito.md`.
+- `/callback` es el redirect URI registrado en el Cognito App Client.
+- `authorization = "NONE"` porque Cognito redirige con `?code=...` en query string (sin Authorization header). Es un bridge HTTPS: Cognito exige HTTPS para callback/logout, pero el frontend está en S3 HTTP — la Lambda hace el 302 final al frontend. Documentado en `teoria/notas-de-clase/workaround-cognito.md`.
+- Throttling: 5 req/s sostenido, 10 burst (más conservador que el chatbot porque el flujo de auth es raro por usuario).
 
-### Cognito Authorizer — cambio respecto al TP3
+### Por qué el chatbot entra por ALB y no por API Gateway
 
-En el TP3, la Lambda `chat-handler` descargaba el JWKS de Cognito, parseaba el JWT manualmente con `python-jose` y validaba firma/issuer/token_use por cuenta propia. Eran ~50 líneas de código aplicativo manejando un problema de seguridad estándar.
+El core del chatbot pasó a ser un servicio web nativo en Fargate (contenedor de larga vida), no funciones invocadas por evento. Un **ALB** es el balanceador natural para ese modelo: distribuye tráfico HTTP a las tasks por IP (`target_type = "ip"`, awsvpc), corre health checks contra `/health`, e integra con el Auto Scaling del servicio. API Gateway tiene sentido para Lambda invocada por evento — no para un pool de contenedores detrás de un load balancer.
 
-En el TP4, API Gateway hace toda esa validación con un recurso de Terraform:
-
-```hcl
-resource "aws_api_gateway_authorizer" "cognito" {
-  name            = "${var.name_prefix}-cognito-authorizer"
-  type            = "COGNITO_USER_POOLS"
-  rest_api_id     = aws_api_gateway_rest_api.chatbot.id
-  provider_arns   = [var.cognito_user_pool_arn]
-  identity_source = "method.request.header.Authorization"
-}
-```
-
-Los claims llegan a la Lambda ya validados en `event.requestContext.authorizer.claims`. Si el token es inválido, API GW devuelve `401` antes de invocar Lambda — sin gastar invocación ni cold start. El layer `python-jose` también desapareció.
-
-### Por qué API Gateway y no una URL de Lambda
-
-Lambda Function URLs son más simples pero no soportan Cognito Authorizer nativo (tendría que volver a validar manualmente). API Gateway permite:
-- Cognito Authorizer plug-and-play.
-- Throttling configurable (10 req/s sostenido, 20 burst).
-- CORS preflight con MOCK integration.
-- Stages independientes (dev / staging / prod).
+La validación del JWT, que en el diseño serverless intermedio se pensó delegar a un Cognito Authorizer de API Gateway, ahora la hace el contenedor in-app (ver "Validación de JWT in-app" arriba).
 
 ---
 
@@ -112,9 +134,9 @@ SNS es un servicio de pub/sub: un publicador manda un mensaje al topic y todos l
 
 | Topic | Publicado por | Suscriptores |
 |---|---|---|
-| `events` | `chat-handler` (mensajes de chat) y `payment-confirm` (compras completadas) | SQS `analytics` |
+| `events` | `chat-handler` (mensajes de chat) y `payment-confirm` (compras completadas) | Firehose `interaction_events` (→ data lake), SQS `human-handoff`, y Lambdas suscritas por filtro (`notification`, `boarding-pass-async`, etc.) |
 | `notifications` | Lambdas (`notification`, `human-handoff-processor`, `proactive-notifications`, etc.) y CloudWatch Alarms | Endpoints email suscritos manualmente con `aws sns subscribe` (el topic acepta también SMS u otros protocolos sin cambios de código si se quisiera sumarlos) |
-| `flight-events` | Lambda `flight-cancellation-detector` cuando detecta una transición de `estado_vuelo` a CANCELADO vía DynamoDB Stream | SQS `proactive-notifications` |
+| `flight-events` | Lambda `stream-emitter` cuando detecta una transición de `estado_vuelo` a CANCELADO vía DynamoDB Stream | SQS `proactive-notifications` |
 
 ### Por qué tres topics y no uno solo
 
@@ -122,7 +144,7 @@ Cada topic representa un **dominio de eventos** distinto y tiene consumidores di
 
 - `events` → analytics interno (data lake)
 - `notifications` → comunicación saliente al usuario y al equipo de operaciones (alarmas)
-- `flight-events` → publicado por el módulo de operaciones de la aerolínea cuando un vuelo cambia de estado (cancelación, demora, gate change). En TP4 el publisher es la Lambda `flight-cancellation-detector` triggered por DynamoDB Stream: ops solo modifica el ítem en la tabla y el resto del flujo se dispara automáticamente.
+- `flight-events` → publicado cuando un vuelo cambia de estado (cancelación, demora, gate change). En TP4 el publisher es la Lambda `stream-emitter` triggered por DynamoDB Stream: el `weather-poller` (Fargate) modifica el ítem en la tabla y el resto del flujo se dispara automáticamente.
 
 Unificar todo en un solo topic acoplaría dominios sin necesidad y haría que cada consumer tuviera que filtrar mensajes por `event_type` — antipatrón. Topics separados dejan que cada consumer se suscriba solo a lo que le importa.
 
@@ -132,7 +154,7 @@ En la arquitectura original del TP3 (TALO — Trigger-and-Lambda-Orchestration) 
 
 ### Fan-out con SNS — caso de uso
 
-`notifications` recibe eventos de **CloudWatch Alarms** (`analytics-processor-errors` y 3 DLQ depth alarms) y de Lambdas que confirman acciones al usuario. Cualquier endpoint suscrito (email del equipo de ops, eventualmente Slack) recibe todo. Sumar un consumer nuevo (Telegram, PagerDuty) es una sola subscripción — no requiere tocar las Lambdas ni las alarms.
+`notifications` recibe eventos de **CloudWatch Alarms** (`business-analytics-emitter-errors` y las DLQ depth alarms) y de Lambdas que confirman acciones al usuario. Cualquier endpoint suscrito (email del equipo de ops, eventualmente Slack) recibe todo. Sumar un consumer nuevo (Telegram, PagerDuty) es una sola subscripción — no requiere tocar las Lambdas ni las alarms.
 
 ---
 
@@ -146,8 +168,7 @@ Cuatro flujos asíncronos, cada uno con su DLQ — más una DLQ standalone para 
 
 | Queue principal | Productor | Consumidor | DLQ |
 |---|---|---|---|
-| `analytics` | SNS `events` (chat-handler + payment-confirm) | `analytics-processor` → S3 data lake | `analytics-dlq` |
-| `human-handoff` | `chat-handler` cuando el LLM invoca tool `escalate_to_human` | `human-handoff-processor` → call center mock | `human-handoff-dlq` |
+| `human-handoff` | SNS `events` (filtro `handoff_requested`, publicado por `chat-handler` cuando el LLM invoca tool `escalate_to_human`) | `human-handoff-processor` → call center mock | `human-handoff-dlq` |
 | `proactive-notifications` | SNS `flight-events` (script ops cancela vuelo) | `proactive-notifications` → Query GSI2 + fan-out emails | `proactive-notifications-dlq` |
 | `boarding-pass-generation` | Step Functions `PostBookingActions` (vía `arn:aws:states:::sqs:sendMessage`) | `boarding-pass-async` → genera BP + sube a S3 | `boarding-pass-generation-dlq` |
 
@@ -171,15 +192,15 @@ Cada cola desacopla un punto donde **el productor no debe esperar al consumidor*
 
 ```
 Sin SQS:
-chat-handler → analytics-processor → S3
-(si S3 está lento, el usuario del chat espera)
+chat-handler → human-handoff-processor → call center
+(si el call center está lento, el usuario del chat espera)
 
 Con SQS:
-chat-handler → SNS → SQS → analytics-processor → S3
-(chat-handler termina inmediato; analytics corre después)
+chat-handler → SNS → SQS → human-handoff-processor → call center
+(chat-handler termina inmediato; la derivación se procesa después)
 ```
 
-Mismo principio para human-handoff (chat no debe esperar al call center), boarding-pass (la reserva ya está confirmada, el BP puede llegar 5s después), proactive-notifications (cancelar un vuelo no debe esperar a que se envíen N emails).
+Mismo principio para boarding-pass (la reserva ya está confirmada, el BP puede llegar 5s después) y proactive-notifications (cancelar un vuelo no debe esperar a que se envíen N emails). El analytics histórico no usa SQS: SNS `events` entrega directo a un Firehose (`interaction_events`) que batchea al data lake.
 
 ### Por qué el flujo de pago NO usa SQS entre pasos
 
@@ -260,7 +281,7 @@ Ver el diseño completo en [07 — Capa de datos](./07-data-layer.md).
 
 ### Por qué DynamoDB para el chat
 
-- **Sin VPC**: ninguna Lambda usa VPC. DynamoDB es accesible por endpoint regional de AWS.
+- **Acceso interno por VPC endpoint**: alcanzable por el Gateway Endpoint de DynamoDB desde la VPC (tráfico interno, sin salir por NAT).
 - **Latencia baja**: operaciones de GetItem/PutItem en < 5ms — no frena al usuario.
 - **Escala automática**: on-demand billing, sin capacidad que administrar.
 
@@ -279,7 +300,7 @@ s3://jetsmart-prod-<account-id>-analytics/
 └── events/
     └── dt=2026-06-13/
         └── hh=14/
-            └── <uuid>.jsonl    ← uno por invocación de analytics-processor
+            └── <uuid>.jsonl    ← objeto batcheado por Firehose
 ```
 
 Cada `.jsonl` contiene una línea JSON por evento. Lifecycle policy: archivar a Glacier después de 90 días, expirar los resultados de Athena después de 14 días.
@@ -327,7 +348,7 @@ Usa la **Cognito Hosted UI** — una página de login que AWS genera automática
 
 > En TP3 había un grupo `admins` para un dashboard de analytics. En TP4 ese dashboard se eliminó — el equipo de business analytics consume Athena directamente con cliente SQL (mejor patrón). El grupo `users` es el único activo.
 
-El grupo se incluye en el ID Token del usuario. La Lambda chat-handler lo lee desde los claims si lo necesita.
+El grupo se incluye en el ID Token del usuario. El servicio `chat-handler` (Fargate) lo lee desde los claims del JWT validado in-app si lo necesita.
 
 ---
 
@@ -341,7 +362,7 @@ Guarda un único secreto:
 
 > El secreto `jetsmart-prod/rds-credentials` del TP3 se eliminó junto con RDS.
 
-La Lambda `chat-handler` lee la API key de Anthropic en el cold start y la cachea en el contexto de ejecución.
+El servicio `chat-handler` (Fargate) lee la API key de Anthropic al iniciar el contenedor (`chat_core.py`, init eager en el import) y la cachea en memoria del proceso.
 
 El secreto está encriptado con AWS managed KMS keys.
 
@@ -349,11 +370,12 @@ El secreto está encriptado con AWS managed KMS keys.
 
 ## CloudWatch
 
-Recibe los logs de todas las Lambdas. Hay un log group por Lambda, creados con `for_each` en Terraform:
+Recibe los logs de las Lambdas (un log group por Lambda) y de los servicios Fargate (driver `awslogs`):
 
-| Log group | Lambda |
+| Log group | Workload |
 |---|---|
-| `/aws/lambda/jetsmart-prod-chat-handler` | chat-handler |
+| `/ecs/jetsmart-prod-chat-handler` | chat-handler (Fargate) |
+| `/ecs/jetsmart-prod-weather-poller` | weather-poller (Fargate) |
 | `/aws/lambda/jetsmart-prod-payment-reserve-flight` | payment-reserve-flight |
 | `/aws/lambda/jetsmart-prod-payment-reserve-booking` | payment-reserve-booking |
 | `/aws/lambda/jetsmart-prod-payment-collect` | payment-collect |
@@ -363,7 +385,9 @@ Recibe los logs de todas las Lambdas. Hay un log group por Lambda, creados con `
 | `/aws/lambda/jetsmart-prod-payment-release-flight` | payment-release-flight |
 | `/aws/lambda/jetsmart-prod-boarding-pass-async` | boarding-pass-async |
 | `/aws/lambda/jetsmart-prod-notification` | notification |
-| `/aws/lambda/jetsmart-prod-analytics-processor` | analytics-processor |
+| `/aws/lambda/jetsmart-prod-business-analytics-emitter` | business-analytics-emitter |
+| `/aws/lambda/jetsmart-prod-stream-emitter` | stream-emitter |
+| `/aws/lambda/jetsmart-prod-refund-trigger` | refund-trigger |
 | `/aws/lambda/jetsmart-prod-human-handoff-processor` | human-handoff-processor |
 | `/aws/lambda/jetsmart-prod-proactive-notifications` | proactive-notifications |
 | `/aws/lambda/jetsmart-prod-auth-callback` | auth-callback |
@@ -379,7 +403,7 @@ Cuatro alarmas conectadas al SNS topic `notifications`:
 
 | Alarma | Métrica | Por qué importa |
 |---|---|---|
-| `analytics-processor-errors` | `AWS/Lambda Errors > 0` sobre `analytics-processor` | Si falla, no escribimos eventos al data lake |
+| `business-analytics-emitter-errors` | `AWS/Lambda Errors > 0` sobre `business-analytics-emitter` | Si falla, no emitimos eventos CDC al data lake |
 | `human-handoff-dlq-messages-visible` | `AWS/SQS ApproximateNumberOfMessagesVisible > 0` | Hay derivaciones a humano que no se procesaron |
 | `proactive-notifications-dlq-messages-visible` | idem | Hay notificaciones proactivas que no se enviaron |
 | `boarding-pass-generation-dlq-messages-visible` | idem | Hay boarding passes pendientes de generar |
@@ -436,36 +460,13 @@ Cuatro buckets con propósitos distintos:
 - Bucket policy permite a `dynamodb.amazonaws.com` hacer `PutObject` (export funciona)
 - Encriptación SSE-S3
 
-## Lambda Layers
+## Dependencias del chat-handler: imagen Docker (no Lambda Layers)
 
-**Dos layers** compilados para Python 3.12 en Linux x86_64 (`layers.tf`):
+Como `chat-handler` ahora es un **contenedor Fargate**, sus dependencias y su system prompt van **dentro de la imagen Docker** (`app/chat-handler/Dockerfile`), no en Lambda Layers:
 
-| Layer | Contenido | Montado en | Usada por |
-|---|---|---|---|
-| `jetsmart-prod-anthropic` | SDK `anthropic` + dependencias HTTP | `/opt/python/` | `chat-handler` |
-| `jetsmart-prod-system-prompt` | El system prompt del chatbot (texto) | `/opt/system_prompt.txt` | `chat-handler` |
+- **SDK `anthropic` + FastAPI/uvicorn + PyJWT/requests** — se instalan con `pip install -r requirements.txt` durante el `docker build`.
+- **System prompt** — se hornea en la imagen con `COPY terraform/infra/templates/system_prompt.tpl /opt/system_prompt.txt`. `chat_core.py` lo lee de `SYSTEM_PROMPT_PATH = /opt/system_prompt.txt` al iniciar.
 
-### Por qué el system prompt en layer y no en S3 (cambio respecto al TP3)
+La imagen se publica en ECR y Fargate la pullea. Versionado por tag de imagen (`var.image_tag`): cada build es un artefacto inmutable, rollback = re-deploy del tag anterior.
 
-En el TP3 el system prompt vivía en S3 (`config/system_prompt.txt`) y la Lambda lo descargaba en el cold start con `s3:GetObject`. En TP4 se movió a Lambda Layer. Justificación:
-
-- **Cero penalty de cold start** — leer un filesystem local de Lambda es ~1ms; un `GetObject` sobre la red regional son ~30-50ms en el cold start.
-- **Versionado inmutable nativo** — cada `PublishLayerVersion` devuelve un ARN nuevo. Rollback es un click cambiando el ARN atachado a la Lambda. En S3 había que copiar archivos a una key alternativa.
-- **Sin permisos IAM extra** — eliminamos el `s3:GetObject` de la policy del LabRole para esta key específica. Superficie de permisos más chica.
-
-### Por qué dos layers separados y no uno solo
-
-Distintos ciclos de vida:
-
-- El SDK de `anthropic` cambia cuando Anthropic publica una versión nueva (mensual aprox).
-- El system prompt cambia cuando el equipo de Producto tunea el comportamiento del bot (a veces varias veces por semana).
-
-Mezclarlos contaminaría el versionado: cada ajuste de una línea del prompt obligaría a republicar el SDK también. Separarlos permite versionarlos independientemente y rotar el prompt sin tocar el SDK.
-
-### Build pipeline
-
-Ambos layers se construyen con `scripts/build-layers.sh` antes de `terraform apply`:
-- `anthropic` se compila con `pip --platform manylinux2014_x86_64 --target` para garantizar compatibilidad con el runtime de Lambda
-- `system-prompt` se zipea desde `config/system_prompt.txt`
-
-> El layer `jetsmart-prod-psycopg2` del TP3 (driver PostgreSQL) se eliminó junto con RDS. La validación JWT manual con `python-jose` también desapareció — ahora la hace el Cognito Authorizer en el perímetro del API Gateway.
+> **Vestigios del diseño viejo:** `layers.tf` todavía define dos `aws_lambda_layer_version` (`anthropic` y `system-prompt`) del diseño serverless. **Ya no los consume nadie** — el chat-handler era la única Lambda que los montaba y dejó de ser Lambda. Son candidatos a borrar. El layer `psycopg2` del TP3 (driver PostgreSQL) ya se eliminó junto con RDS. La validación JWT manual con `python-jose` se mantiene conceptualmente, pero ahora corre **in-app en el contenedor** (PyJWT contra el JWKS, RS256) — no en un Cognito Authorizer.

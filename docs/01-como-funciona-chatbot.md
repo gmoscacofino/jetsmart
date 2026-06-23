@@ -22,7 +22,7 @@ Toda aplicación web tiene dos partes:
 
 **Frontend** — lo que el usuario ve. En este caso, la página del chatbot: el cuadro de texto, los mensajes, el diseño. Son archivos estáticos (HTML, CSS, JavaScript) que el navegador descarga y muestra. En este proyecto viven en S3 (static website hosting).
 
-**Backend** — el código que corre en un servidor, invisible para el usuario. En este proyecto, el backend son funciones Lambda: se activan cuando llega un request, procesan el mensaje y devuelven una respuesta.
+**Backend** — el código que corre en un servidor, invisible para el usuario. En este proyecto, el core del chatbot (`chat-handler`) es un servicio FastAPI que corre en **ECS Fargate**, dentro de la VPC: recibe el request HTTP, procesa el mensaje y devuelve una respuesta. Alrededor hay funciones Lambda —la mayoría también dentro de la VPC, en subnets `private-lambda`— para tareas asincrónicas (saga de pago, notificaciones, analytics, etc.).
 
 ---
 
@@ -33,7 +33,7 @@ Cuando el backend necesita hablar con otro sistema — por ejemplo, pedirle a un
 Una API es un canal de comunicación entre sistemas. El backend manda un pedido (HTTP request), el otro sistema lo procesa y devuelve una respuesta (JSON).
 
 ```
-Tu Lambda (chat-handler)          API de Anthropic
+Tu servicio (chat-handler)        API de Anthropic
           │                               │
           │──── "El usuario preguntó X" ──→│
           │                               │  (procesa)
@@ -54,7 +54,7 @@ El LLM no vive en tu servidor. Lo usás llamando a su API, igual que usás Googl
 
 ## Cómo el backend habla con el LLM
 
-Cada vez que el usuario manda un mensaje, la Lambda construye un "paquete" con tres partes y se lo manda al LLM:
+Cada vez que el usuario manda un mensaje, el chat-handler construye un "paquete" con tres partes y se lo manda al LLM:
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -82,7 +82,7 @@ Es el texto de instrucciones que le da identidad al chatbot. Acá se define:
 
 ### Por qué el LLM no "recuerda" solo
 
-El LLM no tiene memoria entre llamadas. Cada vez que lo llamás, es como la primera vez. Por eso la Lambda le manda **los últimos 40 mensajes** (`MAX_HISTORY = 40`) junto con el mensaje nuevo. Ese historial se guarda en DynamoDB y se rescata con un Query limitado.
+El LLM no tiene memoria entre llamadas. Cada vez que lo llamás, es como la primera vez. Por eso el chat-handler le manda **los últimos 40 mensajes** (`MAX_HISTORY = 40`) junto con el mensaje nuevo. Ese historial se guarda en DynamoDB y se rescata con un Query limitado.
 
 ```
 DynamoDB — historial de una sesión:
@@ -102,28 +102,28 @@ DynamoDB — historial de una sesión:
 ```
 Usuario escribe "quiero volar a Mendoza"
         ↓
-Frontend (S3) hace POST al API Gateway
+Frontend (S3) hace POST al ALB (POST /api/chat)
 + incluye el Access Token de Cognito en el header
         ↓
-API Gateway invoca la Lambda chat-handler
+ALB enruta el request al chat-handler (Fargate)
         ↓
-Lambda verifica que el token sea válido (Cognito)
+chat-handler valida el token in-app (firma RS256 contra el JWKS de Cognito)
         ↓
-Lambda carga el historial de esta conversación desde DynamoDB
+chat-handler carga el historial de esta conversación desde DynamoDB
         ↓
-Lambda construye el prompt:
+chat-handler construye el prompt:
   [system prompt] + [historial] + [mensaje nuevo]
         ↓
-Lambda llama a la API de Anthropic
+chat-handler llama a la API de Anthropic
 (usando la key guardada en Secrets Manager)
         ↓
 Anthropic devuelve la respuesta del chatbot
         ↓
-Lambda guarda el intercambio nuevo en DynamoDB (sincrónico)
+chat-handler guarda el intercambio nuevo en DynamoDB (sincrónico)
         ↓
-Lambda publica evento en SNS → SQS → analytics-processor → S3 data lake (asincrónico)
+chat-handler publica evento en SNS → SQS → analytics → S3 data lake (asincrónico)
         ↓
-Lambda devuelve la respuesta al frontend
+chat-handler devuelve la respuesta al frontend
         ↓
 Frontend muestra el mensaje al usuario
 ```
@@ -154,7 +154,7 @@ En lugar de que el LLM adivine, le damos herramientas que puede invocar:
 Con tool use:
   Usuario: "¿hay vuelos BUE→SCL el 20 de junio?"
   Claude: "Necesito consultar disponibilidad" → invoca search_flights(origen=AEP, destino=SCL, fecha=2026-06-20)
-  Lambda ejecuta la herramienta → obtiene datos reales de DynamoDB
+  chat-handler ejecuta la herramienta → obtiene datos reales de DynamoDB
   Claude recibe los datos → "Sí, el vuelo JA-201 sale a las 08:00, precio $85 USD"
 ```
 
@@ -189,7 +189,7 @@ El chatbot tiene declaradas diez herramientas, agrupadas por familia:
 
 ### El bucle de tool use
 
-La Lambda implementa un bucle de hasta 5 rondas:
+El chat-handler implementa un bucle de hasta 5 rondas:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -217,10 +217,10 @@ Claude puede invocar múltiples herramientas en una sola ronda. En la ronda sigu
 
 ### Cómo funciona en la API de Anthropic
 
-Al llamar a `messages.create()`, se pasa la lista de herramientas disponibles. Claude devuelve un bloque de tipo `tool_use` con el nombre de la herramienta y los parámetros que eligió. La Lambda ejecuta la herramienta y devuelve el resultado en un bloque `tool_result`. Claude entonces genera la respuesta final en lenguaje natural.
+Al llamar a `messages.create()`, se pasa la lista de herramientas disponibles. Claude devuelve un bloque de tipo `tool_use` con el nombre de la herramienta y los parámetros que eligió. El chat-handler ejecuta la herramienta y devuelve el resultado en un bloque `tool_result`. Claude entonces genera la respuesta final en lenguaje natural.
 
 ```python
-# La Lambda le declara las herramientas a Claude:
+# El chat-handler le declara las herramientas a Claude:
 TOOLS = [
     {
         "name": "search_flights",
@@ -240,7 +240,7 @@ TOOLS = [
 ]
 ```
 
-Claude decide cuándo y cómo llamarlas según la pregunta del usuario — la Lambda no le dice explícitamente "usá esta herramienta".
+Claude decide cuándo y cómo llamarlas según la pregunta del usuario — el chat-handler no le dice explícitamente "usá esta herramienta".
 
 ### La tabla `business` ES el PSS
 
@@ -259,7 +259,7 @@ def _execute_tool(name, inputs, user_id):
         return json.dumps(resp.get("Items", []))
 ```
 
-No hay "modo demo" ni "modo prod" — la Lambda hace `Query` a la business table igual hoy que en una hipotética operación real. El TP carga un dataset de vuelos cuando se hace `terraform apply` (ver `seed.py`), pero el esquema (`PK=FLIGHT#{origen}#{destino}` / `SK=DATE#{fecha}#FLIGHT#{vuelo}` + GSIs por número de vuelo, por reserva y por pasajero) es el que tendría un PSS de verdad.
+No hay "modo demo" ni "modo prod" — el chat-handler hace `Query` a la business table igual hoy que en una hipotética operación real. El TP carga un dataset de vuelos cuando se hace `terraform apply` (ver `seed.py`), pero el esquema (`PK=FLIGHT#{origen}#{destino}` / `SK=DATE#{fecha}#FLIGHT#{vuelo}` + GSIs por número de vuelo, por reserva y por pasajero) es el que tendría un PSS de verdad.
 
 ```
 Todos los canales de la aerolínea consultan el mismo PSS:
@@ -276,27 +276,27 @@ Todos los canales de la aerolínea consultan el mismo PSS:
 ```
 Usuario: "¿hay vuelos de AEP a SCL el 20 de junio para 2 personas?"
         ↓
-Frontend hace POST /api/chat
+Frontend hace POST /api/chat (vía ALB)
         ↓
-Lambda chat-handler recibe el mensaje
+chat-handler (Fargate) recibe el mensaje
         ↓
-Lambda llama a Claude con TOOLS declaradas
+chat-handler llama a Claude con TOOLS declaradas
         ↓
 Claude responde: stop_reason = "tool_use"
   → quiere ejecutar search_flights(origen=AEP, destino=SCL, fecha=2026-06-20, pasajeros=2)
         ↓
-Lambda ejecuta _execute_tool("search_flights", {...})
+chat-handler ejecuta _execute_tool("search_flights", {...})
   → consulta DynamoDB business (el PSS)
   → obtiene: vuelo JA-201, salida 08:00, precio $85, asientos disponibles: 142
         ↓
-Lambda devuelve el resultado a Claude como tool_result
+chat-handler devuelve el resultado a Claude como tool_result
         ↓
 Claude responde: stop_reason = "end_turn"
   → genera texto: "Sí, hay un vuelo disponible. El JA-201 sale a las 08:00..."
         ↓
-Lambda guarda el intercambio en DynamoDB
-Lambda publica evento en SNS → analytics
-Lambda devuelve la respuesta al frontend
+chat-handler guarda el intercambio en DynamoDB
+chat-handler publica evento en SNS → analytics
+chat-handler devuelve la respuesta al frontend
 ```
 
 ---
@@ -307,10 +307,10 @@ Si el frontend llamara a Anthropic directamente, la API key quedaría visible en
 
 ```
 ✗ INCORRECTO: Frontend → Anthropic (key expuesta en el browser)
-✓ CORRECTO:   Frontend → API Gateway → Lambda → Anthropic (key en Secrets Manager)
+✓ CORRECTO:   Frontend → ALB → chat-handler (Fargate) → Anthropic (key en Secrets Manager)
 ```
 
-La API key **nunca sale de la Lambda**.
+La API key **nunca sale del chat-handler**.
 
 ---
 

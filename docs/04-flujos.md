@@ -1,6 +1,6 @@
 # 04 — Flujos del sistema
 
-> Refleja la arquitectura serverless puro del TP4: sin VPC, sin RDS, sin bastion. Cognito Authorizer en API Gateway, Saga orquestada con Step Functions, analytics como data lake (S3 + Glue + Athena).
+> Refleja la arquitectura desplegada: el core del chatbot (chat-handler) corre como servicio FastAPI en ECS Fargate (subnets privadas de la VPC) detrás de un ALB internet-facing; las Lambdas de negocio también corren en la VPC (subnets `private-lambda`), salvo auth-callback/cognito-trigger/backup-dynamodb que son regionales; sin RDS, sin bastion. El JWT de Cognito se valida in-app en el contenedor (no Cognito Authorizer), Saga orquestada con Step Functions, analytics como data lake (S3 + Glue + Athena).
 
 ## Flujo 1 — Autenticación (login con Cognito)
 
@@ -38,9 +38,10 @@ S3 no puede ejecutar código y sólo sirve HTTP estático. Cognito sólo redirig
 8. A partir de ahora, cada request al backend incluye el ID Token
    en el header: Authorization: Bearer <token>
            ↓
-9. API Gateway (chatbot) → Cognito Authorizer valida el JWT
-   Si es inválido o falta → 401 antes de invocar Lambda
-   Si es válido → invoca chat-handler con los claims ya resueltos
+9. ALB → chat-handler (Fargate) valida el JWT in-app
+   server.py verifica firma RS256 contra el JWKS del User Pool, issuer y exp
+   Si es inválido o falta → 401 antes de ejecutar la lógica
+   Si es válido → pasa los claims (sub, etc.) a chat_core
 ```
 
 ### Cognito trigger — post-registro
@@ -57,56 +58,54 @@ Lambda llama a Cognito AdminAddUserToGroup → grupo `users`
 
 ### Cambio respecto al TP3
 
-En TP3, `chat-handler` validaba el JWT internamente con `python-jose` (~50 líneas + layer). En TP4 esa validación la hace API Gateway con un `aws_api_gateway_authorizer` tipo `COGNITO_USER_POOLS`. Los claims llegan a la Lambda ya verificados en `event.requestContext.authorizer.claims`. Excepción documentada: el API de `auth-callback` queda con `authorization = "NONE"` porque Cognito redirige sin Authorization header.
+En TP3, `chat-handler` validaba el JWT internamente con `python-jose` corriendo en Lambda. En la arquitectura desplegada el chat-handler corre como servicio FastAPI en Fargate detrás del ALB y la validación sigue siendo in-app: `server.py` verifica la firma RS256 contra el JWKS del User Pool (más issuer y exp) y pasa los claims a la lógica. No hay Cognito Authorizer: el API Gateway del chatbot fue reemplazado por el ALB. El único API Gateway que queda es el de `auth-callback`, con `authorization = "NONE"` porque Cognito redirige sin Authorization header.
 
 ---
 
 ## Flujo 2 — Mensaje del chatbot
 
-El chat es **sincrónico**: la Lambda responde en la misma invocación.
+El chat es **sincrónico**: el chat-handler responde en el mismo request HTTP.
 
 ```
 Usuario escribe "quiero volar de Buenos Aires a Mendoza el 15 de junio"
         ↓
-Frontend hace POST a https://<api-gw>/api/chat
+Frontend hace POST a http://<alb-dns>/api/chat
 con Authorization: Bearer <id_token>
         ↓
-API Gateway → Cognito Authorizer valida el JWT
-(token inválido / faltante → 401, no se invoca Lambda)
+ALB → chat-handler (Fargate) valida el JWT in-app
+(server.py: firma RS256 contra el JWKS, issuer, exp;
+ token inválido / faltante → 401, no se ejecuta la lógica)
         ↓
-API Gateway invoca `chat-handler` con claims en
-event.requestContext.authorizer.claims
-        ↓
-Lambda identifica al usuario por el `sub` del claim
+chat-handler identifica al usuario por el `sub` del claim
 Carga historial de la sesión desde DynamoDB
         ↓
-Lambda construye prompt para Claude:
+chat-handler construye prompt para Claude:
   [system prompt cargado desde S3 assets]
   [historial completo de la sesión]
   [mensaje nuevo]
         ↓
-Lambda llama a la API de Anthropic (claude-haiku-4-5-20251001)
-con API key leída de Secrets Manager (cacheada en cold start)
+chat-handler llama a la API de Anthropic (claude-haiku-4-5-20251001)
+con API key leída de Secrets Manager (cacheada en el proceso)
         ↓
 [bucle de tool use, hasta 5 rondas — MAX_TOOL_ROUNDS = 5]
-Si Claude pide tool → Lambda ejecuta una de las 10:
+Si Claude pide tool → chat-handler ejecuta una de las 10:
   search_flights / list_flight_dates / get_reservation /
   list_user_reservations / list_saved_passengers / check_in /
   get_boarding_pass / create_claim / create_reservation /
   escalate_to_human
         ↓
-Si create_reservation → Lambda llama a Step Functions
+Si create_reservation → chat-handler llama a Step Functions
   StartExecution (no espera el resultado)
   Devuelve transaction_id al chat — la Saga corre async
         ↓
-Lambda guarda intercambio en DynamoDB (sincrónico):
+chat-handler guarda intercambio en DynamoDB (sincrónico):
   { rol: "usuario",    mensaje: "..." }
   { rol: "asistente", mensaje: "..." }
         ↓
-Lambda publica evento en SNS `events` (asincrónico — no espera):
+chat-handler publica evento en SNS `events` (asincrónico — no espera):
   { event_type: "chat_message", user_id, ... }
         ↓
-Lambda devuelve la respuesta al frontend
+chat-handler devuelve la respuesta al frontend
         ↓
 Frontend renderiza el mensaje
 ```

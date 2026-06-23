@@ -4,18 +4,24 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 ---
 
-## 1. Sin VPC
+## 1. Con VPC — el core del chatbot corre dentro de la red privada
 
-**Decisión:** la arquitectura no tiene VPC propia.
+**Decisión:** la arquitectura tiene VPC propia (`10.0.0.0/16`). El core del chatbot corre como servicio Fargate en **subnets privadas** (`private-fargate`, `assign_public_ip=false`) detrás de un ALB; las Lambdas de negocio corren en subnets privadas (`private-lambda`). Esto responde directamente al feedback de Faustino del 17/06: el cómputo del chatbot ahora vive DENTRO de la VPC, no como Lambdas sueltas regionales.
+
+**Topología (ver `networking.tf`):**
+- 2 subnets públicas → ALB + NAT Gateway.
+- 2 subnets `private-fargate` → Fargate (chat-handler + weather-poller).
+- 2 subnets `private-lambda` → Lambdas de negocio (Saga payment/refund, workers).
+- 1 IGW, 1 NAT Gateway, 2 gateway endpoints (S3, DynamoDB gratis), 8 interface endpoints (sns, sqs, secretsmanager, states, ecr.api, ecr.dkr, logs, kinesis-firehose).
 
 **Alternativas:**
-- (a) Mantener VPC con todas las Lambdas adentro + VPC Endpoints. → Over-engineering sin recursos persistentes.
-- (b) VPC con sólo `analytics-processor` adentro (como TP3). → Marcado como inconsistente por Faustino.
-- (c) **Sin VPC (elegida).** → Coherente con la realidad: no hay recursos para aislar.
+- (a) Mantener todo serverless sin VPC (diseño rechazado el 17/06) → Faustino lo marcó: el core del chatbot quedaba sin perímetro de red.
+- (b) VPC con sólo una Lambda adentro (TP3) → marcado como inconsistente por Faustino.
+- (c) **VPC con el core en contenedor + Lambdas de negocio adentro, endpoints para el tráfico AWS (elegida).** → El cómputo persistente (Fargate, awsvpc) necesita identidad de red; los VPC endpoints le dan acceso least-privilege a los servicios AWS sin salir a internet.
 
-**Trade-off:** se pierde VPC Flow Logs (visibilidad L3/L4 de red). Se gana: cold start mínimo, costo cero de NAT/endpoints, menos código Terraform, sin SGs.
+**Trade-off:** se paga 1 NAT Gateway (~USD/hora) y los interface endpoints; se agrega código Terraform (SGs, routing, endpoints). Se gana: perímetro de red real para el core, ECR/Logs alcanzables desde subnet privada, egress controlado por NAT, y el feedback de Faustino resuelto.
 
-**Por qué es la decisión correcta:** las VPCs sirven para aislar recursos con identidad de red persistente (EC2, RDS, ElastiCache). En una arquitectura 100% Lambda + servicios managed regionales no hay nada para aislar. CloudTrail cubre la auditoría que en otro escenario haría falta de Flow Logs.
+**Por qué es la decisión correcta:** Fargate con `network_mode=awsvpc` necesita ENIs en subnets — es cómputo con identidad de red persistente, exactamente el caso de uso de una VPC. El ALB internet-facing es el único punto expuesto; las tasks viven en subnets privadas sin IP pública. CloudTrail sigue cubriendo la auditoría a nivel management (decisión #18); VPC Flow Logs se podrían sumar para visibilidad L3/L4.
 
 ---
 
@@ -43,33 +49,32 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 **Alternativas:**
 - (a) Mantener bastion en subnet pública → señalado por Faustino.
-- (b) Mover bastion a subnet privada + VPC Endpoints SSM → requiere VPC para nada más.
-- (c) **Eliminar bastion (elegida).** → Sin RDS, no hay caso de uso.
+- (b) Mover bastion a subnet privada + VPC Endpoints SSM → aunque ahora hay VPC, no hay RDS al que forwardear.
+- (c) **Eliminar bastion (elegida).** → Sin RDS, no hay caso de uso, aunque la VPC ahora exista para el core en Fargate.
 
-**Trade-off:** ninguno relevante. El bastion solo servía para que un DBA hiciera port-forwarding a RDS via SSM — sin RDS no hay nada que forwardear.
+**Trade-off:** ninguno relevante. El bastion solo servía para que un DBA hiciera port-forwarding a RDS via SSM — sin RDS no hay nada que forwardear. La VPC actual existe para el cómputo en contenedor, no para alojar una base de datos.
 
 **Si tuviéramos que dar acceso DBA en producción real:** Lambda one-shot con permisos limitados invocada por el DBA via AWS CLI, logueada por CloudTrail.
 
 ---
 
-## 4. Cognito Authorizer (no validación manual)
+## 4. Validación del JWT in-app en el contenedor (no Cognito Authorizer)
 
-**Decisión:** el JWT lo valida API Gateway con un Cognito Authorizer, no la Lambda.
+**Decisión:** el chatbot entra por **ALB** (no API Gateway), y el JWT de Cognito lo valida el propio contenedor Fargate. `server.py` verifica la firma RS256 contra el JWKS del User Pool, el `issuer` y el `exp`, y pasa los claims a la lógica. No existe Cognito Authorizer en ningún lado (verificado: no hay `aws_api_gateway_authorizer` ni `COGNITO_USER_POOLS` en la infra).
 
 **Alternativas:**
 - (a) Validación manual con `python-jose` dentro de la Lambda (TP3).
-- (b) Lambda Authorizer custom → más código.
-- (c) **Cognito Authorizer (elegida).** → Patrón canónico de AWS.
+- (b) Cognito Authorizer en API Gateway (diseño serverless intermedio) → descartado: el core dejó de entrar por API Gateway y pasó a un ALB delante de Fargate (no soporta Cognito Authorizer; en producción real sería auth Cognito nativa del ALB sobre listener HTTPS).
+- (c) **Validación in-app en el contenedor (elegida).** → El core ya es un servicio HTTP nativo (FastAPI); validar el JWT en el request handler es el patrón natural y no acopla la auth a API Gateway.
 
-**Trade-off:** dependencia más fuerte en API Gateway (si el servicio se cae, no se puede validar). Pero API GW es serverless administrado por AWS — alta disponibilidad por diseño.
+**Trade-off:** el código de validación vive en la app (hay que mantenerlo y testearlo) en lugar de delegarlo al perímetro. A cambio, la validación es independiente de API Gateway y el contenedor controla exactamente qué claims usa.
 
 **Ganancias:**
-- Sin token válido → `401` en el perímetro, sin gastar invocación de Lambda.
-- Cero código de validación que mantener.
-- Layer `python-jose` eliminado.
-- Patrón estándar reconocible por cualquier arquitecto AWS.
+- Sin token válido → `401` desde el propio servicio antes de tocar la lógica de negocio.
+- El ALB hace health-check a `/health` (sin auth); las rutas `POST /api/chat`, `GET /api/reservations`, `POST /api/payment` exigen JWT válido.
+- La auth no depende de API Gateway: si mañana se cambia el ALB por otro ingress, la validación viaja con el contenedor.
 
-**Excepción documentada:** el API GW de `auth-callback` queda con `authorization = "NONE"` por el workaround Cognito (ver `teoria/notas-de-clase/workaround-cognito.md`).
+**Excepción documentada:** el API GW de `auth-callback` (único API Gateway que queda, `jetsmart-prod-auth-api`, bridge OAuth del Hosted UI) tiene `authorization = "NONE"` por el workaround Cognito (ver `teoria/notas-de-clase/workaround-cognito.md`).
 
 ---
 
@@ -116,17 +121,24 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 ---
 
-## 8. chat-handler regional (no en VPC)
+## 8. chat-handler en Fargate dentro de la VPC (subnets privadas)
 
-**Decisión:** la Lambda `chat-handler` no está en VPC.
+**Decisión:** el core "chat-handler" dejó de ser Lambda y corre como **servicio FastAPI nativo en ECS Fargate**, en subnets privadas (`private-fargate`, `assign_public_ip=false`), detrás de un ALB internet-facing (HTTP:80). 2 tasks Multi-AZ (1 por AZ), Auto Scaling 2→6 con target tracking de CPU al 60%. El egress a la API de Anthropic sale por el NAT Gateway; ECR/Logs/Secrets/DynamoDB se alcanzan por VPC endpoints. Esto responde al feedback de Faustino: el cómputo del chatbot ahora vive en la VPC.
 
-**Alternativa eliminada:** ponerla en VPC con NAT Gateway para alcanzar Anthropic API.
+**Alternativa eliminada:** mantenerlo como Lambda regional sin VPC (diseño serverless rechazado el 17/06) → Faustino marcó que el core no tenía perímetro de red.
 
-**Razón:** ponerla en VPC requiere NAT Gateway (USD/hora) y agrega cold start de 500ms-2s. Sin VPC no hay perímetro de red pero la seguridad está en:
-- Cognito Authorizer rechaza requests sin JWT.
-- LabRole limita las acciones AWS.
-- API key Anthropic en Secrets Manager (no en código).
-- CloudTrail audita todas las API calls.
+**Por qué Fargate en VPC:**
+- Cómputo con identidad de red persistente (`network_mode=awsvpc`, ENIs en subnet) → caso de uso natural de una VPC.
+- Servicio HTTP de larga vida con health-checks del ALB, sin cold start por request como Lambda.
+- Auto Scaling por CPU para absorber picos (elasticidad real, 2→6 tasks).
+
+**Seguridad:**
+- El contenedor valida el JWT de Cognito in-app (decisión #4) y rechaza requests sin token válido.
+- Tasks en subnet privada sin IP pública; solo el ALB está expuesto.
+- Security groups: el SG de las tasks solo acepta tráfico del SG del ALB.
+- LabRole limita las acciones AWS; API key Anthropic en Secrets Manager (no en código); CloudTrail audita las API calls.
+
+**Código:** `app/chat-handler/` → `chat_core.py` (tool-use loop de Anthropic, DynamoDB, PII) + `server.py` (router FastAPI, validación JWT). Imagen Docker en ECR, pulleada por Fargate. El nombre lógico "chat-handler" se mantiene; lo que cambió es el runtime (Lambda→Fargate) y el envoltorio (event Lambda→HTTP nativo).
 
 ---
 
@@ -156,11 +168,11 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 ## 11. No layer `python-jose`
 
-**Decisión:** eliminamos el layer.
+**Decisión:** eliminamos el Lambda layer `python-jose`. Quedan solo dos layers (`anthropic` y `system-prompt`, ver `layers.tf`).
 
-**Razón:** era usado por `chat-handler` para validar JWT manualmente. Con Cognito Authorizer la validación ya no está en la Lambda → `python-jose` se eliminó.
+**Razón:** el `python-jose` era usado por la Lambda `chat-handler` del TP3 para validar el JWT manualmente. Al migrar el core a Fargate, la validación del JWT pasó a ser in-app en el contenedor (decisión #4) usando **PyJWT + cryptography** (ver `app/chat-handler/requirements.txt`), que se empaquetan en la imagen Docker, no en un layer. Ninguna Lambda restante valida JWT, así que el layer dejó de tener consumidor.
 
-**Beneficio colateral:** menos peso del cold start, menos superficie de seguridad (el código de `python-jose` ya no se ejecuta).
+**Beneficio colateral:** un layer menos que construir y versionar; menos superficie en el empaquetado de las Lambdas.
 
 ---
 
@@ -173,7 +185,7 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 - (b) Una tabla por entidad (USERS, FLIGHTS, RESERVATIONS, ...) → rompe single-table design, multiplica RCU/WCU.
 - (c) **Dos tablas, una por bounded context (elegida)** → bounded contexts del DDD, manteniendo single-table dentro de cada uno.
 
-**Trade-off:** dos conexiones de cliente DynamoDB en `chat_handler`, una operación más en `terraform apply`, dos backups diarios. Ganancia: separación clara de responsabilidades, failure isolation, retention policies independientes, reemplazabilidad del canal sin tocar el negocio.
+**Trade-off:** dos conexiones de cliente DynamoDB en el servicio chat-handler (`chat_core.py`), una operación más en `terraform apply`, dos backups diarios. Ganancia: separación clara de responsabilidades, failure isolation, retention policies independientes, reemplazabilidad del canal sin tocar el negocio.
 
 **Por qué es la decisión correcta:** el chatbot y el negocio JetSmart son dominios distintos. Las conversaciones son efímeras (TTL días), las reservas son persistentes (años). Las conversaciones son propiedad del canal, las reservas son propiedad de la aerolínea — si mañana sumás un canal web/mobile/IVR, comparten la business table pero cada uno tiene su propio conversation store.
 
@@ -201,7 +213,7 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 **Decisión:** la tool `escalate_to_human` del chatbot publica a SQS `human-handoff`; la Lambda `human_handoff_processor` consume y simula el POST al call center.
 
 **Alternativas:**
-- (a) `chat_handler` llama directo a la API del call center → acopla disponibilidad y latencia.
+- (a) el chat-handler llama directo a la API del call center → acopla disponibilidad y latencia.
 - (b) **SQS intermediario (elegida)** → desacople + reintentos + DLQ.
 
 **Trade-off:** un componente más en el path (SQS). Ganancia: si el call center está caído, el pedido queda esperando 14 días en la cola; reintentos automáticos con DLQ para alarma; trazabilidad de todos los handoffs en conversations table.
@@ -270,10 +282,10 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 **Decisión:** la tool `create_reservation` ignora el campo `email_contacto` del input y usa el claim `email` del JWT de Cognito. El system prompt instruye explícitamente *"NUNCA preguntar el email al usuario"*.
 
-**Razón:** el usuario ya se autenticó vía Cognito Hosted UI — su email está validado por el IdP, llega firmado en el JWT y la API Gateway lo expone vía `event.requestContext.authorizer.claims.email`. Preguntárselo de nuevo en el chat es:
+**Razón:** el usuario ya se autenticó vía Cognito Hosted UI — su email está validado por el IdP, llega firmado en el JWT y el contenedor lo extrae del claim `email` tras validar el token in-app (`server.py`). Preguntárselo de nuevo en el chat es:
 1. **Mala UX** — el usuario lo escribió hace 10 segundos en el login.
 2. **Riesgo de tipos** — un email mal tipeado en el chat dispara mails fallidos sin que el sistema se entere.
-3. **Inconsistente con el design de Cognito Authorizer** (decisión #4): si confiamos en el JWT para autenticación, también confiamos en sus claims para identidad.
+3. **Inconsistente con el design de validación in-app del JWT** (decisión #4): si confiamos en el JWT para autenticación, también confiamos en sus claims para identidad.
 
 **Trade-off:** el `email_contacto` queda como opcional en el schema de la tool — útil sólo si el usuario quiere especificar un mail distinto al del login (caso edge, no documentado en el flujo). El handler hace `user_email or inputs.email_contacto` por compatibilidad.
 
@@ -320,7 +332,7 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 - (b) Set-attribute en el FLIGHT item con lista de seats ocupados → DynamoDB no permite operaciones atómicas sobre elementos de set, expone la lista entera en cada read (>=400 KB con vuelo lleno).
 - (c) **Items individuales con ConditionExpression (elegida)** → atomicidad real, prevención de double-assignment, queryable con `Select=COUNT` y `begins_with(SK, "...#SEAT#")`.
 
-**Decisión de atomicidad:** el PNR se genera en `chat_handler.py` con SHA-256 del payment_id ANTES de iniciar el Saga y se pasa en el input del state machine. ReserveFlight escribe `reserved_by = "PNR#XXXXXX"` desde el primer paso. Esto permite que la compensación `ReleaseFlight` libere exactamente el seat de este PNR (sin riesgo de tocar uno ajeno) y que el flujo sea idempotente bajo retry.
+**Decisión de atomicidad:** el PNR se genera en `app/chat-handler/chat_core.py` (servicio Fargate) con SHA-256 del payment_id ANTES de iniciar el Saga y se pasa en el input del state machine. ReserveFlight escribe `reserved_by = "PNR#XXXXXX"` desde el primer paso. Esto permite que la compensación `ReleaseFlight` libere exactamente el seat de este PNR (sin riesgo de tocar uno ajeno) y que el flujo sea idempotente bajo retry.
 
 **Trade-off:** el volumen de ítems se multiplica por ~121× (20 rutas × 30 fechas × 121 ítems = ~72k). En DynamoDB es despreciable. El seed tarda ~3 min en lugar de ~10 seg.
 
@@ -370,7 +382,7 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 ## 25. Sacar atributo `aerolinea`
 
-**Decisión:** se eliminó la columna `aerolinea: "JetSmart"` del seed y de las lecturas en `chat_handler`. Era un valor constante en toda la tabla.
+**Decisión:** se eliminó la columna `aerolinea: "JetSmart"` del seed y de las lecturas en el chat-handler (`chat_core.py`). Era un valor constante en toda la tabla.
 
 **Razón:** YAGNI. La tabla `business` ya está namespaced por `name_prefix = jetsmart-prod-` y el sistema es mono-aerolínea. Tener un campo que siempre dice "JetSmart" sólo añade ruido en la consola y en los logs.
 
@@ -410,13 +422,13 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 - Si el user tarda >10 min completando PASOS 4-5-6, el hold expira. El backend lo detecta y le ofrece retomar. Si en ese intervalo otro usuario tomó el mismo seat, le mostramos alternativas.
 - No usamos `TransactWriteItems` para liberar previos + tomar nuevo. Atomic global agregaría costo 2× WCU y complejidad. El hold huérfano por race es bounded por TTL.
 
-**Pregunta esperable en oral:** *"¿Y si el user holdea desde un tab e intenta confirmar desde otro?"* → el `user_id` viene del JWT del Cognito Authorizer, es el mismo en ambos tabs. El handler reconoce el hold como propio y lo consume. **Funciona transparente.**
+**Pregunta esperable en oral:** *"¿Y si el user holdea desde un tab e intenta confirmar desde otro?"* → el `user_id` viene del JWT de Cognito validado in-app en el contenedor, es el mismo en ambos tabs. El handler reconoce el hold como propio y lo consume. **Funciona transparente.**
 
 ---
 
 ## 27. Protección de PII frente a la API de Anthropic
 
-**Decisión:** tokenización en línea de PII del usuario antes de enviar mensajes a `api.anthropic.com`. El módulo `lambda/pii_tokenizer.py` detecta email, DNI, teléfono, fecha de nacimiento (ISO y DD/MM/YYYY) y sexo en el texto que el user escribe en el chat, y los reemplaza por placeholders del tipo `<EMAIL_xxxxxxxxxx>`, `<DNI_xxxxxxxxxx>`, etc. Claude ve solo los placeholders. Antes de invocar los handlers de tools, los placeholders se resuelven a los valores reales (look-up en `conversations` table).
+**Decisión:** tokenización en línea de PII del usuario antes de enviar mensajes a `api.anthropic.com`. El módulo de tokenización de PII (copia en `app/chat-handler/`, ejecutado por el servicio Fargate del chat-handler) detecta email, DNI, teléfono, fecha de nacimiento (ISO y DD/MM/YYYY) y sexo en el texto que el user escribe en el chat, y los reemplaza por placeholders del tipo `<EMAIL_xxxxxxxxxx>`, `<DNI_xxxxxxxxxx>`, etc. Claude ve solo los placeholders. Antes de invocar los handlers de tools, los placeholders se resuelven a los valores reales (look-up en `conversations` table).
 
 **Por qué importa:**
 - Cada llamada a `messages.create()` envía el system prompt, el array `messages` (historial + nuevo mensaje) y los `tools` schemas a infraestructura de Anthropic. Los servidores de Anthropic procesan transitivamente todo lo que el user escribió.
@@ -441,7 +453,7 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 - ✅ Tokenizamos los inputs PII más estructurados que sí tienen regex confiable.
 - ✅ Si Anthropic compromete sus logs, lo único directamente identificable serían nombres y partes del flujo conversacional, no DNIs ni emails ni fechas de nacimiento.
 
-**Validación server-side asociada:** como Claude solo ve tokens, no puede validar formato de DNI/teléfono/fecha. La validación es responsabilidad del server: `_validate_passenger_input` en `chat_handler.py` valida los valores reales después de detokenizar y rechaza con error explícito si el DNI no tiene 7-8 dígitos, la fecha no es válida, el sexo no está en el enum, etc.
+**Validación server-side asociada:** como Claude solo ve tokens, no puede validar formato de DNI/teléfono/fecha. La validación es responsabilidad del server: `_validate_passenger_input` en `app/chat-handler/chat_core.py` (servicio Fargate) valida los valores reales después de detokenizar y rechaza con error explícito si el DNI no tiene 7-8 dígitos, la fecha no es válida, el sexo no está en el enum, etc.
 
 **Persistencia de fecha_nacimiento + sexo:** los pasos 5c y 5d del flujo de compra recolectan estos datos como exige cualquier PSS real (regulación TSA, identificación en boarding pass). Ahora se persisten en el item `PNR#<pnr>/PAX#01` junto con DNI, nombre, email, teléfono y seat. Antes se pedían pero no se guardaban — bug de coherencia que se cierra.
 
@@ -493,17 +505,17 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 ## Preguntas probables y respuestas cortas
 
-> **¿Por qué eliminaste todo en lugar de "arreglar" lo que Faustino marcó?**
+> **¿Cómo respondiste al feedback de Faustino del 17/06?**
 
-Porque al analizarlo en profundidad descubrimos que los 3 puntos tenían una raíz común: la VPC no tenía razón de ser sin RDS, y RDS no tenía razón de ser sin un equipo que la consumiera bien. Cambiar al patrón data lake resolvió los 3 puntos de raíz en lugar de parchearlos.
+Faustino marcó que el core del chatbot quedaba como Lambdas sueltas fuera de la VPC, sin perímetro de red. La respuesta fue mover el core a un servicio en contenedor (Fargate) DENTRO de la VPC, en subnets privadas detrás de un ALB, con las Lambdas de negocio también en subnets privadas. Ahora el cómputo del chatbot vive en la VPC, que es exactamente lo que pedía. El bastion y RDS siguen sin existir porque no hay caso de uso (la capa de analytics es data lake S3 + Athena).
 
-> **¿No es una arquitectura "menos serial" que la de TP3?**
+> **¿Por qué Fargate en VPC y no seguir 100% serverless?**
 
-Es menos componentes — y eso es justamente la fortaleza. YAGNI también aplica a arquitectura. Una VPC sin recursos persistentes es burocracia de red.
+Porque un servicio HTTP de larga vida con auth in-app, health-checks y Auto Scaling es el patrón natural para el core conversacional, y necesita identidad de red (awsvpc) — la VPC deja de ser burocracia y pasa a ser el perímetro real del cómputo. Los servicios managed (DynamoDB, SNS, SQS, Step Functions, Firehose) se alcanzan por VPC endpoints sin salir a internet; el egress a Anthropic sale por NAT. No es "menos serverless por moda": es poner el cómputo donde corresponde según su forma.
 
 > **¿Cómo escalan los analytics a 10x el volumen?**
 
-S3 escala infinito. Athena escala automáticamente (es serverless). Glue Crawler tarda más pero no bloquea queries. La única cosa que escalaría problemática es la velocidad de invocación de analytics-processor — para eso ya tenemos SQS con batching.
+S3 escala infinito. Athena escala automáticamente (es serverless). Glue Crawler tarda más pero no bloquea queries. El ingest al data lake lo hace `business_analytics_emitter` consumiendo el DynamoDB Stream con batching y haciendo PutRecord a Firehose, que batchea nativo a S3 — escala con el throughput del Stream sin cuello de botella.
 
 > **¿Qué hacen los `payment-*` Lambdas si una de ellas falla con error transitorio?**
 

@@ -5,7 +5,7 @@
 
 JetSmart Chatbot es un asistente conversacional desplegado en AWS con Terraform que replica la experiencia de compra de JetSmart. El usuario puede reservar vuelos, hacer check-in y gestionar reservas en lenguaje natural usando Claude (Anthropic).
 
-**Esta entrega (TP4) incorpora la evolución arquitectónica posterior al feedback del TP3:** la VPC y RDS fueron eliminados a favor de una arquitectura **100% serverless con data lake** (S3 + Glue + Athena) para business analytics, y la autenticación se delegó al **Cognito Authorizer de API Gateway** en lugar de validación manual del JWT en la Lambda.
+**Esta entrega incorpora la re-arquitectura posterior al feedback del TP3 (defensa 17/06):** el core del chatbot (`chat-handler`) dejó de ser una Lambda detrás de API Gateway y pasó a correr como **servicio FastAPI nativo en ECS Fargate**, en subnets privadas de una **VPC**, detrás de un **Application Load Balancer (ALB)**. El JWT de Cognito se valida **in-app dentro del contenedor** (contra el JWKS del User Pool), no con un Cognito Authorizer. Para business analytics se mantiene el **data lake** (S3 + Glue + Athena). El bastion EC2 y RDS siguen sin existir.
 
 ## Diagrama
 <img src="docs/Jetsmart - Diagrama.png" alt="Diagrama de Arquitectura" width="110%">
@@ -17,11 +17,11 @@ JetSmart Chatbot es un asistente conversacional desplegado en AWS con Terraform 
 | Punto del feedback de Faustino | Cómo se resolvió en TP4 |
 |---|---|
 | Bastion EC2 en subnet pública | **Eliminado.** Sin RDS no hay caso de uso para un bastion. |
-| Lambdas fuera de la VPC | **Decisión inversa, mejor justificada:** se eliminó la VPC entera. Las Lambdas no manejan recursos privados — DynamoDB, SNS, SQS, Step Functions son managed regionales. Sin recursos persistentes (RDS, EC2), la VPC era over-engineering. |
+| El core del chatbot fuera de la VPC | **Resuelto:** el `chat-handler` ahora vive **dentro de la VPC** como servicio Fargate en subnets privadas (`private-fargate`), detrás del ALB. El cómputo del chatbot ya no es una Lambda suelta. |
 | RDS Proxy mal representado en el diagrama | **Eliminado junto con RDS.** Para business analytics el patrón correcto es un data lake (S3 + Athena), no un OLTP postgres. |
 | "Sin tener en cuenta la justificación" | Ver `docs/justificaciones.md` — fundamentación escrita de cada decisión arquitectónica con alternativas y trade-offs. |
 
-**Mejora adicional no observada por el feedback:** la validación del JWT pasó a hacerse en API Gateway con **Cognito Authorizer**, en lugar del código manual con `python-jose` que tenía la Lambda `chat-handler` en el TP3.
+**Sobre la validación del JWT:** se hace **in-app dentro del contenedor** del `chat-handler` (`server.py` verifica firma RS256 contra el JWKS del User Pool, issuer y exp), no en API Gateway ni con un Cognito Authorizer. Reemplaza el código manual con `python-jose` que tenía la Lambda `chat-handler` en el TP3.
 
 ## Cambios introducidos en TP4 (demostración final)
 
@@ -44,7 +44,7 @@ Total Lambdas: **13 → 16** (eliminada `boarding-pass`, agregadas `boarding-pas
 
 | Requisito | Detalle |
 |-----------|---------|
-| Cuenta AWS | Permisos para Lambda, S3, DynamoDB, Cognito, Step Functions, SNS, SQS, API Gateway, Glue, Athena. |
+| Cuenta AWS | Permisos para ECS Fargate, ECR, ELB (ALB), VPC, Lambda, S3, DynamoDB, Cognito, Step Functions, SNS, SQS, API Gateway, Glue, Athena. |
 | Rol **LabRole** | Pre-existente en AWS Academy (`data.aws_iam_role.lab_role` en Terraform). |
 | AWS CLI v2 | Credenciales en `~/.aws/credentials` o variables de entorno (para usar Athena localmente). |
 
@@ -82,7 +82,7 @@ Muestra todos los recursos que se van a crear sin modificar nada.
 
 Ir a **Actions → Terraform → Run workflow**, seleccionar **`apply`** y ejecutar.
 
-> Tiempo estimado: **5–8 minutos** (mucho más rápido que TP3 — sin RDS, sin VPC, sin RDS Proxy).
+> El apply incluye la creación de la VPC, los VPC endpoints, el NAT Gateway, el ALB y el levantamiento de las tasks Fargate (pull de imagen desde ECR); no hay RDS ni RDS Proxy.
 
 Al finalizar, Terraform sube automáticamente el frontend a S3 y carga los vuelos mock en DynamoDB.
 
@@ -93,7 +93,7 @@ Al terminar el apply, en el job **Apply → Summary** aparecen las URLs:
 | Recurso | Comportamiento esperado |
 |---------|------------------------|
 | **Frontend** | Abrirla en el browser muestra la app con el botón "Iniciar sesión". |
-| **Chatbot API** | GET sin token → `401 Unauthorized` desde **Cognito Authorizer** (no llega a Lambda). Con JWT válido → respuesta del chatbot. |
+| **Chatbot (ALB)** | `GET /health` → `200` (sin auth). Las rutas `/api/*` sin token → `401 Unauthorized` validado **in-app en el contenedor** Fargate. Con JWT válido → respuesta del chatbot. |
 | **Cognito Hosted UI** | Formulario de login/signup. |
 | **Auth Callback** | Redirige al frontend con el token (`#id_token=...`). |
 
@@ -183,7 +183,7 @@ Flujo de prueba:
 
 ### Capa de analytics — Athena para el equipo de business analytics
 
-Toda la actividad del chatbot (mensajes, compras, reclamos, check-ins) se publica en **SNS events**, se buffer en **SQS analytics** y la Lambda `analytics-processor` la escribe en S3 como JSON Lines particionado por fecha:
+Los cambios de negocio (reservas, vuelos, reclamos) viajan por el **Stream de DynamoDB** y la Lambda `business-analytics-emitter` (CDC) hace `PutRecord` a **Kinesis Data Firehose**, que batchea nativo (sin Lambda de transformación) y escribe en S3 como JSON Lines particionado por fecha:
 
 ```
 s3://jetsmart-prod-<account-id>-analytics/events/dt=YYYY-MM-DD/hh=HH/<uuid>.jsonl
@@ -256,33 +256,33 @@ aws glue start-crawler --name jetsmart-prod-events-crawler --region us-east-1
 
 | Módulo | Tipo | Descripción |
 |--------|------|-------------|
-| `modules/auth` | Custom | Cognito User Pool, grupos, Hosted UI, Lambda auth-callback, API Gateway callback |
-| `modules/chatbot-lambda` | Custom | Lambda chat-handler, API Gateway chatbot, **Cognito Authorizer**, throttling, CORS preflight |
+| `modules/auth` | Custom | Cognito User Pool, grupos, Hosted UI, Lambda auth-callback, API Gateway callback/logout (bridge OAuth) |
+
+> El `chat-handler` ya no es un módulo Lambda: corre como servicio ECS Fargate detrás de un ALB con Auto Scaling, definido en `ecs.tf` + `alb.tf` (no como módulo reutilizable).
 
 ### Funciones de Terraform
 
 | Función | Archivo | Uso |
 |---------|---------|-----|
-| `jsonencode()` | `messaging.tf`, `secrets.tf`, `step_functions.tf`, `storage.tf`, `analytics.tf` | Genera JSON para políticas, secretos y la definición del state machine |
-| `toset()` | `modules/auth/main.tf` | Convierte el map de grupos Cognito en set para `for_each` |
+| `jsonencode()` | `ecs.tf`, `messaging.tf`, `secrets.tf`, `step_functions.tf`, `storage.tf`, `analytics.tf` | Genera JSON para container definitions de Fargate, políticas, secretos y la definición del state machine |
+| `toset()` | `networking.tf` (interface VPC endpoints), `messaging.tf`, `modules/auth/main.tf` | Convierte listas/maps en set para `for_each` |
 | `filebase64sha256()` | `layers.tf` | Hash del ZIP del Lambda Layer Anthropic para detectar cambios |
 | `filemd5()` | `storage.tf` | Etag del system prompt para forzar actualización en S3 |
-| `sha1()` | `modules/chatbot-lambda/main.tf` | Triggers para redeploy del API Gateway cuando cambian recursos |
 | `replace()` | `analytics.tf` | Normaliza el name_prefix para el Glue Catalog (acepta solo `[a-z0-9_]`) |
 
 ### Meta-argumentos
 
 | Meta-argumento | Dónde | Por qué |
 |----------------|-------|---------|
-| `for_each` | `cloudwatch.tf` (13 log groups), `lambda.tf` (7 Lambdas Saga), `modules/auth/main.tf` (grupos Cognito) | Crea múltiples recursos desde un map sin repetir el bloque |
-| `depends_on` | `lambda.tf`, `main.tf` | Garantiza orden de creación: analytics-processor depende del S3 bucket de analytics; chatbot module después de todos sus inputs |
-| `lifecycle { prevent_destroy }` | `database.tf` | Protege DynamoDB contra `terraform destroy` accidental |
-| `lifecycle { create_before_destroy }` | `lambda.tf`, `modules/chatbot-lambda/main.tf`, `modules/auth/main.tf` | Zero downtime al actualizar Lambdas y API Gateway deployments |
+| `for_each` | `cloudwatch.tf`, `lambda.tf` (Saga payment/refund), `networking.tf` (interface VPC endpoints), `firehose.tf`, `messaging.tf`, `modules/auth/main.tf` (grupos Cognito) | Crea múltiples recursos desde un set/map sin repetir el bloque |
+| `depends_on` | `ecs.tf`, `networking.tf`, `main.tf`, `storage.tf` | Garantiza orden de creación: el servicio Fargate arranca después del listener del ALB, los VPC endpoints y el NAT Gateway (para registrar targets y pullear la imagen de ECR) |
+| `lifecycle { ignore_changes }` | `ecs.tf` | El `desired_count` del `chat-handler` lo maneja el Auto Scaling en runtime — Terraform no pelea contra él |
+| `lifecycle { create_before_destroy }` | `lambda.tf`, `modules/auth/main.tf` | Zero downtime al actualizar Lambdas y el API Gateway de auth |
 
 ## Documentación adicional
 
 - [`docs/02-arquitectura-general.md`](docs/02-arquitectura-general.md) — decisiones de arquitectura.
-- [`docs/03-networking.md`](docs/03-networking.md) — por qué no hay VPC.
+- [`docs/03-networking.md`](docs/03-networking.md) — la VPC, subnets, NAT Gateway y VPC endpoints que alojan el cómputo Fargate.
 - [`docs/05-componentes-detalle.md`](docs/05-componentes-detalle.md) — cada componente en detalle.
 - [`docs/07-data-layer.md`](docs/07-data-layer.md) — DynamoDB Single Table Design + capa de analytics S3/Athena.
 - [`docs/justificaciones.md`](docs/justificaciones.md) — fundamentación escrita de cada decisión (cheat sheet de presentación).
