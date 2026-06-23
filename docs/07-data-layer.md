@@ -63,7 +63,7 @@ Estado persistente del dominio. PK/SK, **1 GSI**, **DynamoDB Stream habilitado**
 | **Claim canónico (TP4)** | `CLAIM#{claim_id}` | `#METADATA` | Reclamo (movido desde USER#) |
 | **User claim pointer (TP4)** | `USER#{user_id}` | `CLAIM#{claim_id}` | Thin pointer "mis reclamos" |
 
-> **DynamoDB Stream:** habilitado con `stream_view_type = NEW_AND_OLD_IMAGES`. Consumido por `flight_cancellation_detector` con `filter_criteria` para invocarse solo en transiciones `estado_vuelo → CANCELADO`. Ver justificación #28.
+> **DynamoDB Stream:** habilitado con `stream_view_type = NEW_AND_OLD_IMAGES`. Consumido por la Lambda `stream-emitter` con `filter_criteria` (solo master rows `FLIGHT#` con `estado_vuelo`). Detecta la transición `estado_vuelo → CANCELADO` (OldImage ≠ CANCELADO, NewImage = CANCELADO) y publica `flight_cancelled` al topic SNS central `events` con `MessageAttribute event_type`. Patrón CDC. Ver justificación #28.
 
 ### GSIs de la business table (2)
 
@@ -118,7 +118,7 @@ El modelo TP4 invierte la jerarquía: **el PNR es la entidad canónica**, y `USE
 | AP13 | Verificar estado del hold propio | chat_handler (`check_hold_status`) | GetItem | `FLIGHT#{o}#{d}` | `...#SEAT#{seat_id}` |
 | AP14 | Liberar hold (cambio de seat) | chat_handler (`release_hold`) | UpdateItem `REMOVE held_by, hold_expires_at` + ConditionExpression `held_by = :user` | `FLIGHT#{o}#{d}` | `...#SEAT#{seat_id}` |
 | AP15 | Liberar seat reservado (compensación Saga) | payment_processor (`release_flight`) | UpdateItem `REMOVE reserved_by, reserved_at` + ConditionExpression `reserved_by = :owned_pnr` | `FLIGHT#{o}#{d}` | `...#SEAT#{seat_id}` |
-| AP16 | Detectar cancelación de vuelo (Stream) | flight_cancellation_detector | DynamoDB Stream event | — | filter `eventName=MODIFY AND NewImage.estado_vuelo=CANCELADO` |
+| AP16 | Detectar cancelación de vuelo (Stream) → publicar `flight_cancelled` al SNS `events` | stream-emitter | DynamoDB Stream event | — | filter `eventName=MODIFY AND NewImage.estado_vuelo=CANCELADO` |
 
 **Tabla business — operaciones de reserva (PNR-céntrico):**
 
@@ -509,7 +509,7 @@ El PNR se genera con SHA-256 del `payment_id` en el chat-handler (`app/chat-hand
 | TTL attribute | No tiene | Datos del PSS son persistentes (sin TTL); las reservas no expiran |
 | Encriptación at-rest | AWS managed (`aws/dynamodb`) | KMS implícito, sin costo |
 | GSIs | 1 (ReservationsByFlight) | Resuelve AP32 (fan-out de cancelaciones) sin Scan |
-| **Stream** | **Habilitado, `NEW_AND_OLD_IMAGES`** | Consumido por `flight_cancellation_detector` con filter_criteria. Permite comparar transiciones (no re-cancelaciones). |
+| **Stream** | **Habilitado, `NEW_AND_OLD_IMAGES`** | Consumido por la Lambda `stream-emitter` con filter_criteria. Permite comparar transiciones (no re-cancelaciones) y publicar `flight_cancelled` al SNS `events`. |
 | Point-in-time recovery | Habilitado | Recuperación granular hasta 35 días atrás |
 | Backups | EventBridge cron diario → `ExportTableToPointInTime` → S3 `backups` | Retención larga (AFIP 10 años) — complementa PITR |
 
@@ -525,7 +525,7 @@ Los eventos del chatbot se acumulan en S3 para consumo offline del equipo de bus
 
 ```
 chat-handler (Fargate) / confirm_booking_handler / cancel_booking_handler / ...
-        ↓ SNS publish (event_type, user_id, timestamp, payload)  — eventos semánticos del chat
+        ↓ SNS publish (event_type, user_id, event_ts)  — eventos semánticos del chat → interaction_events
     SNS events topic                                business_analytics_emitter (CDC del Stream)
         ↓ suscripción                                       ↓ PutRecord
     Kinesis Data Firehose (delivery streams: interaction / reservation / flight / claim)
@@ -544,74 +544,148 @@ chat-handler (Fargate) / confirm_booking_handler / cancel_booking_handler / ...
 
 ### Esquema de las tablas del Glue Data Catalog (partition projection, sin crawler)
 
-Las tablas se definen estáticamente en el Glue Data Catalog (una por entidad: `reservation_events` / `flight_events` / `claim_events` / `interaction_events`) con **partition projection** sobre `dt`/`hh` — no hay Glue Crawler. Columnas:
+El data lake **no** usa una tabla `events` genérica con `payload` struct. Son **4 tablas tipadas**, una por entidad, definidas estáticamente en el Glue Data Catalog (`reservation_events` / `flight_events` / `claim_events` / `interaction_events`) con **partition projection** sobre `dt`/`hh` — **no hay Glue Crawler**. Cada columna es un campo de primer nivel del JSON Lines (no un struct anidado), lo que evita `json_extract_scalar` en las queries. Las particiones `dt` y `hh` aplican a las cuatro tablas.
 
-| Columna | Tipo Athena | Origen |
+**`reservation_events`** — CDC de PNRs (emitido por `business-analytics-emitter`):
+
+| Columna | Tipo Athena |
+|---|---|
+| `event_id` | string |
+| `pnr` | string |
+| `event_type` | string |
+| `old_status` | string |
+| `new_status` | string |
+| `total` | double |
+| `pax_count` | int |
+| `user_id` | string |
+| `vuelo` | string |
+| `fecha` | string |
+| `event_ts` | string |
+
+**`flight_events`** — CDC de cambios de estado de vuelo (emitido por `business-analytics-emitter`):
+
+| Columna | Tipo Athena |
+|---|---|
+| `event_id` | string |
+| `vuelo` | string |
+| `origen` | string |
+| `destino` | string |
+| `fecha` | string |
+| `hora_salida` | string |
+| `old_estado` | string |
+| `new_estado` | string |
+| `event_ts` | string |
+
+**`claim_events`** — CDC de reclamos (emitido por `business-analytics-emitter`):
+
+| Columna | Tipo Athena |
+|---|---|
+| `event_id` | string |
+| `claim_id` | string |
+| `event_type` | string |
+| `old_status` | string |
+| `new_status` | string |
+| `tipo` | string |
+| `pnr` | string |
+| `user_id` | string |
+| `event_ts` | string |
+
+**`interaction_events`** — eventos semánticos del chat (suscripción SNS del topic central):
+
+| Columna | Tipo Athena |
+|---|---|
+| `event_type` | string |
+| `user_id` | string |
+| `event_ts` | string |
+
+> El SerDe (`JsonSerDe`) usa `ignore.malformed.json=true`. En `interaction_events` además se mapea `mapping.event_ts=timestamp` (el campo del payload llega como `timestamp` y se expone como columna `event_ts`).
+
+**Particiones (las 4 tablas):**
+
+| Columna | Tipo | Origen |
 |---|---|---|
-| `event_type` | string | Campo `event_type` del mensaje SNS |
-| `user_id` | string | Campo `user_id` |
-| `timestamp` | string (ISO-8601) | Campo `timestamp` |
-| `payload` | struct (anidado) | Campo `payload` (estructura variable según tipo de evento) |
-| `ingested_at` | string (ISO-8601) | Agregado por el `business_analytics_emitter` / productor del evento antes del PutRecord a Firehose |
-| `dt` | string (partition) | `YYYY-MM-DD` — particionada del path S3 |
-| `hh` | string (partition) | `HH` — particionada del path S3 |
+| `dt` | string (partition) | `YYYY-MM-DD` — del path S3 `lake/<tabla>/dt=.../hh=.../` |
+| `hh` | string (partition) | `HH` — del path S3 |
 
-> **Por qué particiones Hive-style:** Athena hace *partition pruning* automático cuando la query filtra por `dt` o `hh`. Una query que escanea solo `dt = '2026-06-13'` lee únicamente los archivos de ese día — no hace full-scan del bucket. Esto reduce el costo de Athena drásticamente.
+> **Por qué partition projection:** Athena calcula las particiones a partir de la `storage.location.template` (no necesita un crawler ni `MSCK REPAIR`). Cuando la query filtra por `dt` o `hh` hace *partition pruning* automático — una query sobre `dt = '2026-06-13'` lee solo los archivos de ese día, no full-scan del bucket. Esto reduce el costo de Athena drásticamente.
 
 ---
 
-### Tipos de eventos y estructura de `payload`
+### Fuentes y destino de cada tabla
 
-| event_type | Quién publica | Estructura de `payload` |
+No hay un campo `payload` genérico: cada evento se escribe ya tipado en la tabla que le corresponde. Hay dos fuentes de ingesta (ver `firehose.tf`):
+
+| Tabla del lake | Fuente | Cómo llega |
 |---|---|---|
-| `chat_message` | `chat_handler` — cada turno de conversación | `{ "session_id": "...", "message_length": 42 }` |
-| `purchase_complete` | `payment_processor` (ConfirmBooking, Saga paso 4) | `{ "amount": 120.0 }` |
-| `busqueda_vuelo` | `chat_handler` — al ejecutar tool `search_flights` | `{ "origen": "AEP", "destino": "MDZ", "fecha": "2026-06-20", "pasajeros": 1, "ruta": "AEP-MDZ" }` |
-| `checkin_realizado` | `chat_handler` — al ejecutar tool `check_in` | `{ "reservation_id": "RES-XXXX", "flight_number": "JA101", "origin": "AEP", "destination": "MDZ" }` |
-| `reclamo_iniciado` | `chat_handler` — al ejecutar tool `create_claim` | `{ "claim_id": "CLM-XXXX", "tipo": "equipaje_perdido", "reservation_id": "RES-XXXX" }` |
+| `reservation_events` | `business-analytics-emitter` (CDC del Stream de `business`) | `PutRecord` al Firehose de reservations |
+| `flight_events` | `business-analytics-emitter` (CDC del Stream de `business`) | `PutRecord` al Firehose de flight |
+| `claim_events` | `business-analytics-emitter` (CDC del Stream de `business`) | `PutRecord` al Firehose de claim |
+| `interaction_events` | Suscripción SNS del topic central `events` | Firehose suscrito al SNS (eventos semánticos del chat) |
+
+> Las tres tablas de CDC (`reservation` / `flight` / `claim`) se alimentan de la misma Lambda emitter que lee el DynamoDB Stream de `business` y rutea cada cambio al delivery stream correspondiente. `interaction_events` es la única alimentada directamente desde SNS.
 
 ---
 
-### Ejemplo de archivo en S3
+### Ejemplo de archivos en S3
 
-`s3://jetsmart-prod-123456789012-analytics/events/dt=2026-06-13/hh=14/abc-def-123.jsonl`:
+Firehose escribe JSON Lines gzip, un objeto `.gz` por buffer (5 MB / 60 s), bajo `lake/<tabla>/dt=YYYY-MM-DD/hh=HH/`. Cada línea es un registro plano y tipado (sin `payload` anidado).
+
+`s3://jetsmart-prod-123456789012-analytics/lake/reservation_events/dt=2026-06-13/hh=14/abc-def-123.gz` (descomprimido):
 
 ```json
-{"event_type":"chat_message","user_id":"us-east-1:a1b2-...","timestamp":"2026-06-13T14:35:00Z","payload":{"session_id":"sess-1","message_length":42},"ingested_at":"2026-06-13T14:35:02Z"}
-{"event_type":"busqueda_vuelo","user_id":"us-east-1:a1b2-...","timestamp":"2026-06-13T14:35:10Z","payload":{"origen":"AEP","destino":"MDZ","fecha":"2026-06-20","pasajeros":1,"ruta":"AEP-MDZ"},"ingested_at":"2026-06-13T14:35:11Z"}
-{"event_type":"purchase_complete","user_id":"us-east-1:a1b2-...","timestamp":"2026-06-13T14:36:01Z","payload":{"amount":120.0},"ingested_at":"2026-06-13T14:36:02Z"}
+{"event_id":"evt-9f2a","pnr":"JS7K2P","event_type":"booking_confirmed","old_status":"PENDIENTE","new_status":"CONFIRMADA","total":120.0,"pax_count":1,"user_id":"us-east-1:a1b2-...","vuelo":"JA203","fecha":"2026-06-22","event_ts":"2026-06-13T14:36:01Z"}
+```
+
+`s3://...-analytics/lake/flight_events/dt=2026-06-13/hh=14/...gz`:
+
+```json
+{"event_id":"evt-3c1b","vuelo":"JA203","origen":"AEP","destino":"MDZ","fecha":"2026-06-22","hora_salida":"17:00","old_estado":"EN_HORARIO","new_estado":"CANCELADO","event_ts":"2026-06-13T14:40:00Z"}
+```
+
+`s3://...-analytics/lake/interaction_events/dt=2026-06-13/hh=14/...gz`:
+
+```json
+{"event_type":"busqueda_vuelo","user_id":"us-east-1:a1b2-...","event_ts":"2026-06-13T14:35:10Z"}
 ```
 
 ---
 
 ### Queries de ejemplo desde Athena
 
+Cada query apunta a la tabla tipada correspondiente (`jetsmart_prod_analytics.<tabla>`), no a una tabla `events`. Las columnas son de primer nivel — no hace falta `json_extract_scalar`.
+
 ```sql
--- Eventos por tipo, últimos 7 días
+-- Interacciones del chat por tipo, últimos 7 días
 SELECT event_type, COUNT(*) AS cantidad
-FROM jetsmart_prod_analytics.events
+FROM jetsmart_prod_analytics.interaction_events
 WHERE dt >= date_format(current_date - interval '7' day, '%Y-%m-%d')
 GROUP BY event_type
 ORDER BY cantidad DESC;
 
--- Compras totales del último mes
+-- Revenue de reservas confirmadas del último mes (columna total tipada como double)
 SELECT
-  SUM(CAST(json_extract_scalar(payload, '$.amount') AS DOUBLE)) AS revenue_usd,
-  COUNT(*) AS purchases
-FROM jetsmart_prod_analytics.events
-WHERE event_type = 'purchase_complete'
+  SUM(total) AS revenue_usd,
+  COUNT(*)   AS reservas
+FROM jetsmart_prod_analytics.reservation_events
+WHERE event_type = 'booking_confirmed'
   AND dt >= date_format(current_date - interval '30' day, '%Y-%m-%d');
 
--- Búsquedas más frecuentes por ruta
+-- Vuelos cancelados por ruta, último mes
 SELECT
-  json_extract_scalar(payload, '$.ruta') AS ruta,
-  COUNT(*) AS busquedas
-FROM jetsmart_prod_analytics.events
-WHERE event_type = 'busqueda_vuelo'
+  origen, destino, COUNT(*) AS cancelaciones
+FROM jetsmart_prod_analytics.flight_events
+WHERE new_estado = 'CANCELADO'
   AND dt >= date_format(current_date - interval '30' day, '%Y-%m-%d')
-GROUP BY 1
-ORDER BY busquedas DESC
+GROUP BY origen, destino
+ORDER BY cancelaciones DESC
 LIMIT 10;
+
+-- Reclamos por tipo, último mes
+SELECT tipo, COUNT(*) AS cantidad
+FROM jetsmart_prod_analytics.claim_events
+WHERE dt >= date_format(current_date - interval '30' day, '%Y-%m-%d')
+GROUP BY tipo
+ORDER BY cantidad DESC;
 ```
 
 ---

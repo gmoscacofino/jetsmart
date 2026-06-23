@@ -32,11 +32,11 @@ Para llegar al demo presencial del 17/06 incorporamos cinco cambios que cierran 
 | **DynamoDB partida en dos tablas single-design** | `jetsmart-prod-conversations` (chatbot state) + `jetsmart-prod-business` (PSS-like). Ver `docs/07-data-layer.md` y justificación #13. |
 | **Reservas migran a PNR-céntrico** | PNR de 6 chars alfanumérico (à la Navitaire). Sub-items `SEGMENT#`, `PAX#`, `BP#`, `EXTRA#`. 1 GSI en business (`ReservationsByFlight`). |
 | **Derivación a humano (TP1 feature)** | Nueva tool `escalate_to_human` en `chat_handler` → SQS `human-handoff` → Lambda `human_handoff_processor` (mock call center) → SNS notifications. Ver Flujo 7 en `docs/04-flujos.md`. |
-| **Notificaciones proactivas event-driven (TP1 feature)** | Ops cambia `estado_vuelo=CANCELADO` en business table → DynamoDB Stream → Lambda `flight_cancellation_detector` → SNS `flight-events` → SQS `proactive-notifications` → Lambda → Query GSI `ReservationsByFlight` → fan-out de emails. Ver Flujo 8 en `docs/04-flujos.md` y justificación #28. |
-| **Boarding pass async via SQS** | Step Functions PostBookingActions ya no invoca Lambda directo — publica a SQS `boarding-pass-generation`; nueva Lambda `boarding_pass_async` consume y graba `bp_url` en PNR. Fire-and-forget + DLQ. |
-| **3 SQS + DLQs nuevas + 1 SNS nuevo + 3 CloudWatch alarms** | Patrón consistente con el SQS de analytics. Ver `terraform/infra/messaging.tf` y `cloudwatch.tf`. |
+| **Notificaciones proactivas event-driven (TP1 feature)** | weather-poller (Fargate) u Ops setea `estado_vuelo=CANCELADO` en el master row `FLIGHT#` de la business table → DynamoDB Stream → Lambda `stream-emitter` detecta la transición y publica `event_type=flight_cancelled` al SNS central `events` → Lambda `proactive_notifications` (suscripción SNS→Lambda directo, filter `flight_cancelled`) hace Query al GSI `ReservationsByFlight`, marca cada PNR `AFFECTED_BY_CANCELLATION` y fan-out de emails vía SNS `notifications`. (`refund_trigger` también escucha `flight_cancelled`.) Ver Flujo 8 en `docs/04-flujos.md` y justificación #28. |
+| **Boarding pass async event-driven** | La Booking Saga ya no invoca Lambda directo — su estado terminal de éxito publica `event_type=booking_confirmed` al SNS central `events`; la Lambda `boarding_pass_async` (suscripción SNS→Lambda directo, filter `booking_confirmed`) genera el BP y graba `bp_url` en el PNR. Fire-and-forget. No hay SQS `boarding-pass-generation`. |
+| **Fan-out por SNS + DLQs de paths de plata + CloudWatch alarms** | El fan-out post-booking y de cancelación es SNS→Lambda directo con filter policies sobre un único topic `events`; la única SQS funcional es `human-handoff` (protege un downstream no elástico). DLQs reales: `human-handoff-dlq` (redrive de la cola) + `booking_failed_dlq` + `refund_failures_dlq` (sinks de los Catch de las Step Functions, revisión manual). Ver `terraform/infra/messaging.tf` y `cloudwatch.tf`. |
 
-Total Lambdas: **13 → 16** (eliminada `boarding-pass`, agregadas `boarding-pass-async`, `human-handoff-processor`, `proactive-notifications`, `backup-dynamodb`).
+Total Lambdas desplegadas: **19** (incluye las 7 de la Booking Saga y las 2 de la Refund Saga, expandidas con `for_each`; más `business-analytics-emitter`, `stream-emitter`, `boarding-pass-async`, `human-handoff-processor`, `proactive-notifications`, `notification`, `refund-trigger`, `backup-dynamodb`, `auth-callback` y `cognito-trigger`).
 
 ## Requerimientos
 
@@ -137,7 +137,7 @@ aws dynamodb update-item \
   --expression-attribute-values '{":s":{"S":"CANCELADO"},":r":{"S":"mal tiempo"}}'
 
 → Verificar:
-   - CloudWatch logs de /aws/lambda/jetsmart-prod-flight-cancellation-detector
+   - CloudWatch logs de /aws/lambda/jetsmart-prod-stream-emitter
      ("Detected cancellation transition: JA203 ...")
    - CloudWatch logs de /aws/lambda/jetsmart-prod-proactive-notifications
      mostrando "Query GSI ReservationsByFlight ... N PNRs afectados"
@@ -183,13 +183,15 @@ Flujo de prueba:
 
 ### Capa de analytics — Athena para el equipo de business analytics
 
-Los cambios de negocio (reservas, vuelos, reclamos) viajan por el **Stream de DynamoDB** y la Lambda `business-analytics-emitter` (CDC) hace `PutRecord` a **Kinesis Data Firehose**, que batchea nativo (sin Lambda de transformación) y escribe en S3 como JSON Lines particionado por fecha:
+Los cambios de negocio (reservas, vuelos, reclamos) viajan por el **Stream de DynamoDB** y la Lambda `business-analytics-emitter` (CDC) hace `PutRecord` a **Kinesis Data Firehose**, que batchea nativo (sin Lambda de transformación) y escribe en S3 como JSON Lines particionado por fecha. Hay un Firehose por entidad y cada uno escribe bajo su propio prefijo:
 
 ```
-s3://jetsmart-prod-<account-id>-analytics/events/dt=YYYY-MM-DD/hh=HH/<uuid>.jsonl
+s3://jetsmart-prod-<account-id>-analytics/lake/{reservation_events|flight_events|claim_events|interaction_events}/dt=YYYY-MM-DD/hh=HH/<uuid>
 ```
 
-**Glue Crawler** descubre el schema automáticamente (corre cada hora). **Athena** expone los datos vía SQL al equipo de business analytics.
+(`interaction_events` lo alimenta el SNS central `events` con los eventos semánticos del chat; el resto sale del CDC de business.)
+
+El **Glue Data Catalog** define **4 tablas tipadas** (una por entidad), con **partition projection** sobre `dt`/`hh` — **no hay Glue Crawler**, las particiones se proyectan en consulta. **Athena** expone los datos vía SQL al equipo de business analytics.
 
 **Acceso desde DBeaver / DataGrip:**
 
@@ -197,41 +199,35 @@ s3://jetsmart-prod-<account-id>-analytics/events/dt=YYYY-MM-DD/hh=HH/<uuid>.json
 2. Connection URL: `jdbc:awsathena://AwsRegion=us-east-1`.
 3. Workgroup: `jetsmart-prod-analytics` (output del `terraform apply`).
 4. Database: `jetsmart_prod_analytics`.
-5. Tabla: `events`.
+5. Tablas: `reservation_events`, `flight_events`, `claim_events`, `interaction_events`.
 
 **Consultas de ejemplo:**
 
 ```sql
--- Eventos por tipo, últimos 7 días
+-- Eventos de reserva por tipo, últimos 7 días
 SELECT event_type, COUNT(*) AS cantidad
-FROM jetsmart_prod_analytics.events
+FROM jetsmart_prod_analytics.reservation_events
 WHERE dt >= date_format(current_date - interval '7' day, '%Y-%m-%d')
 GROUP BY event_type
 ORDER BY cantidad DESC;
 
--- Últimos 20 eventos
-SELECT timestamp, event_type, user_id, payload
-FROM jetsmart_prod_analytics.events
-ORDER BY timestamp DESC
+-- Últimas 20 reservas confirmadas
+SELECT event_ts, pnr, total, pax_count, user_id, vuelo
+FROM jetsmart_prod_analytics.reservation_events
+WHERE event_type = 'booking_confirmed'
+ORDER BY event_ts DESC
 LIMIT 20;
 
--- Búsquedas más frecuentes por ruta
-SELECT
-  json_extract_scalar(payload, '$.ruta') AS ruta,
-  COUNT(*) AS busquedas
-FROM jetsmart_prod_analytics.events
-WHERE event_type = 'busqueda_vuelo'
-  AND dt >= date_format(current_date - interval '30' day, '%Y-%m-%d')
-GROUP BY 1
-ORDER BY busquedas DESC
+-- Interacciones del chat por tipo, últimos 30 días
+SELECT event_type, COUNT(*) AS cantidad
+FROM jetsmart_prod_analytics.interaction_events
+WHERE dt >= date_format(current_date - interval '30' day, '%Y-%m-%d')
+GROUP BY event_type
+ORDER BY cantidad DESC
 LIMIT 10;
 ```
 
-**Refrescar particiones manualmente** (después de generar eventos nuevos en la demo, si no querés esperar al cron horario):
-
-```bash
-aws glue start-crawler --name jetsmart-prod-events-crawler --region us-east-1
-```
+> Las particiones (`dt`/`hh`) se resuelven con **partition projection**: no hace falta refrescarlas manualmente ni correr un crawler, Athena las proyecta en cada consulta.
 
 ## Pipeline de GitHub Actions
 

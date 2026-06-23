@@ -23,11 +23,11 @@ El chatbot usa inteligencia artificial (Claude de Anthropic) para entender lengu
 | Cambio | Razón |
 |---|---|
 | **DynamoDB partida en dos tablas single-design**: `jetsmart-prod-conversations` (chat) + `jetsmart-prod-business` (PSS-like) | Bounded contexts: separa estado efímero del chatbot del dominio de negocio. Failure isolation entre el canal y el core. Retention policies independientes (TTL en chat, persistencia en negocio). Prepara la arquitectura para sumar otros canales que compartirían la business table. |
-| **Reservas migran a esquema PNR-céntrico** (record locator de 6 chars uppercase, à la Navitaire/Amadeus) con sub-items `SEGMENT#`, `PAX#`, `BP#` | Refleja cómo modelaría las reservas un PSS real. Habilita queries útiles ("quién está en este vuelo") via GSI2. |
+| **Reservas migran a esquema PNR-céntrico** (record locator de 6 chars uppercase, à la Navitaire/Amadeus) con sub-items `SEGMENT#`, `PAX#`, `BP#` | Refleja cómo modelaría las reservas un PSS real. Habilita queries útiles ("quién está en este vuelo") via el GSI ReservationsByFlight. |
 | **Implementada derivación a humano**: nueva tool `escalate_to_human` en `chat_handler` → SQS `human-handoff` → Lambda `human_handoff_processor` (mock call center) | Completar la feature de TP1 que no se había implementado. SQS desacopla el chatbot del sistema del call center: si el call center está caído, el pedido queda esperando. |
-| **Implementadas notificaciones proactivas (event-driven)**: trigger por **DynamoDB Stream** sobre `business` → Lambda `flight_cancellation_detector` → SNS `flight-events` → SQS `proactive-notifications` → Lambda → fan-out de emails vía SNS `notifications` | Completa la feature de TP1. Ops cambia `estado_vuelo=CANCELADO` en el master row del vuelo (consola DynamoDB o dashboard interno) y el Stream propaga. Ver justificación #28. |
-| **Boarding pass async vía SQS**: el Saga ya no invoca la Lambda de boarding pass directamente — publica un mensaje a SQS `boarding-pass-generation` y la nueva Lambda `boarding_pass_async` la consume | Desacopla el path sync del Saga del trabajo de generación del PDF. Si el BP falla queda en DLQ sin afectar la reserva ya confirmada. |
-| **3 nuevas SQS + DLQs** y **1 nuevo SNS topic** (`flight-events`) | Patrón consistente con el SQS de analytics: cada cola funcional tiene su DLQ con retención de 14 días y CloudWatch alarm. |
+| **Implementadas notificaciones proactivas (event-driven)**: trigger por **DynamoDB Stream** sobre `business` → Lambda `stream-emitter` (detecta la transición a CANCELADO) → publica `flight_cancelled` al SNS central `events` → Lambda `proactive_notifications` (suscripción SNS→Lambda directo con filter policy) → fan-out de emails vía SNS `notifications` | Completa la feature de TP1. Ops cambia `estado_vuelo=CANCELADO` en el master row del vuelo (consola DynamoDB o dashboard interno) y el Stream propaga. Ver justificación #28. |
+| **Boarding pass async vía SNS→Lambda directo**: el Saga ya no invoca la Lambda de boarding pass directamente — el estado terminal de éxito publica `booking_confirmed` al SNS central `events` y la Lambda `boarding_pass_async` (suscripción con filter policy `booking_confirmed`) lo consume | Desacopla el path sync del Saga del trabajo de generación del PDF. Fire-and-forget: la reserva ya quedó confirmada antes del fan-out. |
+| **Backbone de eventos: UN solo SNS topic `events`** con fan-out por filter policy (SNS→Lambda directo salvo `human-handoff`) | La única cola funcional es `human-handoff` (protege un downstream no elástico: el call center). Las demás suscripciones van SNS→Lambda directo con alarma de Lambda Errors; el resto de DLQs (`booking-failed-dlq`, `refund-failures-dlq`) son sinks de revisión manual escritos por los Catch de las Step Functions. |
 | **CloudTrail multi-region** con sink S3 dedicado, log file validation y lifecycle 90 días | Capa de auditoría de gobernanza: traza todas las API calls del management plane (IAM, cambios de config de Lambda/SNS/SQS/DynamoDB). Sin CloudWatch Logs (restricción Academy) y sin Glue/Athena (el JSON classifier default no parsea bien la estructura wrapped de CloudTrail — en producción iría con custom classifier o un SIEM). Consulta ad-hoc vía `aws s3 cp` + `jq`. Compensa la pérdida de VPC Flow Logs. |
 
 ### Bounded contexts: Conversations vs PSS Business
@@ -71,12 +71,15 @@ Step Functions orquesta esta lógica con el **patrón Saga**: cada paso tiene un
 Flujo exitoso:
   ReserveFlight → ReserveBooking → CollectPayment → ConfirmBooking
                                                            ↓
-                                                  PostBookingActions (paralelo)
-                                                  ├── Notification
-                                                  └── BoardingPass
+                                          PublishBookingConfirmed (sns:publish a events)
+                                                           ↓
+                                                   BookingConfirmed
+   (el fan-out — notification + boarding-pass + analytics — lo hacen
+    las suscripciones al topic `events` filtradas por event_type)
 
 Si ConfirmBooking falla:
-  RefundPayment → CancelBooking → ReleaseFlight → NotifyBookingFailed → DLQ
+  RefundPayment → CancelBooking → ReleaseFlight
+                → PublishBookingFailed (sns:publish a events) → BookingDLQ → BookingFailed
 ```
 
 **Por qué Step Functions en lugar de SNS→SQS:** la Saga requiere orquestación con estado — saber qué pasos se ejecutaron para hacer el rollback correcto. Step Functions mantiene ese estado, reintenta con backoff exponencial y permite compensaciones declarativas. Con SNS→SQS habría que implementar el tracking de estado manualmente en DynamoDB.
@@ -101,10 +104,10 @@ La tabla `business` no es un mock que se reemplazaría por otra cosa — es el P
 - Reservas y reclamos de usuarios
 
 **S3 + Athena** — analytics histórico para el equipo de business analytics:
-- Eventos de negocio (mensajes de chat, compras, check-ins, reclamos) emitidos por `business-analytics-emitter`
-- **Kinesis Data Firehose** los batchea de forma nativa (sin Lambda de transformación) y los escribe como JSON Lines particionado por `dt=YYYY-MM-DD/hh=HH` en S3
-- Glue Crawler descubre el schema automáticamente (corre cada hora)
-- El equipo consume Athena vía cliente SQL externo (DBeaver / DataGrip con driver JDBC)
+- Dos fuentes alimentan el data lake: el CDC de la tabla `business` (DynamoDB Stream → `business-analytics-emitter`, que clasifica por entidad PNR#/FLIGHT#/CLAIM#) y los eventos de comportamiento del chat (SNS `events` → suscripción Firehose)
+- **4 Kinesis Data Firehose delivery streams** (`reservation_events`, `flight_events`, `claim_events`, `interaction_events`) batchean de forma nativa (buffer 5 MB / 60 s, GZIP, sin Lambda de transformación) y escriben a S3 `lake/<entidad>/dt=YYYY-MM-DD/hh=HH/*.gz`
+- **4 tablas Glue tipadas estáticas** (declaradas en Terraform) con **partition projection** sobre `dt`/`hh` — sin Glue Crawler ni descubrimiento de schema; los datos quedan consultables apenas Firehose los escribe (buffer 60 s)
+- El equipo consume Athena vía cliente SQL externo (DBeaver / DataGrip con driver JDBC), consultando `jetsmart_prod_analytics.<tabla>`
 
 **Por qué no RDS:** OLTP postgres es la herramienta equivocada para analítica. Carga el primario con queries pesadas, no escala por costo, y el patrón estándar 2026 para business analytics es data lake. Athena cobra ~5 USD/TB escaneado; con el volumen de eventos del chatbot el costo es despreciable.
 
@@ -128,11 +131,13 @@ El frontend está en S3 HTTP. Cognito sólo redirige a URLs HTTPS. La Lambda `au
 
 El frontend lee el token del fragment y lo guarda en localStorage. Después, todas las requests al chatbot llevan `Authorization: Bearer <token>` que el servicio Fargate valida in-app (contra el JWKS del User Pool) detrás del ALB.
 
-### Pipeline de analytics: eventos → Firehose → S3
+### Pipeline de analytics: CDC + comportamiento → Firehose → S3
 
-Los eventos del chat (mensajes, compras, check-ins, reclamos) los emite la Lambda `business-analytics-emitter` a **Kinesis Data Firehose**. Firehose batchea de forma nativa (sin Lambda de transformación) y los entrega como JSON Lines particionado en S3.
+Dos fuentes alimentan el data lake. **(1) CDC de negocio:** el DynamoDB Stream de `business` dispara la Lambda `business-analytics-emitter`, que clasifica la entidad (PNR#/FLIGHT#/CLAIM#) y hace `PutRecord` al Firehose correspondiente (`reservation_events` / `flight_events` / `claim_events`). **(2) Comportamiento:** el SNS central `events` tiene una suscripción Firehose (filter `anything-but` los `event_type` transaccionales) hacia el delivery stream `interaction_events`.
 
-El buffering de Firehose (por tamaño y por tiempo) absorbe los picos de tráfico; los reintentos de entrega a S3 los maneja el propio Firehose.
+Los **4 delivery streams** de **Kinesis Data Firehose** batchean de forma nativa (buffer 5 MB / 60 s, GZIP, sin Lambda de transformación) y entregan JSON Lines particionado en S3 (`lake/<entidad>/dt=YYYY-MM-DD/hh=HH/*.gz`).
+
+Las **4 tablas Glue son estáticas y tipadas** (declaradas en Terraform): el schema no se descubre con un crawler, está declarado. Las particiones se proyectan en consulta (**partition projection** sobre `dt`/`hh`), así que los datos nuevos quedan consultables apenas Firehose los escribe. El buffering de Firehose absorbe los picos; los reintentos de entrega a S3 los maneja el propio Firehose.
 
 ---
 
@@ -157,29 +162,25 @@ El buffering de Firehose (por tamaño y por tiempo) absorbe los picos de tráfic
 | 13 | Lambda — payment-refund | Cómputo | Compensación: revierte el cobro. |
 | 14 | Lambda — payment-cancel | Cómputo | Compensación: cancela la reserva. |
 | 15 | Lambda — payment-release-flight | Cómputo | Compensación: libera los asientos. |
-| 16 | Lambda — boarding-pass-async | Cómputo | TP4: consume SQS boarding-pass-generation, genera BP en S3 y graba bp_url en PNR. |
-| 17 | Lambda — notification | Cómputo | PostBookingActions + error path: notifica al usuario. |
+| 16 | Lambda — boarding-pass-async | Cómputo | TP4: suscripción SNS→Lambda directo al topic `events` (filter `booking_confirmed`); genera BP en S3 y graba bp_url en PNR. |
+| 17 | Lambda — notification | Cómputo | Suscripción SNS→Lambda directo al topic `events` (filter `booking_confirmed`, `booking_failed`): notifica al usuario. |
 | 18 | Lambda — business-analytics-emitter | Cómputo | Emite eventos de negocio a Kinesis Data Firehose (PutRecord); Firehose batchea nativo y escribe S3 JSON Lines (sin Lambda de transformación). |
 | 19 | Lambda — auth-callback | Cómputo | Bridge HTTPS del workaround. Intercambia code por tokens. |
 | 20 | Lambda — cognito-trigger | Cómputo | Post-registro: asigna grupo `users`. |
 | 20b | Lambda — backup-dynamodb | Cómputo | Disparada por EventBridge cron diario. Exporta sólo la tabla `business` al bucket de backups (la `conversations` es efímera por TTL y queda cubierta por PITR). |
 | 20c | **Lambda — human-handoff-processor (TP4)** | Cómputo | Consume SQS human-handoff, mock POST al call center, actualiza ticket HANDOFF# y notifica al usuario por email. |
-| 20d | **Lambda — proactive-notifications (TP4)** | Cómputo | Consume SQS proactive-notifications, Query a GSI2 ReservationsByFlight, fan-out de emails vía SNS notifications. |
-| 21 | Step Functions | Orquestación | State machine del patrón Saga. TP4: PostBookingActions Branch B ahora publica a SQS en lugar de invocar Lambda directo. |
+| 20d | **Lambda — proactive-notifications (TP4)** | Cómputo | Suscripción SNS→Lambda directo al topic `events` (filter `flight_cancelled`); Query a GSI ReservationsByFlight, fan-out de emails vía SNS notifications. |
+| 21 | Step Functions | Orquestación | State machine del patrón Saga. TP4: el estado terminal de éxito publica `booking_confirmed` al SNS central `events` en lugar de un Parallel interno; el fan-out post-booking lo hacen las suscripciones con filtro. |
 | 21b | EventBridge Rule — backup-dynamodb-daily | Orquestación / Scheduling | Cron `0 3 * * ? *` (03:00 UTC). Único trigger basado en tiempo del sistema. |
-| 22 | SNS — events | Mensajería | Eventos del chat (mensajes, compras, handoffs) → fan-out a SQS human-handoff y a Kinesis Data Firehose (analytics). |
+| 22 | SNS — events | Mensajería | Topic central (backbone). Publishers: chat-handler, Step Functions (booking_confirmed/booking_failed), stream-emitter (flight_cancelled). Fan-out por filter policy (`event_type`): SNS→Lambda directo (notification, boarding_pass_async, proactive_notifications, refund_trigger), SQS human-handoff (handoff_requested) y Firehose interaction_events (comportamiento, anything-but transaccionales). |
 | 23 | SNS — notifications | Mensajería | Notificaciones al usuario (booking confirmado / fallido / handoff ack / cancelación de vuelo). |
-| 23b | **SNS — flight-events (TP4)** | Mensajería | Publicado por `flight_cancellation_detector` (Lambda triggered por DynamoDB Stream) cuando un master row pasa a estado_vuelo=CANCELADO. → SQS proactive-notifications. |
-| 23c | **Lambda — flight-cancellation-detector (TP4)** | Cómputo | Consume DynamoDB Stream de `business`. Filter criteria server-side (eventName=MODIFY, NewImage.estado_vuelo=CANCELADO). Filtra master rows FLIGHT# + valida transición real (no re-publica). Publica al SNS flight-events. |
+| 23b | **Lambda — stream-emitter (TP4)** | Cómputo | Consume el DynamoDB Stream de `business`. Detecta la transición a estado_vuelo=CANCELADO en master rows FLIGHT# (OldImage≠CANCELADO, NewImage=CANCELADO) y publica `flight_cancelled` al SNS central `events`. También emite el CDC de negocio al data lake. |
 | 25 | SQS — refund-failures-dlq | Mensajería | DLQ: ejecuciones de refund que no pudieron completarse. |
 | 26 | SQS — booking-failed-dlq | Mensajería | DLQ: flujos Saga que no pudieron completarse. |
-| 26a | **SQS — human-handoff + DLQ (TP4)** | Mensajería | Chat → call center mock. DLQ retiene 14d para reintento manual. |
-| 26b | **SQS — proactive-notifications + DLQ (TP4)** | Mensajería | SNS flight-events → fan-out de emails. DLQ con CloudWatch alarm. |
-| 26c | **SQS — boarding-pass-generation + DLQ (TP4)** | Mensajería | Saga → boarding pass async. DLQ con alarm. |
+| 26a | **SQS — human-handoff + DLQ (TP4)** | Mensajería | Única cola funcional. Suscrita al SNS `events` (filter `handoff_requested`) → Lambda human-handoff-processor (call center mock). DLQ retiene 14d para reintento manual. |
 | 27a | **DynamoDB — conversations (TP4)** | Base de datos | Single Table Design: sesiones, mensajes, perfil chat-scoped, handoffs. TTL en todos los items. |
-| 27b | **DynamoDB — business (TP4, PSS-like)** | Base de datos | Single Table Design PNR-céntrico: FLIGHT#, PNR#/SEGMENT#/PAX#/BP#/EXTRA#, PASSENGER#, CLAIM#. 1 GSI (ReservationsByFlight). Stream habilitado (NEW_AND_OLD_IMAGES) para flight_cancellation_detector. |
-| 28 | Glue Catalog Database | Catálogo | Schema descubierto del bucket de eventos. |
-| 29 | Glue Crawler | Catálogo | Corre cada hora, descubre nuevas particiones y campos. |
+| 27b | **DynamoDB — business (TP4, PSS-like)** | Base de datos | Single Table Design PNR-céntrico: FLIGHT#, PNR#/SEGMENT#/PAX#/BP#/EXTRA#, PASSENGER#, CLAIM#. 1 GSI (ReservationsByFlight). Stream habilitado (NEW_AND_OLD_IMAGES) consumido por stream-emitter. |
+| 28 | Glue Data Catalog (4 tablas estáticas + partition projection, sin crawler) | Catálogo | 4 tablas tipadas declaradas en Terraform (`reservation_events`, `flight_events`, `claim_events`, `interaction_events`) sobre `lake/<entidad>/`. Schema estático (no descubierto); particiones `dt`/`hh` por partition projection. |
 | 30 | Athena Workgroup | Consultas | Endpoint SQL para el equipo de business analytics. |
 | 31 | Secrets Manager | Seguridad | API key Anthropic. |
 | 32 | Lambda Layer — anthropic | Cómputo | SDK de Anthropic compilado para Python 3.12. |
@@ -219,31 +220,34 @@ El buffering de Firehose (por tamaño y por tiempo) absorbe los picos de tráfic
                                  ├─→ Anthropic API (HTTPS externo)       │
                                  └─→ Step Functions (Saga reserva)       │
                                           ├─→ payment-* Lambdas          │
-                                          ├─→ SQS → boarding-pass-async  │
-                                          └─→ notification               │
+                                          └─→ PublishBookingConfirmed → SNS events
+                                                   │ (fan-out por filter policy)
+                                                   ├─→ λ notification
+                                                   └─→ λ boarding-pass-async
 
-                          Pipeline analytics:
-                          chat-handler             → SNS events ─┐
-                          payment-confirm          → SNS events ─┤
-                          business-analytics-emitter ────────────┘
-                                                              │
-                                                              ↓ PutRecord
-                                                  Kinesis Data Firehose
-                                                              │
-                                                              ↓ batch nativo (tamaño/tiempo)
+                          Pipeline analytics (data lake):
+                          DynamoDB Stream (business)            SNS events
+                                  │ CDC                             │ comportamiento
+                                  ↓                                 ↓ (anything-but transaccionales)
+                          λ business-analytics-emitter      suscripción Firehose
+                          (clasifica PNR#/FLIGHT#/CLAIM#)            │
+                                  │ PutRecord                       │
+                                  ↓                                 ↓
+                          ┌───────────────── 4 Kinesis Data Firehose ─────────────────┐
+                          │ reservation_events  flight_events  claim_events  interaction_events
+                          └────────────────────────────┬───────────────────────────────┘
+                                                        ↓ batch nativo (5 MB / 60 s) + GZIP
                                               S3 jetsmart-analytics/lake/
-                                                  dt=YYYY-MM-DD/hh=HH/<uuid>.jsonl
+                                                  <entidad>/dt=YYYY-MM-DD/hh=HH/*.gz
                                                               │
-                                                              ↓ corre cada 1h
-                                                          Glue Crawler
-                                                              │
-                                                              ↓ catálogo
-                                                  Glue Data Catalog (database: events)
+                                                              ↓ (sin crawler)
+                                  Glue Data Catalog: 4 tablas estáticas tipadas
+                                  + partition projection (dt/hh) — schema en Terraform
                                                               │
                                                               ↓ JDBC
                                                           Athena Workgroup
                                                               │
-                                                              ↓ SQL
+                                                              ↓ SQL (jetsmart_prod_analytics.<tabla>)
                                               Equipo Business Analytics
                                               (DBeaver / DataGrip)
 
@@ -279,5 +283,5 @@ El buffering de Firehose (por tamaño y por tiempo) absorbe los picos de tráfic
 | Reclamos | Tool use → `create_claim` → PutItem CLAIM# canónico + thin pointer en USER# |
 | Pasajeros guardados | Tool use → `list_saved_passengers` → Query reservas y agrupar por nombre |
 | **Derivación a humano (TP4)** | Tool use → `escalate_to_human` → PutItem HANDOFF# en conversations + send a SQS → Lambda mock call center |
-| **Notificación proactiva (TP4, event-driven)** | UpdateItem master row `estado_vuelo=CANCELADO` → DynamoDB Stream → Lambda detector → SNS flight-events → SQS → Lambda proactive → Query GSI2 → SNS notifications a cada pasajero afectado |
+| **Notificación proactiva (TP4, event-driven)** | UpdateItem master row `estado_vuelo=CANCELADO` → DynamoDB Stream → Lambda `stream-emitter` (detecta la transición) → publica `flight_cancelled` al SNS central `events` → Lambda `proactive_notifications` (SNS→Lambda directo, filter `flight_cancelled`) → Query GSI ReservationsByFlight → SNS notifications a cada pasajero afectado |
 | Análisis del negocio (offline) | Eventos → S3 → Athena → equipo de business analytics consulta vía SQL |

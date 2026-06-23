@@ -144,20 +144,19 @@ CollectPayment  (Lambda payment-collect)
         ↓
 ConfirmBooking  (Lambda payment-confirm)
   Update reserva PENDIENTE → CONFIRMADA en DynamoDB
-  Publica evento en SNS `events`
         ↓
-PostBookingActions  (estado Parallel)
-  ├── EnqueueBoardingPass   (SDK integration sqs:sendMessage — TP4)
-  │       Publica el state actual a SQS boarding-pass-generation.
-  │       La Lambda boarding_pass_async lo consume async y genera el BP
-  │       en S3 + bp_url en business table. No bloquea la confirmación.
-  └── Notification   (Lambda notification)
-          Envía notificación de éxito al usuario
+PublishBookingConfirmed  (SDK integration sns:publish)
+  Publica el evento `booking_confirmed` al SNS central `events`
+  (event_type como MessageAttribute). Best-effort: si el publish
+  falla, la reserva ya quedó confirmada igual.
+  El fan-out post-booking (notification + boarding-pass + analytics)
+  lo hacen las SUSCRIPCIONES con filter_policy, NO un Parallel interno
+  ni una cola.
         ↓
 BookingConfirmed ✓
 ```
 
-> **Cambio TP4:** boarding pass salió del path sync del Saga. Si la generación falla, queda en DLQ sin afectar la reserva ya confirmada. El usuario consulta el BP con `get_boarding_pass` y, si todavía no se generó, recibe "tu boarding pass se está generando, intentá en unos segundos".
+> **Cambio TP4:** el post-procesado (notificación + boarding pass) salió del path sync del Saga. El estado terminal de éxito sólo publica `booking_confirmed` al topic `events`; las Lambdas suscriptas (`notification`, `boarding_pass_async`) reaccionan por filtro. El boarding pass es fire-and-forget y no afecta la reserva ya confirmada. El usuario consulta el BP con `get_boarding_pass` y, si todavía no se generó, recibe "tu boarding pass se está generando, intentá en unos segundos".
 
 ### Compensaciones automáticas
 
@@ -169,7 +168,9 @@ Si CollectPayment falla:
        Marca la reserva como CANCELADA
   → ReleaseFlight (Lambda payment-release-flight)
        Devuelve los asientos bloqueados en DynamoDB
-  → NotifyBookingFailed (Lambda notification, modo error)
+  → PublishBookingFailed (SDK integration sns:publish)
+       Publica `booking_failed` a `events`; la Lambda notification
+       reacciona por filtro (booking_failed) y avisa al usuario
   → BookingDLQ (SDK integration directa: sqs:sendMessage)
        Persiste el contexto del fallo en booking-failed-dlq (14 días)
   → BookingFailed ✗
@@ -177,7 +178,7 @@ Si CollectPayment falla:
 Si ConfirmBooking falla (raro: el cobro ya pasó):
   → RefundPayment (Lambda payment-refund)
        Revierte el cobro
-  → CancelBooking → ReleaseFlight → NotifyBookingFailed → BookingDLQ
+  → CancelBooking → ReleaseFlight → PublishBookingFailed → BookingDLQ
 ```
 
 ### Por qué Step Functions y no SNS→SQS encadenadas (TALO del TP3)
@@ -192,17 +193,15 @@ Step Functions centraliza la orquestación en la ASL. Las Lambdas sólo hacen su
 
 ---
 
-## Flujo 4 — Boarding pass (async via SQS — TP4)
+## Flujo 4 — Boarding pass (async via SNS → Lambda — TP4)
 
-TP4: el boarding pass se desacopló del path sync del Saga. Ahora corre como un fire-and-forget desde Step Functions.
+TP4: el boarding pass se desacopló del path sync del Saga. Ahora corre como un fire-and-forget event-driven: la Saga sólo publica el hecho `booking_confirmed` y la Lambda reacciona por suscripción con filtro.
 
 ```
-Step Functions PostBookingActions Branch B (TP4)
-  estado "EnqueueBoardingPass" — SDK integration arn:aws:states:::sqs:sendMessage
-        ↓
-Publica el state completo (JSON serializado con States.JsonToString) a:
-  SQS boarding-pass-generation
-        ↓ trigger event_source_mapping (batch_size=1)
+Step Functions — estado terminal de éxito "PublishBookingConfirmed"
+  SDK integration arn:aws:states:::sns:publish → SNS `events`
+  (event_type=booking_confirmed como MessageAttribute)
+        ↓ suscripción SNS→Lambda DIRECTO (filter_policy event_type=booking_confirmed)
 Lambda boarding_pass_async
         ↓
 Lambda parsea el estado, genera el contenido del boarding pass (texto)
@@ -227,8 +226,8 @@ chat-handler hace GetItem PNR#/BP#01:
 Si la generación del BP fallara, antes detenía toda la confirmación de la reserva (el usuario podía no ver su PNR confirmado por un error post-pago). Con esta arquitectura:
 
 - La reserva queda confirmada de inmediato; el BP no es bloqueante.
-- Si la Lambda `boarding_pass_async` falla N veces, el mensaje cae a la **DLQ boarding-pass-generation-dlq** (retención 14d) y dispara la alarma CloudWatch. El usuario igualmente puede consultar su BP más tarde — se puede reintentar manualmente reenqueueando.
-- Demostramos el patrón de **decoupling fire-and-forget** desde Step Functions hacia SQS, que es lo que se vería en una arquitectura productiva.
+- Es fire-and-forget: NO hay cola `boarding-pass-generation` ni DLQ. La durabilidad la dan el retry de SNS→Lambda y una alarma de Lambda Errors en CloudWatch (ver `messaging.tf`). Si la generación falla, el usuario igualmente puede reintentar consultando su BP más tarde; el BP es recuperable, no es plata.
+- Demostramos el patrón de **decoupling event-driven** (Saga publica el hecho, la Lambda reacciona por suscripción con filtro), que es lo que se vería en una arquitectura productiva.
 
 El bucket es privado — la pre-signed URL es el único modo de descarga.
 
@@ -286,23 +285,21 @@ En este TP el "POST al call center" se loguea en CloudWatch como `MOCK POST http
 
 Cuando un vuelo se cancela en el sistema de operaciones, todos los pasajeros afectados reciben automáticamente una notificación por email. Habilita el caso de uso "tormenta cancela vuelo → 5000 pasajeros enterados antes de llegar al aeropuerto".
 
-> **Trigger en TP4 final:** **DynamoDB Stream + Lambda detector**. Ops cambia el `estado_vuelo` del master row a `CANCELADO` desde la consola DynamoDB (o el dashboard interno que conectaría en producción) y el flujo se dispara automáticamente. Ver justificación #28.
+> **Trigger en TP4 final:** **DynamoDB Stream + Lambda `stream-emitter`**. Ops (o el weather-poller en Fargate) cambia el `estado_vuelo` del master row a `CANCELADO` desde la consola DynamoDB (o el dashboard interno que conectaría en producción) y el flujo se dispara automáticamente. Ver justificación #28.
 
 ```
 [Disparador en producción — sistema de ops o consola DynamoDB]
    ops → UpdateItem master row FLIGHT#AEP#MDZ / DATE#2026-06-20#FLIGHT#JA203
          SET estado_vuelo = "CANCELADO", cancellation_reason = "...", cancellation_at = "..."
         ↓
-DynamoDB Stream (NEW_AND_OLD_IMAGES)
+DynamoDB Stream (NEW_AND_OLD_IMAGES) de la tabla business
         ↓ event_source_mapping con filter_criteria (eventName=MODIFY, NewImage.estado_vuelo=CANCELADO)
-Lambda flight_cancellation_detector
+Lambda stream-emitter
    1. Filtra master rows FLIGHT# (descarta SEAT#, PNR#, etc.)
    2. Detecta transición real (OldImage.estado_vuelo != CANCELADO)
-   3. Publica al SNS flight_events:
+   3. Publica al SNS central `events`:
       { event_type: "flight_cancelled", vuelo_numero, fecha, reason }
-        ↓ fan-out (subscription sqs)
-SQS proactive-notifications  (+ DLQ)
-        ↓ trigger event_source_mapping (batch_size=5)
+        ↓ suscripción SNS→Lambda DIRECTO (filter_policy event_type=flight_cancelled)
 Lambda proactive_notifications
         ↓
   1. Parsea body (SNS-wrapped: extrae .Message del envelope)
@@ -327,11 +324,10 @@ Sin este índice, encontrar "qué pasajeros están en el vuelo X del día Y" req
 
 **Es el GSI clave del TP4** — habilita el caso de uso "ops cancela un vuelo, el sistema notifica automáticamente a todos los afectados".
 
-### Por qué SNS → SQS → Lambda
+### Por qué el topic central `events` como punto de fan-out
 
-- **SNS flight-events**: punto de fan-out. Mañana podríamos sumar otros suscriptores (sistema de reembolsos automáticos, dashboard ops, etc.) sin tocar al publisher.
-- **SQS**: buffer ante picos (durante una tormenta se cancelan 20 vuelos en 5 minutos → 20 mensajes que la Lambda procesa con batching).
-- **DLQ con alarma**: si la Lambda falla, los mensajes no se pierden — quedan 14 días en `proactive-notifications-dlq` y CloudWatch dispara alarma.
+- **SNS `events`**: el mismo `flight_cancelled` que escucha `proactive_notifications` lo escucha también `refund_trigger` (dispara la Refund Saga). Sumar otro suscriptor (dashboard ops, etc.) es agregar una suscripción con filtro, sin tocar al publisher (`stream-emitter`).
+- **SNS→Lambda directo, sin SQS**: el downstream es elástico (Lambda escala) y el resultado es recuperable desde DynamoDB → no se justifica una cola amortiguadora. La durabilidad la dan el retry de SNS→Lambda y una alarma de Lambda Errors en CloudWatch. NO existe la cola `proactive-notifications` ni su DLQ.
 
 ### Por qué offline en el demo y no en vivo
 
@@ -341,61 +337,83 @@ El demo en vivo se concentra en el flujo end-to-end del chatbot (login → searc
 
 ## Flujo 5 — Analytics (data lake S3 + Glue + Athena)
 
-Los eventos del chatbot se procesan offline. La capa OLTP (DynamoDB) no se toca para analytics; los eventos viajan por SNS → SQS → Lambda y se materializan como objetos JSON Lines particionados en S3.
+Los eventos se procesan offline. La capa OLTP (DynamoDB) no se consulta para analytics; los datos se materializan como JSON Lines gzip particionados en S3. Hay **dos fuentes de ingesta** que alimentan **4 Kinesis Data Firehose tipados**, uno por entidad. Firehose batchea nativo (no hay Lambda de procesamiento intermedia): cada delivery stream acumula 5 MB o 60 s, comprime en GZIP y escribe a S3.
 
 ```
-Publicadores:
-  chat-handler            → SNS `events`  (chat, búsqueda, check-in, claim, handoff)
-  payment-confirm         → SNS `events`  (compras completadas)
-  proactive-notifications → SNS `events`  (notificaciones de cancelación de vuelo enviadas)
+FUENTE 1 — CDC transaccional (cambios en business)
+  Tabla DynamoDB `business`
+        ↓ DynamoDB Stream (NEW_AND_OLD_IMAGES)
+  event_source_mapping (filter_criteria: INSERT/MODIFY de PK PNR# / FLIGHT# con estado_vuelo / CLAIM#)
+        ↓ batch_size=50, ReportBatchItemFailures
+  Lambda `business-analytics-emitter`
+    Clasifica la entidad por el prefijo del PK (PNR# / FLIGHT# / CLAIM#)
+    Arma el record tipado y hace PutRecord al Firehose correspondiente:
+        ↓                      ↓                      ↓
+  Firehose                Firehose               Firehose
+  reservation_events      flight_events          claim_events
+
+FUENTE 2 — Eventos de comportamiento (chat)
+  SNS topic `events`  (chat_message, busqueda_vuelo, checkin_realizado, handoff_requested, …)
+        ↓ suscripción protocol=firehose, raw_message_delivery=true
+        ↓ filter_policy: event_type anything-but [booking_confirmed, booking_failed, flight_cancelled]
+          (los transaccionales ya entran por el CDC → sin doble conteo)
+  Firehose interaction_events
+
+  ── Los 4 Firehose escriben a S3 (buffer 5 MB / 60 s, GZIP) ──
         ↓
-SNS topic `events`
-        ↓ fan-out (sólo 1 sub hoy: analytics)
-SQS `analytics-queue`   (long polling 20s, DLQ tras 3 intentos)
-        ↓ trigger batch_size=10
-Lambda `analytics-processor`
-        ↓ put_object
-S3 `jetsmart-prod-<account-id>-analytics`:
-  events/dt=YYYY-MM-DD/hh=HH/<uuid>.jsonl
+  S3 `jetsmart-prod-<account-id>-analytics`:
+    lake/<entidad>/dt=YYYY-MM-DD/hh=HH/*.gz
+    (entidad ∈ reservation_events | flight_events | claim_events | interaction_events)
+    Records fallidos → lake-errors/<entidad>/...
         ↓
-(en paralelo, cada hora)
-Glue Crawler `events-crawler`
-  Infiere schema (event_type, user_id, timestamp, payload, ingested_at)
-  Descubre nuevas particiones dt= / hh=
-        ↓
-Glue Data Catalog (database: jetsmart_prod_analytics, table: events)
+  Glue Data Catalog  (database: jetsmart_prod_analytics)
+    4 tablas EXTERNAL tipadas ESTÁTICAS, definidas en Terraform (analytics.tf)
+    partition projection dt (date) / hh (integer 0–23) → SIN crawler
         ↓ JDBC
-Athena Workgroup `jetsmart-prod-analytics`
-        ↓ SQL
-Equipo de business analytics (DBeaver / DataGrip)
+  Athena Workgroup `jetsmart-prod-analytics`
+        ↓ SQL: jetsmart_prod_analytics.<tabla>
+  Equipo de business analytics (DBeaver / DataGrip)
 ```
 
-### Eventos publicados
+### Las 4 tablas tipadas (Glue Data Catalog)
 
-| event_type | Publicador | Cuándo |
-|---|---|---|
-| `chat_message` | chat-handler | Cada mensaje procesado del chatbot |
-| `busqueda_vuelo` | chat-handler (tool `search_flights`) | Búsqueda de vuelo con resultados |
-| `checkin_realizado` | chat-handler (tool `check_in`) | Check-in completado |
-| `reclamo_iniciado` | chat-handler (tool `create_claim`) | Claim registrado |
-| `handoff_escalated` | chat-handler (tool `escalate_to_human`) | Derivación a humano encolada |
-| `purchase_complete` | payment-confirm | Reserva confirmada exitosamente |
-| `flight_cancellation_notified` | proactive-notifications | Email de cancelación de vuelo enviado a un pasajero |
+Cada entidad tiene su propio esquema declarado en Terraform; no hay una tabla `events` genérica con un blob `payload`.
 
-### Por qué SQS entre SNS y Lambda
+| Tabla | Columnas |
+|---|---|
+| `reservation_events` | event_id, pnr, event_type, old_status, new_status, total (double), pax_count (int), user_id, vuelo, fecha, event_ts |
+| `flight_events` | event_id, vuelo, origen, destino, fecha, hora_salida, old_estado, new_estado, event_ts |
+| `claim_events` | event_id, claim_id, event_type, old_status, new_status, tipo, pnr, user_id, event_ts |
+| `interaction_events` | event_type, user_id, event_ts |
 
-SQS amortigua picos y permite reintentos con DLQ. Si la Lambda o S3 fallaran, sin SQS los mensajes se perderían (SNS→Lambda directo no garantiza retención). Sacar S3 PutObject del path sincrónico del chat además mejora la latencia del usuario aunque sea ~50ms.
+### Por qué Firehose y no SQS → Lambda (cambio del diseño viejo)
+
+El diseño anterior ponía `SNS → SQS analytics-queue → Lambda analytics-processor → put_object`. Firehose lo reemplaza: hace el buffering por tamaño/tiempo, la compresión GZIP y el particionado dt/hh de forma nativa y administrada — sin código propio que mantener, sin cola, sin Lambda de escritura. El CDC desde el stream de `business` además captura los cambios transaccionales directo de la fuente de verdad (no depende de que cada publicador recuerde emitir el evento), y separar 4 streams tipados evita el `payload` JSON opaco: cada entidad queda consultable con columnas reales.
 
 ### Por qué data lake y no RDS (cambio del TP3)
 
-OLTP postgres es la herramienta equivocada para analítica histórica: cargás el primario con queries pesadas, no escala por costo, y requiere VPC + RDS Proxy + bastion para acceso del equipo. S3 + Athena es serverless, escala a TBs, cobra ~5 USD/TB escaneado, y se consulta con cualquier cliente JDBC sin tocar la red privada (que ya no existe).
+OLTP postgres es la herramienta equivocada para analítica histórica: cargás el primario con queries pesadas, no escala por costo, y requiere VPC + RDS Proxy + bastion para acceso del equipo. S3 + Athena es serverless, escala a TBs, cobra ~5 USD/TB escaneado, y se consulta con cualquier cliente JDBC sin tocar la red privada.
 
-### Frescura
+### Frescura — sin crawler
 
-El crawler corre cada 1 hora. Para refresh inmediato durante la demo:
-```bash
-aws glue start-crawler --name jetsmart-prod-events-crawler
+Las tablas son **estáticas** (definidas en Terraform) y las particiones se resuelven en consulta con **partition projection** (rango `dt` desde 2026-01-01 hasta NOW, `hh` de 00 a 23). No hay descubrimiento de schema ni `start-crawler`: apenas Firehose escribe el objeto (buffer máx. 60 s), los datos quedan consultables. Athena proyecta la partición a partir de los predicados `dt`/`hh` de la query.
+
+### Query de ejemplo (Athena)
+
+```sql
+-- Reservas confirmadas por día en la última semana
+SELECT dt,
+       count(*)         AS reservas,
+       sum(total)       AS facturado,
+       sum(pax_count)   AS pasajeros
+FROM   jetsmart_prod_analytics.reservation_events
+WHERE  dt >= date_format(current_date - interval '7' day, '%Y-%m-%d')
+  AND  new_status = 'CONFIRMADA'
+GROUP BY dt
+ORDER BY dt;
 ```
+
+Filtrar siempre por `dt` (y `hh` si aplica) acota las particiones escaneadas y, con ello, el costo por TB de Athena.
 
 ---
 
@@ -444,7 +462,7 @@ PITR cubre los últimos 35 días. Los exports diarios duplican esa cobertura has
 
 ### Resto del sistema
 
-- **S3 buckets** — los objetos `.jsonl` de analytics son inmutables por diseño (append-only por partición). El bucket frontend se reconstruye desde el repo en cada deploy.
+- **S3 buckets** — los objetos `.gz` de analytics son inmutables por diseño (append-only por partición). El bucket frontend se reconstruye desde el repo en cada deploy.
 - **Lambdas / Step Functions / API GW / Cognito** — código y configuración viven en Terraform en el repo. La fuente de verdad es git; ante pérdida total, `terraform apply` reconstruye toda la infraestructura.
 - **Secrets Manager** — la única secret (`anthropic-api-key`) se rota manualmente; backup = la key original en el password manager del equipo.
 

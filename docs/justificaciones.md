@@ -27,7 +27,7 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 ## 2. Sin RDS — Data Lake S3 + Athena
 
-**Decisión:** la capa de analytics es S3 (eventos crudos en JSON Lines) + Glue Crawler + Athena.
+**Decisión:** la capa de analytics es un data lake S3 (eventos en JSON Lines gzip) + 4 tablas Glue tipadas estáticas con partition projection + Athena, alimentado por Kinesis Firehose. El schema está declarado en Terraform (`analytics.tf`), no se descubre con un crawler.
 
 **Alternativas:**
 - (a) RDS PostgreSQL como TP3 → carga el OLTP con queries de OLAP; no escala por costo; mala práctica.
@@ -39,7 +39,9 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 **Costo:** Athena cobra ~5 USD por TB escaneado. Con el volumen del chatbot el costo es despreciable. S3 storage es ~0.023 USD/GB vs ~0.10 USD/GB de RDS.
 
-**Frescura de datos:** Glue Crawler corre cada hora. Para demo se invoca manualmente con `aws glue start-crawler`.
+**Frescura de datos:** no hay crawler. Las 4 tablas Glue son estáticas (declaradas en Terraform) y las particiones se proyectan en consulta (partition projection sobre `dt`/`hh`). Los datos quedan consultables apenas Firehose los escribe a S3 — buffer de ~60s — sin esperar una corrida de crawler ni un descubrimiento de schema.
+
+**Ingesta (ver `firehose.tf`):** 4 Kinesis Firehose delivery streams (reservation_events, flight_events, claim_events, interaction_events), buffer 5 MB / 60 s, GZIP → `lake/<entidad>/dt=YYYY-MM-DD/hh=HH/*.gz`. Dos fuentes: CDC desde la tabla `business` (DynamoDB Stream → Lambda `business-analytics-emitter` → `PutRecord` al Firehose de la entidad) y eventos de comportamiento (suscripción SNS del topic central → Firehose `interaction_events`).
 
 ---
 
@@ -224,7 +226,7 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 ## 16. Notificaciones proactivas vs polling
 
-**Decisión:** las cancelaciones de vuelo se notifican proactivamente vía SNS `flight-events` → SQS `proactive-notifications` → Lambda → SNS `notifications` (emails).
+**Decisión:** las cancelaciones de vuelo se notifican proactivamente vía SNS central `events` (`event_type=flight_cancelled`) → Lambda `proactive_notifications` (suscripta directo, SNS→Lambda con filter policy) → Query GSI `ReservationsByFlight` → emails de los afectados vía SNS `notifications`.
 
 **Alternativas:**
 - (a) El usuario consulta periódicamente (polling) → mala UX, carga la tabla.
@@ -233,22 +235,24 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 **Por qué GSI `ReservationsByFlight`:** sin él, encontrar los pasajeros afectados requiere Scan de toda la business table — O(n) lineal. Con el GSI, una sola Query devuelve la lista — O(log n). Es **el habilitador técnico** del feature.
 
-**Trigger en TP4:** el flujo se dispara automáticamente cuando ops cambia `estado_vuelo=CANCELADO` en el master row del vuelo (consola DynamoDB o dashboard interno). Un DynamoDB Stream sobre la tabla propaga el cambio a la Lambda `flight_cancellation_detector`, que publica al SNS `flight-events`. Ver justificación #28.
+**Trigger en TP4:** el flujo se dispara automáticamente cuando ops (o el weather-poller) cambia `estado_vuelo=CANCELADO` en el master row del vuelo (consola DynamoDB o dashboard interno). Un DynamoDB Stream sobre la tabla `business` propaga el cambio a la Lambda `stream-emitter`, que detecta la transición de estado y publica `event_type=flight_cancelled` al SNS central `events`. Ver justificación #28.
 
 ---
 
 ## 17. Boarding pass async vía SQS
 
-**Decisión:** el Saga PostBookingActions ya no invoca la Lambda de boarding pass directamente — publica un mensaje a SQS `boarding-pass-generation` y la Lambda `boarding_pass_async` la consume.
+**Decisión:** el Saga ya no invoca la Lambda de boarding pass directamente — el estado terminal de éxito publica `booking_confirmed` al SNS central `events`, y la Lambda `boarding_pass_async` (suscripta directo al topic, filter policy `event_type=booking_confirmed`) genera el BP de forma asíncrona. El mismo evento hace fan-out también a la Lambda `notification`.
 
 **Alternativas:**
-- (a) Mantener sync en el Saga (TP3) → un error en BP frena la confirmación post-pago.
+- (a) Mantener sync en el Saga (TP3, Parallel interno) → un error en BP frena la confirmación post-pago.
 - (b) `.waitForTaskToken` pattern → el Saga espera al BP. Más complejo en ASL.
-- (c) **Fire-and-forget vía SQS (elegida)** → simple, desacopla, retry automático con DLQ.
+- (c) **Fire-and-forget vía SNS→Lambda directo (elegida)** → simple, desacopla, y reusa el backbone de eventos: el Saga solo publica el hecho, los consumidores se enganchan por filter policy sin que el Saga los conozca.
 
 **Trade-off:** el BP no está inmediatamente disponible. El usuario consulta y, si todavía no se generó, recibe "tu boarding pass se está generando, intentá en unos segundos". En la práctica el BP está listo en <2 segundos.
 
-**Por qué es correcto:** la reserva confirmada es lo crítico — no debe esperar al BP. Si la generación fallara, hoy queda en DLQ con alarma; antes hubiera dejado el Saga incompleto. Demuestra el patrón de **decoupling fire-and-forget desde Step Functions**.
+**Por qué SNS→Lambda directo y no una SQS amortiguadora:** la generación del BP es un downstream elástico (Lambda escala sola) y el resultado es re-derivable desde DynamoDB — si la Lambda fallara, el dato de la reserva sigue ahí para regenerar. No se justifica una cola intermedia ni una DLQ por agregar; la durabilidad/visibilidad la dan el retry de SNS + una **alarma de Lambda Errors** (ver `cloudwatch.tf`). La única SQS funcional del sistema es `human-handoff`, donde el downstream (call center mock) SÍ es no elástico.
+
+**Por qué es correcto:** la reserva confirmada es lo crítico — no debe esperar al BP. El Saga publica `booking_confirmed` y termina; el BP se genera fuera del path crítico. Demuestra el patrón de **publicar el hecho al backbone y dejar que el fan-out por filter policy desacople a los consumidores** desde Step Functions.
 
 ---
 
@@ -461,30 +465,30 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 ---
 
-## 28. Proactive notifications event-driven (DynamoDB Stream → Lambda detector)
+## 28. Proactive notifications event-driven (DynamoDB Stream → Lambda emisor)
 
-**Decisión:** habilitamos un Stream en la tabla `business` (`NEW_AND_OLD_IMAGES`) y agregamos una Lambda `flight_cancellation_detector` que consume el stream con `filter_criteria` server-side. Cuando detecta un master row `FLIGHT#` con transición de estado a `CANCELADO`, publica al SNS `flight_events` existente. El resto del flujo downstream (SNS → SQS `proactive_notifications` → Lambda → fan-out de emails) queda intacto.
+**Decisión:** habilitamos un Stream en la tabla `business` (`NEW_AND_OLD_IMAGES`) y la Lambda `stream-emitter` consume el stream con `filter_criteria` server-side. Cuando detecta un master row `FLIGHT#` con transición de estado a `CANCELADO`, publica `event_type=flight_cancelled` al SNS central `events`. El downstream lo resuelven las suscripciones directas del backbone (SNS→Lambda con filter policy): `proactive_notifications` (Query GSI `ReservationsByFlight` → emails vía SNS `notifications`) y `refund_trigger` (arranca la Refund Saga). No hay SNS `flight_events` ni SQS `proactive_notifications`: hay un único topic central `events` y el fan-out es por filter policy.
 
 **Antes (TP4 inicial):** un script local `scripts/cancel_flight.py` hacía el `UpdateItem` y publicaba al SNS. Trigger manual, fuera del sistema. **Eliminado en TP4 final** — el único trigger ahora es el Stream.
 
 **Alternativas evaluadas:**
 - (a) Script manual (TP3 → mitad de TP4) → no escala, requiere operador con creds, no se integra con un dashboard de ops real.
-- (b) **DynamoDB Stream → Lambda detector (elegida)** → cambia solo el origen del trigger sin tocar el patrón SNS→SQS→Lambda ya defendido como elasticidad. Latencia <1 seg.
+- (b) **DynamoDB Stream → Lambda `stream-emitter` → SNS central `events` (elegida)** → cambia solo el origen del trigger; la Lambda traduce el cambio de estado a un evento de dominio y lo publica al backbone, donde los consumidores ya se enganchan por filter policy. Latencia <1 seg.
 - (c) DynamoDB Stream → EventBridge Pipes → SNS (sin Lambda intermedia) → más declarativo, cero código de glue, pero los filter patterns de Pipes no permiten comparar `OldImage` vs `NewImage` para detectar transiciones. Habría falsos positivos cuando el ítem ya estaba CANCELADO y se modifica otro atributo. Además Pipes en LabRole no está garantizado disponible.
-- (d) Stream → Lambda detector → Lambda proactive directo (saltar SNS/SQS) → un componente menos pero perdés el buffer SQS con retry/DLQ. Acoplamiento más fuerte.
+- (d) Stream → Lambda que invoca `proactive_notifications` directo (saltar el SNS central) → un componente menos pero perdés el fan-out: el mismo `flight_cancelled` también dispara `refund_trigger`. Publicar al backbone desacopla y deja sumar consumidores sin tocar el emisor.
 
-**Implementación del detector:**
+**Implementación del `stream-emitter`:**
 - `filter_criteria` en el event_source_mapping: solo invoca cuando `eventName=MODIFY` y `NewImage.estado_vuelo.S=CANCELADO`. Evita procesamiento de cambios en ítems PNR#, SEAT#, etc.
 - Guard adicional en el handler: confirma que es master row `FLIGHT#` (no SEAT#, no PNR# que pudo matchear el filtro por coincidencia de atributo).
 - Detección de transición real: `OldImage.estado_vuelo != "CANCELADO"`. Si el ítem ya estaba cancelado y solo se actualizó otro campo (ej. `cancellation_reason`), no se re-publica.
-- Payload idéntico al que `proactive_notifications.py` ya esperaba (`event_type=flight_cancelled`, `vuelo_numero`, `fecha`, `reason`) — cero cambios downstream.
+- Publica al SNS central `events` con `event_type=flight_cancelled` como MessageAttribute (`vuelo_numero`, `fecha`, `reason` en el body) — exactamente lo que `proactive_notifications.py` y `refund_trigger` ya esperan vía sus filter policies. Cero cambios downstream.
 
 **Trade-offs:**
 - ✅ Event-driven real: ahora ops cambia el estado desde cualquier interfaz (consola DynamoDB, otra Lambda, futuro dashboard) y el flujo se dispara solo.
 - ✅ Latencia <1 seg desde el `UpdateItem` hasta la publicación al SNS.
 - ✅ El script `cancel_flight.py` se eliminó: el Stream es ahora el único path. Para testear se hace `UpdateItem` directo desde la consola DynamoDB o CLI — más simple que mantener un script paralelo.
 - ❌ Costo de Stream: ~$0.02 por 100k read requests. Despreciable en sandbox.
-- ❌ Una Lambda más que mantener (16 totales).
+- ❌ Una Lambda más que mantener (el `stream-emitter`).
 - ❌ El Stream emite TODOS los cambios de la tabla. El `filter_criteria` reduce las invocaciones a las que realmente importan, pero hay costo de read del Stream igualmente.
 
 **Pregunta esperable en oral:** *"¿Por qué Stream + Lambda y no EventBridge Pipes?"* → Pipes no permite comparar OldImage vs NewImage. Habría una invocación por cada modificación de un ítem que ya tenía estado_vuelo=CANCELADO (ej. actualización de `cancellation_reason`). Con Lambda intermedia hacemos esa comparación en código y el patrón es 100% compatible con LabRole.
@@ -515,12 +519,12 @@ Porque un servicio HTTP de larga vida con auth in-app, health-checks y Auto Scal
 
 > **¿Cómo escalan los analytics a 10x el volumen?**
 
-S3 escala infinito. Athena escala automáticamente (es serverless). Glue Crawler tarda más pero no bloquea queries. El ingest al data lake lo hace `business_analytics_emitter` consumiendo el DynamoDB Stream con batching y haciendo PutRecord a Firehose, que batchea nativo a S3 — escala con el throughput del Stream sin cuello de botella.
+S3 escala infinito. Athena escala automáticamente (es serverless). No hay crawler que pueda quedar atrás: el schema es estático y las particiones se proyectan en consulta, así que más volumen no agrega latencia de descubrimiento. El ingest al data lake lo hace `business_analytics_emitter` consumiendo el DynamoDB Stream con batching y haciendo PutRecord a Firehose, que batchea nativo a S3 — escala con el throughput del Stream sin cuello de botella.
 
 > **¿Qué hacen los `payment-*` Lambdas si una de ellas falla con error transitorio?**
 
 Step Functions reintenta automáticamente con backoff exponencial (configurado en cada estado). Si después de N reintentos sigue fallando, el `Catch` dispara las compensaciones del Saga.
 
-> **¿Cómo sabe el equipo de analytics qué columnas tiene `events`?**
+> **¿Cómo sabe el equipo de analytics qué columnas tiene cada tabla?**
 
-Glue Crawler las descubre y las publica en el Glue Data Catalog. El equipo abre DBeaver y la tabla aparece con todas sus columnas y tipos. Si llega un nuevo `event_type` con campos nuevos, el crawler lo agrega en su próxima corrida (configurado con `update_behavior = "UPDATE_IN_DATABASE"`).
+El schema está declarado en Terraform (`analytics.tf`): hay 4 tablas tipadas en el Glue Data Catalog (`reservation_events`, `flight_events`, `claim_events`, `interaction_events`), cada una con sus columnas y tipos fijos. El equipo abre DBeaver y las ve directamente — no hay descubrimiento, el catálogo ya está poblado por el `apply`. Trade-off honesto vs un crawler: si llega un `event_type` con campos nuevos, no aparecen solos — hay que agregar la columna en Terraform y re-aplicar. Es menos mágico que un crawler con `update_behavior=UPDATE_IN_DATABASE`, pero a cambio el schema es explícito, versionado en git y revisable en el PR, sin riesgo de que un crawler infiera mal un tipo o renombre una columna en producción.
