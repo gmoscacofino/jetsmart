@@ -155,8 +155,8 @@ locals {
     "states",   # Step Functions
     "ecr.api",  # ECR control plane
     "ecr.dkr",  # ECR docker registry (pull de imagen)
-    "logs",     # CloudWatch Logs (awslogs de Fargate)
-    "firehose", # business-analytics-emitter → Firehose (PutRecord desde VPC)
+    "logs",             # CloudWatch Logs (awslogs de Fargate)
+    "kinesis-firehose", # business-analytics-emitter → Firehose (PutRecord desde VPC)
   ]
 }
 
