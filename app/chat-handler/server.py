@@ -1,16 +1,15 @@
 """
-Adaptador FastAPI para ejecutar el handler de Lambda (chat_handler.py) en ECS Fargate
-detrás de un ALB HTTP.
+Servicio FastAPI nativo del chat-handler de JetSmart, en ECS Fargate detrás de un
+ALB HTTP.
 
-Diseño: adaptador THIN. No reimplementa lógica de negocio. Por cada request HTTP:
-  1. Valida el JWT de Cognito en proceso (reemplaza el Cognito Authorizer de API Gateway).
-  2. Sintetiza un `event` estilo Lambda-proxy.
-  3. Llama `chat_handler.handler(event, None)`.
-  4. Traduce el dict {statusCode, headers, body} de vuelta a una Response de FastAPI.
+Diseño: servicio web nativo (NO un adaptador de Lambda). Por cada request:
+  1. Valida el JWT de Cognito en proceso (firma RS256 contra el JWKS, issuer, exp).
+  2. Rutea método/path a la función de negocio correspondiente en `chat_core`.
+  3. Cada función devuelve (status_code, payload) — se traduce a Response HTTP.
 
-`chat_handler` hace init eager en el import (lee el secret de Anthropic desde Secrets
+`chat_core` hace init eager en el import (lee el secret de Anthropic desde Secrets
 Manager y varias env vars). ECS inyecta esas env vars en runtime, así que importar
-chat_handler acá funciona sin duplicar esa lógica.
+chat_core acá funciona sin duplicar esa lógica.
 """
 import os
 import json
@@ -21,11 +20,11 @@ import requests
 from jwt.algorithms import RSAAlgorithm
 from fastapi import FastAPI, Request, Response
 
-# El import de chat_handler dispara el cold-start eager init (Secrets Manager + env vars).
+# El import de chat_core dispara el cold-start eager init (Secrets Manager + env vars).
 # Debe ocurrir DESPUÉS de que el proceso tenga las env vars (ECS las provee en runtime).
-import chat_handler
+import chat_core
 
-log = logging.getLogger("chat-handler-adapter")
+log = logging.getLogger("chat-handler")
 logging.basicConfig(level=logging.INFO)
 
 # ── Configuración de auth (Cognito) ───────────────────────────────────────────
@@ -56,7 +55,7 @@ class AuthError(Exception):
 
 
 def _fetch_jwks(force: bool = False) -> dict:
-    """Devuelve {kid: clave_publica}. Cachea en _jwks_cache; refresca si force=True."""
+    """Devuelve {kid: jwk}. Cachea en _jwks_cache; refresca si force=True."""
     global _jwks_cache
     if _jwks_cache and not force:
         return _jwks_cache
@@ -83,8 +82,7 @@ def _public_key_for_kid(kid: str):
 def _validate_token(auth_header: str) -> dict:
     """
     Valida `Authorization: Bearer <jwt>` contra el JWKS de Cognito.
-    Verifica firma RS256, exp e iss. Verifica aud sólo si COGNITO_CLIENT_ID está seteado
-    (los ID tokens de Cognito traen `aud`; los access tokens traen `client_id` en su lugar).
+    Verifica firma RS256, exp e iss. Verifica aud sólo si COGNITO_CLIENT_ID está seteado.
     Devuelve el dict de claims decodificado. Lanza AuthError en cualquier fallo.
     """
     if not auth_header or not auth_header.lower().startswith("bearer "):
@@ -120,125 +118,76 @@ def _validate_token(auth_header: str) -> dict:
     return claims
 
 
-# ── App ───────────────────────────────────────────────────────────────────────
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
 
-app = FastAPI(title="JetSmart Chat Handler Adapter")
-
-
-def _lambda_response_to_fastapi(result: dict) -> Response:
-    """Traduce el dict Lambda-proxy {statusCode, headers, body} a una Response de FastAPI."""
-    status = int(result.get("statusCode", 500))
-    body = result.get("body", "")
-    headers = dict(result.get("headers") or {})
-    # Aseguramos CORS en todas las respuestas (el handler ya los incluye, pero somos defensivos).
-    for k, v in CORS_HEADERS.items():
-        headers.setdefault(k, v)
-    # No dejamos que un Content-Length viejo se filtre; FastAPI lo recalcula.
-    headers.pop("Content-Length", None)
-    headers.pop("content-length", None)
+def _json_response(status: int, payload: dict) -> Response:
     return Response(
-        content=body,
+        content=json.dumps(payload),
         status_code=status,
-        headers=headers,
-        media_type="application/json",
-    )
-
-
-def _cors_preflight_response() -> Response:
-    return Response(content="", status_code=200, headers=CORS_HEADERS)
-
-
-def _unauthorized() -> Response:
-    return Response(
-        content=json.dumps({"error": "unauthorized"}),
-        status_code=401,
         headers={**CORS_HEADERS, "Content-Type": "application/json"},
         media_type="application/json",
     )
 
 
-async def _build_event(request: Request, path: str, claims: dict) -> dict:
-    """Sintetiza el event estilo Lambda-proxy que chat_handler.handler espera."""
-    raw_body = await request.body()
-    body_str = raw_body.decode("utf-8") if raw_body else None
-    qsp = dict(request.query_params) or None
-    return {
-        "httpMethod": request.method,
-        "path": path,
-        "headers": dict(request.headers),
-        "queryStringParameters": qsp,
-        "body": body_str,
-        "requestContext": {"authorizer": {"claims": claims}},
-    }
+def _cors_preflight() -> Response:
+    return Response(content="", status_code=200, headers=CORS_HEADERS)
 
 
-async def _dispatch(request: Request, path: str) -> Response:
-    """Auth + sintetizar event + invocar el handler de Lambda + traducir la respuesta."""
+# ── App ───────────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="JetSmart Chat Handler")
+
+
+@app.get("/health")
+async def health() -> Response:
+    return _json_response(200, {"status": "ok"})
+
+
+@app.api_route("/api/{path:path}", methods=["GET", "POST", "OPTIONS"])
+async def api(request: Request, path: str) -> Response:
     # Preflight CORS: sin auth.
     if request.method == "OPTIONS":
-        return _cors_preflight_response()
+        return _cors_preflight()
 
+    # Auth: valida el JWT y obtiene los claims (la identidad del usuario).
     try:
         claims = _validate_token(request.headers.get("authorization", ""))
     except AuthError as e:
         log.info("Auth rechazada: %s", e)
-        return _unauthorized()
+        return _json_response(401, {"error": "unauthorized"})
     except Exception as e:
         # Fallo inesperado validando (ej. JWKS no alcanzable) → 401 conservador.
         log.warning("Error inesperado en auth: %s", e)
-        return _unauthorized()
+        return _json_response(401, {"error": "unauthorized"})
 
-    event = await _build_event(request, path, claims)
+    method = request.method
+    route = f"/api/{path}"
 
+    # Body JSON (solo POST). Si viene mal formado → 400.
+    body: dict = {}
+    if method == "POST":
+        raw = await request.body()
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                return _json_response(400, {"error": "JSON inválido"})
+            if not isinstance(parsed, dict):
+                return _json_response(400, {"error": "JSON inválido"})
+            body = parsed
+
+    # Routing → lógica de negocio nativa en chat_core.
     try:
-        result = chat_handler.handler(event, None)
+        if method == "POST" and route == "/api/chat":
+            status, payload = chat_core.handle_chat(claims, body)
+        elif method == "GET" and route == "/api/reservations":
+            status, payload = chat_core.handle_reservations(claims)
+        elif method == "POST" and route == "/api/payment":
+            status, payload = chat_core.handle_payment(claims, body)
+        else:
+            return _json_response(404, {"error": "Ruta no encontrada"})
     except Exception:
-        log.exception("chat_handler.handler lanzó una excepción")
-        return Response(
-            content=json.dumps({"error": "internal_server_error"}),
-            status_code=500,
-            headers={**CORS_HEADERS, "Content-Type": "application/json"},
-            media_type="application/json",
-        )
+        log.exception("chat_core lanzó una excepción")
+        return _json_response(500, {"error": "internal_server_error"})
 
-    if not isinstance(result, dict) or "statusCode" not in result:
-        log.error("chat_handler.handler devolvió una forma inesperada: %r", result)
-        return Response(
-            content=json.dumps({"error": "internal_server_error"}),
-            status_code=500,
-            headers={**CORS_HEADERS, "Content-Type": "application/json"},
-            media_type="application/json",
-        )
-
-    return _lambda_response_to_fastapi(result)
-
-
-# ── Rutas ─────────────────────────────────────────────────────────────────────
-
-@app.get("/health")
-async def health() -> Response:
-    """Health check para el ALB. Sin auth — invoca el handler con el path /health."""
-    event = {
-        "httpMethod": "GET",
-        "path": "/health",
-        "headers": {},
-        "queryStringParameters": None,
-        "body": None,
-        "requestContext": {},
-    }
-    try:
-        result = chat_handler.handler(event, None)
-        return _lambda_response_to_fastapi(result)
-    except Exception:
-        log.exception("health check falló")
-        return Response(
-            content=json.dumps({"status": "error"}),
-            status_code=500,
-            media_type="application/json",
-        )
-
-
-# Catch-all para /api/* — el handler enruta internamente por (httpMethod, path).
-@app.api_route("/api/{path:path}", methods=["GET", "POST", "OPTIONS"])
-async def api(request: Request, path: str) -> Response:
-    return await _dispatch(request, f"/api/{path}")
+    return _json_response(status, payload)
