@@ -22,6 +22,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import boto3
 import requests
+from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
 
 # ── Logging estructurado a stdout (awslogs) ───────────────────────────────────
@@ -141,54 +142,38 @@ def _first_number(body, keys):
     return None
 
 
-# ── DynamoDB: encontrar vuelos activos ────────────────────────────────────────
-def _scan_active_flights() -> list[dict]:
-    """Scan de la business table por master rows de vuelo activos en las próximas
-    ~48h.
+# ── DynamoDB: encontrar vuelos activos (Query GSI FlightsByDate) ──────────────
+def _active_flights() -> list[dict]:
+    """Query del GSI `FlightsByDate`, una partición por fecha de la ventana
+    [hoy, hoy+LOOKAHEAD_HOURS].
 
-    PRODUCCIÓN: esto debería ser una Query sobre un GSI tipo `FlightsByDate`
-    (gsipk = "FLIGHT", gsisk = fecha) para no escanear toda la tabla. El dataset
-    del demo es chico (~660 vuelos), así que el Scan con FilterExpression es
-    aceptable. La FilterExpression deja sólo master rows FLIGHT# (no SEAT#,
-    no PNR#) en un estado activo.
+    El índice es sparse (solo los master rows FLIGHT# estampan gsi_flights_pk),
+    así que NO devuelve asientos ni PNRs — sin necesidad de filtrar #SEAT#. La
+    FilterExpression deja solo los estados activos (EN_HORARIO / DEMORADO); como la
+    partición ya es "los vuelos de esa fecha", el filtro recorre pocos ítems: es un
+    Query acotado, no un Scan de tabla.
     """
     today = date.today()
     horizon = today + timedelta(hours=LOOKAHEAD_HOURS)
-
-    filt = (
-        "begins_with(PK, :flight_prefix) AND begins_with(SK, :date_prefix) "
-        "AND attribute_exists(estado_vuelo)"
-    )
-    values = {
-        ":flight_prefix": "FLIGHT#",
-        ":date_prefix": "DATE#",
-    }
+    fechas = [
+        (today + timedelta(days=i)).isoformat()
+        for i in range((horizon - today).days + 1)
+    ]
 
     flights: list[dict] = []
-    kwargs = {"FilterExpression": filt, "ExpressionAttributeValues": values}
-    while True:
-        resp = _table.scan(**kwargs)
-        for item in resp.get("Items", []):
-            sk = item.get("SK", "")
-            # Sólo master rows: SK = DATE#...#FLIGHT#<vuelo>, sin #SEAT#.
-            if "#SEAT#" in sk:
-                continue
-            if item.get("estado_vuelo") not in ACTIVE_STATES:
-                continue
-            # Filtro de fecha within now..now+48h (fecha es "YYYY-MM-DD").
-            fecha_str = item.get("fecha", "")
-            try:
-                fecha = date.fromisoformat(fecha_str)
-            except ValueError:
-                continue
-            if not (today <= fecha <= horizon.date()):
-                continue
-            flights.append(item)
-
-        lek = resp.get("LastEvaluatedKey")
-        if not lek:
-            break
-        kwargs["ExclusiveStartKey"] = lek
+    for fecha in fechas:
+        kwargs = {
+            "IndexName": "FlightsByDate",
+            "KeyConditionExpression": Key("gsi_flights_pk").eq(f"FLIGHTDATE#{fecha}"),
+            "FilterExpression": Attr("estado_vuelo").is_in(list(ACTIVE_STATES)),
+        }
+        while True:
+            resp = _table.query(**kwargs)
+            flights.extend(resp.get("Items", []))
+            lek = resp.get("LastEvaluatedKey")
+            if not lek:
+                break
+            kwargs["ExclusiveStartKey"] = lek
 
     return flights
 
@@ -255,7 +240,7 @@ def _should_cancel(weather: dict | None) -> bool:
 
 # ── Ciclo principal ───────────────────────────────────────────────────────────
 def run_cycle() -> None:
-    flights = _scan_active_flights()
+    flights = _active_flights()
     log.info(
         "cycle start — active_flights=%d force_cancel=%s",
         len(flights),

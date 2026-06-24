@@ -1,6 +1,6 @@
 # 07 — Capa de datos: DynamoDB (dos tablas, bounded contexts) + Data Lake (S3 + Athena)
 
-> **Cambio TP4:** la única tabla DynamoDB del TP3 se separó en **dos tablas single-design**, una por bounded context. El esquema de reservas migró a un patrón **PNR-céntrico** (record locator de 6 chars, à la Navitaire/Amadeus), con 1 GSI en la tabla de negocio.
+> **Cambio TP4:** la única tabla DynamoDB del TP3 se separó en **dos tablas single-design**, una por bounded context. El esquema de reservas migró a un patrón **PNR-céntrico** (record locator de 6 chars, à la Navitaire/Amadeus), con 2 GSIs en la tabla de negocio.
 
 ---
 
@@ -46,7 +46,7 @@ Estado efímero del chatbot. PK/SK, **sin GSIs**, TTL en todos los items.
 
 ### Tabla 2 — `jetsmart-prod-business` (PSS-like)
 
-Estado persistente del dominio. PK/SK, **1 GSI**, **DynamoDB Stream habilitado** (`NEW_AND_OLD_IMAGES`), sin TTL.
+Estado persistente del dominio. PK/SK, **2 GSIs**, **DynamoDB Stream habilitado** (`NEW_AND_OLD_IMAGES`), sin TTL.
 
 | Entidad | PK | SK | Descripción |
 |---|---|---|---|
@@ -69,8 +69,11 @@ Estado persistente del dominio. PK/SK, **1 GSI**, **DynamoDB Stream habilitado**
 
 | GSI | HK (`gsi*pk`) | RK (`gsi*sk`) | Projection | Caller |
 |---|---|---|---|---|
-| **`ReservationsByFlight`** | `FLIGHT#{vuelo}#{fecha}` | `PNR#{pnr}` | INCLUDE (user_id, email, passenger_name, status) | `proactive_notifications` — "qué pasajeros tengo en el vuelo cancelado" |
-> **El único GSI de TP4 final es `ReservationsByFlight`.** Sin él, encontrar "todos los PNRs en el vuelo JA203 del 2026-06-20" requiere Scan O(n) sobre la tabla entera. Con el GSI es una sola Query O(log n) — el atributo `gsi2pk` se estampa en cada SEGMENT# al crear el booking.
+| **`ReservationsByFlight`** | `FLIGHT#{vuelo}#{fecha}` | `PNR#{pnr}` | INCLUDE (user_id, email, passenger_name, status) | `proactive_notifications` / `refund` — "qué pasajeros tengo en el vuelo cancelado" |
+| **`FlightsByDate`** | `FLIGHTDATE#{fecha}` | `vuelo_numero` | INCLUDE (estado_vuelo, vuelo_numero, fecha) | `weather-poller` — "qué vuelos activos hay en esta fecha" |
+> **`ReservationsByFlight`** habilita el fan-out de cancelaciones: sin él, encontrar "todos los PNRs en el vuelo JA203 del 2026-06-20" requiere Scan O(n) sobre la tabla entera. Con el GSI es una sola Query O(log n) — el atributo `gsi2pk` se estampa en cada SEGMENT# al crear el booking.
+>
+> **`FlightsByDate`** reemplaza el Scan que hacía el `weather-poller` para listar vuelos activos. Es **sparse** (solo el master row `FLIGHT#` estampa `gsi_flights_pk`; los 120 `SEAT#` por vuelo no), así que el índice contiene únicamente vuelos. **Particionado por fecha** (`FLIGHTDATE#{fecha}`): cada día es su propia partición → sin hot partition. El poller hace una Query por fecha de la ventana [hoy, hoy+48h] (2-3 queries) con `FilterExpression` por `estado_vuelo IN (EN_HORARIO, DEMORADO)`, en vez de escanear la tabla entera.
 
 > **Histórico:** TP4 inicial tenía dos GSIs adicionales que se eliminaron en TP4 final:
 > - `FlightByNumber`: lo usaba `scripts/cancel_flight.py`. Al volcar el trigger a DynamoDB Streams quedó sin consumidor en runtime.
@@ -151,6 +154,8 @@ El modelo TP4 invierte la jerarquía: **el PNR es la entidad canónica**, y `USE
 |---|---|---|---|---|---|
 | AP32 | Encontrar PNRs afectados por vuelo cancelado | proactive_notifications | **GSI Query** sobre `ReservationsByFlight` | `gsi2pk = FLIGHT#{vuelo}#{fecha}` | begins_with `PNR#` |
 | AP33 | Marcar PNR como AFFECTED_BY_CANCELLATION | proactive_notifications | UpdateItem | `PNR#{pnr}` | `#METADATA` |
+| AP36 | Listar vuelos activos de una fecha | weather-poller | **GSI Query** sobre `FlightsByDate` (1 por fecha de la ventana 48h) + filter `estado_vuelo IN (EN_HORARIO, DEMORADO)` | `gsi_flights_pk = FLIGHTDATE#{fecha}` | — |
+| AP37 | Cancelar vuelo por clima (idempotente) | weather-poller | UpdateItem condicional | `FLIGHT#{org}#{dst}` | `estado_vuelo <> CANCELADO` |
 
 > **Nota:** los access patterns de call center "buscar PNR por DNI/email" (AP34/AP35 en versiones previas del doc) requerían el GSI `ReservationsByPassenger` que se eliminó en TP4 final (sin consumidor en runtime). Si en producción se agregara un canal de call center, se recreará el GSI o se implementará vía Scan + filter para volúmenes bajos.
 
@@ -508,7 +513,7 @@ El PNR se genera con SHA-256 del `payment_id` en el chat-handler (`app/chat-hand
 | Billing mode | PAY_PER_REQUEST | Tráfico irregular — no pagar por capacidad ociosa |
 | TTL attribute | No tiene | Datos del PSS son persistentes (sin TTL); las reservas no expiran |
 | Encriptación at-rest | AWS managed (`aws/dynamodb`) | KMS implícito, sin costo |
-| GSIs | 1 (ReservationsByFlight) | Resuelve AP32 (fan-out de cancelaciones) sin Scan |
+| GSIs | 2 (ReservationsByFlight, FlightsByDate) | Resuelven AP32 (fan-out de cancelaciones) y AP36 (vuelos activos del weather-poller) sin Scan |
 | **Stream** | **Habilitado, `NEW_AND_OLD_IMAGES`** | Consumido por la Lambda `stream-emitter` con filter_criteria. Permite comparar transiciones (no re-cancelaciones) y publicar `flight_cancelled` al SNS `events`. |
 | Point-in-time recovery | Habilitado | Recuperación granular hasta 35 días atrás |
 

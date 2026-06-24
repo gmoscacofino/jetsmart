@@ -119,10 +119,14 @@ for origen, destino, vuelo, hora_salida, hora_llegada, duracion_min, precio_base
     for fecha in FECHAS:
         precio = _precio(precio_base, vuelo, fecha)
 
-        # Master row del vuelo (sin #SEAT# en el SK) — datos comerciales y horarios
+        # Master row del vuelo (sin #SEAT# en el SK) — datos comerciales y horarios.
+        # gsi_flights_pk/sk estampan SOLO este master row (no los SEAT#) → GSI
+        # FlightsByDate sparse: "vuelos activos de una fecha" para el weather-poller.
         items.append({
             "PK":                   f"FLIGHT#{origen}#{destino}",
             "SK":                   f"DATE#{fecha}#FLIGHT#{vuelo}",
+            "gsi_flights_pk":       f"FLIGHTDATE#{fecha}",
+            "gsi_flights_sk":       vuelo,
             "vuelo_numero":         vuelo,
             "fecha":                fecha,
             "origen":               origen,

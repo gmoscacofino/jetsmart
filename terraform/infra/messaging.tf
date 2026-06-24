@@ -150,9 +150,14 @@ resource "aws_lambda_permission" "events_invoke" {
 # ── Suscripción comportamiento: SNS central → Firehose interaction_events ──────
 #
 # Captura los eventos semánticos del chat (búsquedas, intents, handoff) para el
-# data lake. filter_policy = anything-but los event_type transaccionales (esos
-# vienen del CDC de business, no del bus → sin doble conteo). raw_message_delivery
-# para que Firehose reciba el JSON del evento, no el envelope de SNS.
+# data lake. filter_policy = anything-but los event_type que YA llegan al lake por
+# el CDC de business (evita doble conteo):
+#   - booking_confirmed  → lo deriva business_analytics_emitter (write CONFIRMADA).
+#   - flight_cancelled   → lo deriva el CDC (write estado_vuelo=CANCELADO).
+#   - reclamo_iniciado   → equivale a claim_created del CDC (write CLAIM#).
+# booking_failed SÍ pasa: no genera transición CONFIRMADA, así que el CDC no lo
+# representa → es la única vía para que el "booking fallido" llegue al lake.
+# raw_message_delivery para que Firehose reciba el JSON del evento, no el envelope.
 
 resource "aws_sns_topic_subscription" "events_to_firehose" {
   topic_arn             = aws_sns_topic.events.arn
@@ -162,6 +167,6 @@ resource "aws_sns_topic_subscription" "events_to_firehose" {
   raw_message_delivery  = true
 
   filter_policy = jsonencode({
-    event_type = [{ "anything-but" = ["booking_confirmed", "booking_failed", "flight_cancelled"] }]
+    event_type = [{ "anything-but" = ["booking_confirmed", "flight_cancelled", "reclamo_iniciado"] }]
   })
 }

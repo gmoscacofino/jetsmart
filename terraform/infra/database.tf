@@ -59,8 +59,9 @@ resource "aws_dynamodb_table" "conversations" {
 #   CLAIM#{id}             / #METADATA                  — reclamo canónico
 #   USER#{id}              / CLAIM#{id}                  — thin pointer "mis reclamos"
 #
-# 1 GSI:
+# 2 GSIs:
 #   ReservationsByFlight — "quiénes están en el vuelo X del día Y" (proactive notifications)
+#   FlightsByDate        — "vuelos activos de una fecha" (weather-poller, reemplaza el Scan)
 #
 # (En TP4 inicial había dos GSIs adicionales:
 #  - FlightByNumber: lo usaba scripts/cancel_flight.py. Al volcar el trigger a
@@ -121,6 +122,32 @@ resource "aws_dynamodb_table" "business" {
       "status",
       "origen",
       "destino",
+    ]
+  }
+
+  # GSI FlightsByDate — "vuelos activos de una fecha" (consumido por weather-poller).
+  # Sparse: solo los master rows FLIGHT# estampan gsi_flights_pk/sk (los SEAT# no),
+  # así el índice contiene únicamente vuelos, sin asientos. Particionado por fecha
+  # (HK = FLIGHTDATE#{fecha}) → cada día es su propia partición, sin hot partition.
+  attribute {
+    name = "gsi_flights_pk"
+    type = "S"
+  }
+
+  attribute {
+    name = "gsi_flights_sk"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "FlightsByDate"
+    hash_key        = "gsi_flights_pk" # FLIGHTDATE#{fecha}
+    range_key       = "gsi_flights_sk" # vuelo_numero
+    projection_type = "INCLUDE"
+    non_key_attributes = [
+      "estado_vuelo",
+      "vuelo_numero",
+      "fecha",
     ]
   }
 
