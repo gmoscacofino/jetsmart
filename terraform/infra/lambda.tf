@@ -1,13 +1,15 @@
-# ── Lambdas en VPC ────────────────────────────────────────────────────────────
+# ── Lambdas ───────────────────────────────────────────────────────────────────
 #
-# TP4 re-arquitectura: todo el cómputo Lambda de negocio corre en las subnets
-# privadas-lambda. Acceden a DynamoDB/S3 por Gateway Endpoint (gratis) y a
-# SNS/SQS/Secrets/StepFunctions por Interface Endpoint; salen a internet (si hace
-# falta) por NAT. auth_callback/cognito_trigger (módulo auth) quedan FUERA de la
-# VPC — sólo tocan Cognito/DynamoDB regional.
+# TP4: sólo el núcleo transaccional (payment + refund Saga) corre DENTRO de la
+# VPC — toca dinero/PNR, así que aislamos su egress. El resto de las Lambdas
+# (event glue: analytics, stream, boarding, handoff, notification, proactive,
+# refund-trigger) corre FUERA de la VPC: sólo mueven datos entre servicios AWS
+# gestionados vía IAM, sin acceso a recursos privados, así que la VPC sólo
+# sumaría cold-starts por ENI sin ganar seguridad efectiva. auth_callback/
+# cognito_trigger (módulo auth) también quedan fuera.
 #
-# vpc_config se repite en cada función (es un bloque anidado, no parametrizable).
-# subnet_ids = private_lambda ; security_group_ids = [sg-lambda].
+# Las que quedan en VPC acceden a DynamoDB por Gateway Endpoint (gratis) y a SNS
+# por Interface Endpoint. vpc_config sólo en payment y refund.
 
 # ── Lambda: Business Analytics Emitter (CDC → Firehose) ───────────────────────
 #
@@ -37,11 +39,6 @@ resource "aws_lambda_function" "business_analytics_emitter" {
       FIREHOSE_FLIGHT      = aws_kinesis_firehose_delivery_stream.lake["flight_events"].name
       FIREHOSE_CLAIM       = aws_kinesis_firehose_delivery_stream.lake["claim_events"].name
     }
-  }
-
-  vpc_config {
-    subnet_ids         = aws_subnet.private_lambda[*].id
-    security_group_ids = [aws_security_group.lambda.id]
   }
 }
 
@@ -159,11 +156,6 @@ resource "aws_lambda_function" "boarding_pass_async" {
       BOARDING_PASSES_BUCKET = aws_s3_bucket.boarding_passes.bucket
     }
   }
-
-  vpc_config {
-    subnet_ids         = aws_subnet.private_lambda[*].id
-    security_group_ids = [aws_security_group.lambda.id]
-  }
 }
 
 # boarding-pass: SNS→Lambda directo (suscripción + permiso en messaging.tf).
@@ -194,11 +186,6 @@ resource "aws_lambda_function" "human_handoff_processor" {
       CONVERSATIONS_TABLE_NAME = aws_dynamodb_table.conversations.name
       SNS_NOTIFICATIONS_ARN    = aws_sns_topic.notifications.arn
     }
-  }
-
-  vpc_config {
-    subnet_ids         = aws_subnet.private_lambda[*].id
-    security_group_ids = [aws_security_group.lambda.id]
   }
 }
 
@@ -236,11 +223,6 @@ resource "aws_lambda_function" "proactive_notifications" {
       SNS_EVENTS_ARN        = aws_sns_topic.events.arn
     }
   }
-
-  vpc_config {
-    subnet_ids         = aws_subnet.private_lambda[*].id
-    security_group_ids = [aws_security_group.lambda.id]
-  }
 }
 
 # proactive-notifications: SNS→Lambda directo (suscripción + permiso en messaging.tf).
@@ -271,11 +253,6 @@ resource "aws_lambda_function" "stream_emitter" {
       AWS_REGION_VAR = var.aws_region
       SNS_EVENTS_ARN = aws_sns_topic.events.arn
     }
-  }
-
-  vpc_config {
-    subnet_ids         = aws_subnet.private_lambda[*].id
-    security_group_ids = [aws_security_group.lambda.id]
   }
 }
 
@@ -327,11 +304,6 @@ resource "aws_lambda_function" "notification" {
       AWS_REGION_VAR        = var.aws_region
       SNS_NOTIFICATIONS_ARN = aws_sns_topic.notifications.arn
     }
-  }
-
-  vpc_config {
-    subnet_ids         = aws_subnet.private_lambda[*].id
-    security_group_ids = [aws_security_group.lambda.id]
   }
 }
 
@@ -412,11 +384,6 @@ resource "aws_lambda_function" "refund_trigger" {
       REFUND_SFN_ARN      = aws_sfn_state_machine.refund.arn
       BUSINESS_TABLE_NAME = aws_dynamodb_table.business.name
     }
-  }
-
-  vpc_config {
-    subnet_ids         = aws_subnet.private_lambda[*].id
-    security_group_ids = [aws_security_group.lambda.id]
   }
 }
 

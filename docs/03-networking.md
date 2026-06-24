@@ -16,11 +16,12 @@ En esta arquitectura el recurso que justifica la VPC es **Fargate**: las tasks d
 |---|---|---|
 | **chat-handler** (Fargate) | Subnets privadas `private-fargate` | Core del chatbot, expuesto sólo vía ALB |
 | **weather-poller** (Fargate) | Subnets privadas `private-fargate` | Egress por NAT a la climAPI, sin inbound |
-| **Lambdas** (Saga payment/refund, notification, workers) | Subnets privadas `private-lambda` (`vpc_config`) | Acceso a servicios AWS por endpoints + NAT |
-| DynamoDB, SNS, SQS, Step Functions, S3, Secrets | Regionales (AWS) | Alcanzados por VPC endpoints, no viven en la red |
+| **Lambdas del núcleo transaccional** (Saga payment + refund) | Subnets privadas `private-lambda` (`vpc_config`) | Tocan dinero/PNR: se aísla su egress |
+| **Resto de las Lambdas** (analytics, stream, boarding, handoff, notification, proactive, refund-trigger) | Regionales (fuera de la VPC) | Sólo mueven datos entre servicios AWS por IAM; la VPC sólo sumaría cold-start sin ganar seguridad |
+| DynamoDB, SNS, Step Functions, S3, Secrets | Regionales (AWS) | Alcanzados por VPC endpoints, no viven en la red |
 | Cognito, Glue, Athena | Regionales (AWS) | Servicios managed fuera de la VPC |
 
-> **Nota sobre las Lambdas:** en el despliegue actual (`terraform/infra/lambda.tf`) todas las funciones llevan `vpc_config` apuntando a las subnets `private-lambda` y al SG `sg-lambda`. Es decir, **las Lambdas SÍ están en la VPC**. Esto difiere del diseño serverless anterior, donde eran regionales. Ver la nota al final sobre el trade-off de cold start que esto implica.
+> **Nota sobre las Lambdas:** sólo el núcleo transaccional —`payment` (Saga de booking) y `refund` (Saga de reembolso)— lleva `vpc_config` apuntando a `private-lambda` y al SG `sg-lambda`. Tocan dinero y PNR, así que se aísla su egress. El resto de las Lambdas (event glue: analytics, stream-emitter, boarding-pass, human-handoff, notification, proactive-notifications, refund-trigger) corre **fuera** de la VPC: sólo mueven datos entre servicios AWS gestionados por IAM, sin acceso a recursos privados, así que la VPC sólo agregaría cold-start por ENI sin beneficio de seguridad. `auth-callback` y `cognito-trigger` (módulo auth) también quedan fuera. Ver la nota al final sobre el trade-off de cold start.
 
 ### Comparación con el diseño anterior (serverless rechazado)
 
@@ -31,9 +32,9 @@ En esta arquitectura el recurso que justifica la VPC es **Fargate**: las tasks d
 | VPC | Ninguna (over-engineering según el diseño viejo) | `10.0.0.0/16` con 6 subnets |
 | Subnets | — | 2 públicas + 2 private-fargate + 2 private-lambda |
 | IGW / NAT Gateway | — | 1 IGW + 1 NAT Gateway |
-| VPC Endpoints | — | 2 gateway (S3, DynamoDB) + 8 interface |
+| VPC Endpoints | — | 2 gateway (S3, DynamoDB) + 6 interface |
 | Security Groups | — | 5 (alb, chat, poller, lambda, endpoints) |
-| Lambdas | Regionales | En subnets `private-lambda` (`vpc_config`) |
+| Lambdas | Regionales | Sólo payment + refund Saga en `private-lambda`; el resto regional |
 
 ---
 
@@ -45,7 +46,7 @@ VPC `10.0.0.0/16`, DNS support y DNS hostnames habilitados (`enable_dns_hostname
 |---|---|---|---|
 | `public-0` / `public-1` | `10.0.0.0/24` / `10.0.1.0/24` | 2 AZs | ALB + NAT Gateway (`map_public_ip_on_launch`) |
 | `private-fargate-0/1` | `10.0.10.0/24` / `10.0.11.0/24` | 2 AZs | Tasks Fargate (chat-handler, weather-poller) |
-| `private-lambda-0/1` | `10.0.20.0/24` / `10.0.21.0/24` | 2 AZs | Lambdas en VPC (Saga, workers) |
+| `private-lambda-0/1` | `10.0.20.0/24` / `10.0.21.0/24` | 2 AZs | Lambdas del núcleo transaccional (payment + refund Saga) |
 
 ### Routing
 
@@ -62,7 +63,9 @@ Para que el tráfico a servicios AWS no salga por internet (least-privilege de e
 
 - **Gateway endpoints (gratis):** `S3` y `DynamoDB`. Se inyectan como rutas en la route table privada.
 - **Interface endpoints (ENIs en las 2 subnets private-fargate, private DNS habilitado):**
-  `sns`, `sqs`, `secretsmanager`, `states` (Step Functions), `ecr.api`, `ecr.dkr`, `logs` (CloudWatch Logs), `kinesis-firehose`.
+  `sns`, `secretsmanager`, `states` (Step Functions), `ecr.api`, `ecr.dkr`, `logs` (CloudWatch Logs).
+
+> **Sin `sqs` ni `kinesis-firehose`:** ningún recurso que queda en la VPC los llama por SDK. La entrega SNS→SQS, el redrive a DLQ y la suscripción SNS→Firehose ocurren en el plano gestionado de AWS, no desde las subnets. El único consumidor in-VPC de Firehose (`business-analytics-emitter`) y los consumidores de SQS (human-handoff, refund-trigger) ahora corren fuera de la VPC.
 
 `ecr.api` + `ecr.dkr` + `logs` son críticos para Fargate: sin ellos las tasks no pueden pullear la imagen del registry ni emitir logs `awslogs` desde una subnet privada. Por eso el `aws_ecs_service` depende explícitamente de los endpoints, S3 y el NAT.
 
@@ -78,9 +81,22 @@ El **ALB internet-facing** (`internal = false`, en las 2 subnets públicas) es e
 - Health check sobre `GET /health` (matcher 200, interval 30s).
 - **No hay listener HTTPS:** Academy no habilita ACM. En producción real: ACM + listener 443 + auth Cognito nativa en el ALB.
 
+### WAF en el ALB
+
+Un **Web ACL de AWS WAFv2** (scope REGIONAL) está asociado al ALB del chat-handler — la única superficie pública que recibe input del usuario. `default_action = allow`; las reglas bloquean lo malicioso antes de que llegue al contenedor:
+
+| Prioridad | Regla | Cubre |
+|---|---|---|
+| 1 | AWS Managed — Common Rule Set | XSS y patrones OWASP genéricos |
+| 2 | AWS Managed — Known Bad Inputs | payloads/exploits conocidos (Log4j, etc.) |
+| 3 | AWS Managed — SQLi Rule Set | inyección SQL (defensa en profundidad) |
+| 4 | Rate-based 2000 req / 5 min por IP | bots / DoS aplicativo |
+
+El API Gateway de `auth-callback` no se asocia al WAF: ya tiene `throttling_rate_limit = 5` y sólo intercambia el `code` OAuth con Cognito, sin recibir input de negocio. Definido en `terraform/infra/waf.tf`.
+
 ### Internet Gateway / NAT para egress
 
-El `chat-handler` que llama a la API de Anthropic, el `weather-poller` que llama a la climAPI y las Lambdas que necesitan salir lo hacen **por el NAT Gateway** (subnet privada → NAT → IGW). Ya no es la salida "implícita" de la infraestructura managed de Lambda: ahora el egress está contenido por la VPC y el NAT, que era justamente parte de lo pedido por Faustino.
+El `chat-handler` que llama a la API de Anthropic y el `weather-poller` que llama a la climAPI salen **por el NAT Gateway** (subnet privada → NAT → IGW). Las Lambdas que quedan en la VPC (payment + refund) no necesitan internet: sólo tocan DynamoDB (gateway endpoint) y SNS (interface endpoint). Así el egress del cómputo que sí sale está contenido por la VPC y el NAT, que era parte de lo pedido por Faustino.
 
 ### S3 estático con HTTP
 
@@ -115,7 +131,7 @@ El inbound se encadena por **referencia de SG**, no por CIDR: sólo el SG de ori
 | `sg-alb` | TCP **80** desde `0.0.0.0/0` (internet) | TCP 8000 → `sg-chat` |
 | `sg-chat` (chat-handler) | TCP **8000** sólo desde `sg-alb` | Abierto (NAT: Anthropic, JWKS; endpoints) |
 | `sg-poller` (weather-poller) | — (sin inbound) | Abierto (NAT: climAPI; endpoints) |
-| `sg-lambda` (Lambdas en VPC) | — (sin inbound) | Abierto (endpoints + NAT) |
+| `sg-lambda` (payment + refund en VPC) | — (sin inbound) | Abierto (endpoints) |
 | `sg-endpoints` (interface endpoints) | TCP **443** desde `sg-chat`, `sg-poller`, `sg-lambda` | Abierto (respuestas) |
 
 El egress se deja abierto en los SG de cómputo por correctness (DNS + 443 a endpoints/NAT). En producción real se acotaría el egress por destino.
@@ -145,4 +161,4 @@ Ningún recurso de datos tiene acceso público:
 
 ## Trade-off: cold start de las Lambdas en VPC
 
-Meter las Lambdas en la VPC (`vpc_config`) tiene un costo: el aprovisionamiento de ENIs agrega latencia de cold start respecto de una Lambda regional. AWS mitigó esto con Hyperplane ENIs (las ENIs se comparten y pre-aprovisionan), así que el impacto hoy es mucho menor que los 500ms–2s del modelo viejo, pero sigue siendo no-cero. Se acepta a cambio del aislamiento de red y el egress contenido que pidió la re-arquitectura. Si una función resultara crítica en latencia y no necesitara la VPC, podría sacarse de `vpc_config` y volver a regional — pero el default de este despliegue es el aislamiento.
+Meter una Lambda en la VPC (`vpc_config`) tiene un costo: el aprovisionamiento de ENIs agrega latencia de cold start respecto de una Lambda regional. Por eso **sólo** payment y refund (el núcleo transaccional) están en la VPC: tocan dinero/PNR y el aislamiento de egress lo justifica. AWS mitigó el cold-start con Hyperplane ENIs (se comparten y pre-aprovisionan), así que el impacto hoy es menor que los 500ms–2s del modelo viejo, pero sigue siendo no-cero. El resto de las Lambdas se dejó **fuera** de la VPC justamente para no pagar ese costo donde no aporta seguridad: sólo mueven datos entre servicios AWS por IAM, sin tocar recursos privados.

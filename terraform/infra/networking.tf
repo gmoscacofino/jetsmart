@@ -150,13 +150,11 @@ resource "aws_vpc_endpoint" "dynamodb" {
 locals {
   interface_endpoints = [
     "sns",
-    "sqs",
     "secretsmanager",
-    "states",   # Step Functions
-    "ecr.api",  # ECR control plane
-    "ecr.dkr",  # ECR docker registry (pull de imagen)
-    "logs",             # CloudWatch Logs (awslogs de Fargate)
-    "kinesis-firehose", # business-analytics-emitter → Firehose (PutRecord desde VPC)
+    "states",  # Step Functions
+    "ecr.api", # ECR control plane
+    "ecr.dkr", # ECR docker registry (pull de imagen)
+    "logs",    # CloudWatch Logs (awslogs de Fargate)
   ]
 }
 

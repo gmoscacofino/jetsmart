@@ -16,7 +16,6 @@ REGION               = os.environ["AWS_REGION_VAR"]
 # TP4: dos tablas — bounded contexts (conversations + business/PSS)
 CONV_TABLE_NAME      = os.environ["CONVERSATIONS_TABLE_NAME"]
 BIZ_TABLE_NAME       = os.environ["BUSINESS_TABLE_NAME"]
-HUMAN_HANDOFF_QUEUE_URL = os.environ.get("HUMAN_HANDOFF_QUEUE_URL", "")
 SNS_TOPIC_ARN        = os.environ["SNS_TOPIC_ARN"]
 SECRET_ARN           = os.environ["ANTHROPIC_SECRET_ARN"]
 SF_ARN               = os.environ.get("STEP_FUNCTIONS_ARN", "")
@@ -28,7 +27,6 @@ dynamodb   = boto3.resource("dynamodb", region_name=REGION)
 conv_table = dynamodb.Table(CONV_TABLE_NAME)
 biz_table  = dynamodb.Table(BIZ_TABLE_NAME)
 sns        = boto3.client("sns", region_name=REGION)
-sqs        = boto3.client("sqs", region_name=REGION)
 sm         = boto3.client("secretsmanager", region_name=REGION)
 sf         = boto3.client("stepfunctions", region_name=REGION)
 

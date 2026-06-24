@@ -8,6 +8,11 @@ output "alb_dns_name" {
   value       = aws_lb.main.dns_name
 }
 
+output "waf_web_acl_arn" {
+  description = "ARN del Web ACL (WAFv2) asociado al ALB del chat-handler"
+  value       = aws_wafv2_web_acl.chat.arn
+}
+
 output "ecr_chat_handler_url" {
   description = "URL del repo ECR de la imagen chat-handler"
   value       = aws_ecr_repository.chat_handler.repository_url

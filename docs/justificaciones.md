@@ -6,22 +6,36 @@ Cada decisión arquitectónica con: qué se hizo, alternativas consideradas, tra
 
 ## 1. Con VPC — el core del chatbot corre dentro de la red privada
 
-**Decisión:** la arquitectura tiene VPC propia (`10.0.0.0/16`). El core del chatbot corre como servicio Fargate en **subnets privadas** (`private-fargate`, `assign_public_ip=false`) detrás de un ALB; las Lambdas de negocio corren en subnets privadas (`private-lambda`). Esto responde directamente al feedback de Faustino del 17/06: el cómputo del chatbot ahora vive DENTRO de la VPC, no como Lambdas sueltas regionales.
+**Decisión:** la arquitectura tiene VPC propia (`10.0.0.0/16`). El core del chatbot corre como servicio Fargate en **subnets privadas** (`private-fargate`, `assign_public_ip=false`) detrás de un ALB; las Lambdas del núcleo transaccional (Saga payment + refund) corren en subnets privadas (`private-lambda`) y el resto de las Lambdas queda fuera de la VPC. Esto responde directamente al feedback de Faustino del 17/06: el cómputo del chatbot ahora vive DENTRO de la VPC, no como Lambdas sueltas regionales.
 
 **Topología (ver `networking.tf`):**
 - 2 subnets públicas → ALB + NAT Gateway.
 - 2 subnets `private-fargate` → Fargate (chat-handler + weather-poller).
-- 2 subnets `private-lambda` → Lambdas de negocio (Saga payment/refund, workers).
-- 1 IGW, 1 NAT Gateway, 2 gateway endpoints (S3, DynamoDB gratis), 8 interface endpoints (sns, sqs, secretsmanager, states, ecr.api, ecr.dkr, logs, kinesis-firehose).
+- 2 subnets `private-lambda` → núcleo transaccional (Saga payment + refund). El resto de las Lambdas (event glue) corre fuera de la VPC.
+- 1 IGW, 1 NAT Gateway, 2 gateway endpoints (S3, DynamoDB gratis), 6 interface endpoints (sns, secretsmanager, states, ecr.api, ecr.dkr, logs).
 
 **Alternativas:**
 - (a) Mantener todo serverless sin VPC (diseño rechazado el 17/06) → Faustino lo marcó: el core del chatbot quedaba sin perímetro de red.
 - (b) VPC con sólo una Lambda adentro (TP3) → marcado como inconsistente por Faustino.
-- (c) **VPC con el core en contenedor + Lambdas de negocio adentro, endpoints para el tráfico AWS (elegida).** → El cómputo persistente (Fargate, awsvpc) necesita identidad de red; los VPC endpoints le dan acceso least-privilege a los servicios AWS sin salir a internet.
+- (c) **VPC con el core en contenedor + sólo el núcleo transaccional (payment + refund) adentro, endpoints para el tráfico AWS (elegida).** → El cómputo persistente (Fargate, awsvpc) necesita identidad de red; payment/refund se aíslan porque tocan dinero/PNR. El resto de las Lambdas queda fuera: sólo mueven datos entre servicios AWS por IAM, así que la VPC sólo sumaría cold-start por ENI sin ganar seguridad. Los VPC endpoints dan acceso least-privilege a los servicios AWS sin salir a internet.
+
+**Por qué sólo payment + refund adentro (y no todas):** una Lambda sólo *necesita* la VPC si accede a un recurso que vive sólo ahí (RDS, ElastiCache) — y ninguna lo hace (todo es DynamoDB/SNS/SQS/Firehose/Step Functions vía IAM). Así que el criterio no es "necesidad técnica" sino **aislamiento de egress sobre datos sensibles**: payment y refund tocan dinero y PNR. El resto (analytics, stream, boarding, handoff, notification, proactive, refund-trigger) sólo enruta entre servicios gestionados; meterlas en la VPC pagaría cold-start de ENI sin cerrar ningún vector real. Eso además permitió bajar los interface endpoints de 8 a 6 (se eliminaron `sqs` y `kinesis-firehose`: sus únicos consumidores in-VPC salieron).
 
 **Trade-off:** se paga 1 NAT Gateway (~USD/hora) y los interface endpoints; se agrega código Terraform (SGs, routing, endpoints). Se gana: perímetro de red real para el core, ECR/Logs alcanzables desde subnet privada, egress controlado por NAT, y el feedback de Faustino resuelto.
 
 **Por qué es la decisión correcta:** Fargate con `network_mode=awsvpc` necesita ENIs en subnets — es cómputo con identidad de red persistente, exactamente el caso de uso de una VPC. El ALB internet-facing es el único punto expuesto; las tasks viven en subnets privadas sin IP pública. VPC Flow Logs se podrían sumar para visibilidad L3/L4.
+
+---
+
+## 1b. WAF en el ALB (defensa de capa 7)
+
+**Decisión:** un Web ACL de **AWS WAFv2** (scope REGIONAL) asociado al ALB del chat-handler — el único punto que recibe input del usuario. `default_action = allow` + 4 reglas que bloquean lo malicioso: AWS Managed Common Rule Set (XSS/OWASP), Known Bad Inputs (exploits conocidos), SQLi Rule Set, y una rate-based de 2000 req/5min por IP (bots/DoS aplicativo). Ver `waf.tf`.
+
+**Por qué en el ALB y no en el API Gateway de auth:** el ALB es la superficie con input de negocio (va a Anthropic + DynamoDB). El API Gateway de `auth-callback` ya tiene `throttling_rate_limit = 5` y sólo intercambia el `code` OAuth con Cognito, sin recibir payloads del usuario.
+
+**Trade-off:** ~USD 5/mes por Web ACL + USD 1/regla + USD 0.60 por millón de requests — despreciable en el lab. Sin geo-block: bloquear por país arriesga cortarse a uno mismo/al evaluador en la demo. La teoría de clase lo ubica "antes del ALB" como firewall de aplicación (SQLi, XSS, bots) — exactamente este uso.
+
+**Limitación Academy:** sin ACM no hay HTTPS en el ALB, así que el WAF inspecciona tráfico HTTP plano. En producción real iría ACM + listener 443 y el WAF inspeccionaría el tráfico ya terminado en TLS.
 
 ---
 
