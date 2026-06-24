@@ -149,7 +149,6 @@ resource "aws_ecs_task_definition" "weather_poller" {
         { name = "WEATHER_SECRET_ARN", value = aws_secretsmanager_secret.weather_key.arn },
         { name = "CLIMA_API_BASE", value = var.clima_api_base },
         { name = "POLL_INTERVAL_SECONDS", value = tostring(var.weather_poll_interval_seconds) },
-        { name = "FORCE_CANCEL", value = tostring(var.force_cancel) },
         { name = "ACTIVE_FLIGHT_STATES", value = "EN_HORARIO,DEMORADO" },
         { name = "LOOKAHEAD_HOURS", value = "48" },
       ]

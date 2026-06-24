@@ -62,21 +62,15 @@ variable "image_tag" {
 # ── Weather poller ────────────────────────────────────────────────────────────
 
 variable "clima_api_base" {
-  description = "Base URL de la API de clima externa (climAPI). Ajustar al endpoint real."
+  description = "Base URL de WeatherAPI.com (endpoint /forecast.json)."
   type        = string
-  default     = "https://api.climapi.example"
+  default     = "https://api.weatherapi.com/v1"
 }
 
 variable "weather_poll_interval_seconds" {
   description = "Intervalo del loop del weather-poller en segundos"
   type        = number
   default     = 1800
-}
-
-variable "force_cancel" {
-  description = "Modo demo: el weather-poller cancela un vuelo elegible por ciclo, sin pegarle a climAPI"
-  type        = bool
-  default     = false
 }
 
 # ── Chatbot ───────────────────────────────────────────────────────────────────

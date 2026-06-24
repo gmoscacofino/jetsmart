@@ -53,7 +53,9 @@ Ver explicación completa en [01 — Cómo funciona un chatbot](./01-como-funcio
 
 ### `weather-poller` — task Fargate de operaciones
 
-Task Fargate `desired_count=1` (sin ALB), también en subnet privada. Sale por NAT a la clima API externa, detecta condiciones de cancelación y escribe la transición a `estado_vuelo=CANCELADO` en la tabla `business`. A partir de ahí el flujo proactivo se dispara por DynamoDB Stream (ver `stream-emitter` más abajo).
+Task Fargate `desired_count=1` (sin ALB), también en subnet privada. Loop continuo: por cada vuelo activo de la ventana de 48h (Query a la GSI `FlightsByDate`), consulta el **pronóstico de WeatherAPI.com** (`GET /forecast.json?q=iata:<IATA>&dt=<fecha>&hour=<hora_salida>`) para el aeropuerto de origen a la hora de salida del vuelo. Si el viento (`wind_kph > 90`) o la visibilidad (`vis_km*1000 < 550 m`) superan los umbrales, escribe la transición a `estado_vuelo=CANCELADO` en el master row del vuelo en `business`. Sale por NAT a WeatherAPI. A partir de ahí el flujo proactivo se dispara por DynamoDB Stream (ver `stream-emitter` más abajo).
+
+> La cancelación es **idempotente** (`UpdateItem` con `ConditionExpression estado_vuelo <> CANCELADO`). No usa pronóstico fuera del horizonte del plan free de WeatherAPI (3 días), que cubre de sobra la ventana de 48h.
 
 ---
 

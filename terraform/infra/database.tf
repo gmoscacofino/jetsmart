@@ -148,6 +148,7 @@ resource "aws_dynamodb_table" "business" {
       "estado_vuelo",
       "vuelo_numero",
       "fecha",
+      "hora_salida", # el weather-poller la usa para pedir el forecast de la hora de salida
     ]
   }
 

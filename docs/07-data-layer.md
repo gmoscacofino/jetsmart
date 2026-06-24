@@ -70,7 +70,7 @@ Estado persistente del dominio. PK/SK, **2 GSIs**, **DynamoDB Stream habilitado*
 | GSI | HK (`gsi*pk`) | RK (`gsi*sk`) | Projection | Caller |
 |---|---|---|---|---|
 | **`ReservationsByFlight`** | `FLIGHT#{vuelo}#{fecha}` | `PNR#{pnr}` | INCLUDE (user_id, email, passenger_name, status) | `proactive_notifications` / `refund` — "qué pasajeros tengo en el vuelo cancelado" |
-| **`FlightsByDate`** | `FLIGHTDATE#{fecha}` | `vuelo_numero` | INCLUDE (estado_vuelo, vuelo_numero, fecha) | `weather-poller` — "qué vuelos activos hay en esta fecha" |
+| **`FlightsByDate`** | `FLIGHTDATE#{fecha}` | `vuelo_numero` | INCLUDE (estado_vuelo, vuelo_numero, fecha, hora_salida) | `weather-poller` — "qué vuelos activos hay en esta fecha" (hora_salida → forecast por hora de salida) |
 > **`ReservationsByFlight`** habilita el fan-out de cancelaciones: sin él, encontrar "todos los PNRs en el vuelo JA203 del 2026-06-20" requiere Scan O(n) sobre la tabla entera. Con el GSI es una sola Query O(log n) — el atributo `gsi2pk` se estampa en cada SEGMENT# al crear el booking.
 >
 > **`FlightsByDate`** reemplaza el Scan que hacía el `weather-poller` para listar vuelos activos. Es **sparse** (solo el master row `FLIGHT#` estampa `gsi_flights_pk`; los 120 `SEAT#` por vuelo no), así que el índice contiene únicamente vuelos. **Particionado por fecha** (`FLIGHTDATE#{fecha}`): cada día es su propia partición → sin hot partition. El poller hace una Query por fecha de la ventana [hoy, hoy+48h] (2-3 queries) con `FilterExpression` por `estado_vuelo IN (EN_HORARIO, DEMORADO)`, en vez de escanear la tabla entera.

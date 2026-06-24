@@ -1,15 +1,19 @@
 """
 weather-poller — proceso continuo en ECS Fargate.
 
-Poll-ea una API de clima externa (climAPI) para los aeropuertos de origen de los
-vuelos activos en las próximas ~48h. Si las condiciones superan los umbrales
-(viento / visibilidad) o si FORCE_CANCEL está activo, escribe la transición
+Para cada vuelo activo en las próximas ~48h consulta el PRONÓSTICO de WeatherAPI
+en el aeropuerto de origen, a la hora de salida del vuelo. Si el viento o la
+visibilidad pronosticados superan los umbrales, escribe la transición
 estado_vuelo -> "CANCELADO" en el master row del vuelo en la business table.
 
-Ese write es justamente lo que dispara el DynamoDB Stream consumido por
-lambda/flight_cancellation_detector.py (filtra master rows FLIGHT# cuyo
-estado_vuelo pasa a CANCELADO). El downstream (proactive notifications) NO es
-responsabilidad de este proceso.
+Ese write dispara el DynamoDB Stream consumido por lambda/stream_emitter.py
+(filtra master rows FLIGHT# cuyo estado_vuelo pasa a CANCELADO) → SNS →
+proactive notifications. El downstream NO es responsabilidad de este proceso.
+
+Contrato WeatherAPI.com (https://www.weatherapi.com/docs/):
+    GET {base}/forecast.json?key=<KEY>&q=iata:<IATA>&days=<1-3>&dt=YYYY-MM-DD&hour=<0-23>
+    → forecast.forecastday[0].hour[0].{wind_kph, vis_km}
+    OJO: vis_km viene en KILÓMETROS; el umbral interno es en metros (vis_km*1000).
 
 Logging estructurado a stdout para que el log driver awslogs de ECS lo capture.
 """
@@ -35,27 +39,21 @@ log = logging.getLogger("weather-poller")
 
 
 # ── Configuración (env vars leídas al startup) ────────────────────────────────
-def _get_bool(name: str, default: str = "false") -> bool:
-    return os.environ.get(name, default).strip().lower() in ("true", "1", "yes")
-
-
 REGION              = os.environ["AWS_REGION_VAR"]
 BUSINESS_TABLE_NAME = os.environ["BUSINESS_TABLE_NAME"]
 WEATHER_SECRET_ARN  = os.environ["WEATHER_SECRET_ARN"]
 
-# Base URL de climAPI. Configurable por env var. El placeholder es solo eso:
-# ajustar CLIMA_API_BASE (y _fetch_weather más abajo) al endpoint real.
-CLIMA_API_BASE      = os.environ.get("CLIMA_API_BASE", "https://api.climapi.example")
+# Base URL de WeatherAPI.com. Configurable por env var.
+CLIMA_API_BASE      = os.environ.get("CLIMA_API_BASE", "https://api.weatherapi.com/v1")
 
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "1800"))
-FORCE_CANCEL          = _get_bool("FORCE_CANCEL", "false")
 
 WIND_THRESHOLD_KMH = float(os.environ.get("WEATHER_WIND_THRESHOLD_KMH", "90"))
 VISIBILITY_MIN_M   = float(os.environ.get("WEATHER_VISIBILITY_MIN_M", "550"))
 
 # El seed escribe estado_vuelo="EN_HORARIO" (valores válidos del doc:
-# EN_HORARIO | DEMORADO | CANCELADO — NO existe "PROGRAMADO"). Consideramos
-# "activos / cancelables" ambos estados no terminales. Configurable por env var.
+# EN_HORARIO | DEMORADO | CANCELADO). Consideramos "activos / cancelables" los
+# estados no terminales. Configurable por env var.
 ACTIVE_STATES = tuple(
     s.strip()
     for s in os.environ.get("ACTIVE_FLIGHT_STATES", "EN_HORARIO,DEMORADO").split(",")
@@ -63,6 +61,11 @@ ACTIVE_STATES = tuple(
 )
 
 LOOKAHEAD_HOURS = int(os.environ.get("LOOKAHEAD_HOURS", "48"))
+
+# WeatherAPI free tier: pronóstico hasta 3 días. Un vuelo cuya fecha cae fuera de
+# ese horizonte no se puede evaluar (se deja sin cancelar). Con LOOKAHEAD=48h el
+# horizonte alcanza de sobra.
+FORECAST_MAX_DAYS = int(os.environ.get("FORECAST_MAX_DAYS", "3"))
 
 # ── Clientes AWS ──────────────────────────────────────────────────────────────
 _session   = boto3.session.Session(region_name=REGION)
@@ -72,7 +75,7 @@ _secrets   = _session.client("secretsmanager")
 
 
 def _load_api_key() -> str:
-    """Lee la API key de climAPI desde Secrets Manager una sola vez al startup.
+    """Lee la API key de WeatherAPI desde Secrets Manager una sola vez al startup.
 
     El secreto guarda JSON, ej {"api_key": "..."}. Si no es JSON, se usa el
     string crudo como key.
@@ -90,56 +93,83 @@ def _load_api_key() -> str:
 WEATHER_API_KEY = _load_api_key()
 
 
-# ── climAPI ───────────────────────────────────────────────────────────────────
-# AJUSTAR ESTA FUNCIÓN al contrato real de climAPI. El schema exacto de
-# request/response es desconocido: asumimos GET {CLIMA_API_BASE}/current con la
-# key por header y query param ?airport=IATA, y una respuesta JSON con campos de
-# viento (km/h) y visibilidad (m) en alguno de los nombres comunes probados.
-# Cualquier error de HTTP/parseo se trata como "sin cancelación" (devuelve None).
-def _fetch_weather(airport: str) -> dict | None:
-    """Devuelve {'wind_kmh': float|None, 'visibility_m': float|None} o None si falla."""
+# ── WeatherAPI: pronóstico por aeropuerto + fecha + hora de salida ────────────
+def _fetch_forecast(airport: str, fecha: str, hour: int) -> dict | None:
+    """Pide el pronóstico de WeatherAPI para `airport` (IATA) en la fecha/hora de
+    salida del vuelo. Devuelve {'wind_kmh': float|None, 'visibility_m': float|None}
+    o None si falla o la fecha cae fuera del horizonte de forecast.
+
+    `days` debe cubrir la fecha objetivo (free tier = 3). `dt`+`hour` la acotan al
+    momento del vuelo: con &hour=, la API devuelve un solo elemento en hour[].
+    """
+    days = (date.fromisoformat(fecha) - date.today()).days + 1
+    if days < 1 or days > FORECAST_MAX_DAYS:
+        log.info(
+            "forecast skip airport=%s fecha=%s — fuera del horizonte (%dd)",
+            airport, fecha, days,
+        )
+        return None
+
     try:
         resp = requests.get(
-            f"{CLIMA_API_BASE}/current",
-            params={"airport": airport},
-            headers={
-                "Authorization": f"Bearer {WEATHER_API_KEY}",
-                "x-api-key": WEATHER_API_KEY,
+            f"{CLIMA_API_BASE}/forecast.json",
+            params={
+                "key": WEATHER_API_KEY,
+                "q": f"iata:{airport}",
+                "days": days,
+                "dt": fecha,
+                "hour": hour,
             },
             timeout=10,
         )
         resp.raise_for_status()
         body = resp.json()
     except (requests.RequestException, ValueError) as exc:
-        log.warning("climAPI fetch failed for airport=%s: %s", airport, exc)
+        log.warning(
+            "WeatherAPI forecast failed airport=%s fecha=%s hour=%s: %s",
+            airport, fecha, hour, exc,
+        )
         return None
 
-    wind = _first_number(
-        body, ["wind_kmh", "wind_speed_kmh", "wind", "windSpeed", "viento_kmh"]
-    )
-    visibility = _first_number(
-        body, ["visibility_m", "visibility", "visibilidad_m", "visibilidad"]
-    )
-    return {"wind_kmh": wind, "visibility_m": visibility}
+    hour_obj = _forecast_hour(body, fecha, hour)
+    if hour_obj is None:
+        log.warning("WeatherAPI sin hora airport=%s fecha=%s hour=%s", airport, fecha, hour)
+        return None
+
+    wind = _as_float(hour_obj.get("wind_kph"))
+    vis_km = _as_float(hour_obj.get("vis_km"))
+    return {
+        "wind_kmh": wind,
+        # vis_km viene en KILÓMETROS → convertir a metros para comparar con el umbral.
+        "visibility_m": vis_km * 1000 if vis_km is not None else None,
+    }
 
 
-def _first_number(body, keys):
-    """Devuelve el primer campo numérico presente (top-level o bajo 'current'/'data')."""
-    candidates = [body]
-    if isinstance(body, dict):
-        for nest in ("current", "data", "observation", "weather"):
-            if isinstance(body.get(nest), dict):
-                candidates.append(body[nest])
-    for obj in candidates:
-        if not isinstance(obj, dict):
-            continue
-        for k in keys:
-            if k in obj:
-                try:
-                    return float(obj[k])
-                except (TypeError, ValueError):
-                    continue
-    return None
+def _forecast_hour(body, fecha: str, hour: int):
+    """Extrae el objeto hour del forecast: forecastday con date==fecha → la hora
+    pedida. Con &hour= la API devuelve un solo elemento, pero matcheamos por el
+    timestamp por robustez; fallback al primero disponible."""
+    days = (body or {}).get("forecast", {}).get("forecastday", []) if isinstance(body, dict) else []
+    target_day = next((d for d in days if d.get("date") == fecha), None)
+    if target_day is None and days:
+        target_day = days[0]
+    if not target_day:
+        return None
+    hours = target_day.get("hour", [])
+    if not hours:
+        return None
+    for h in hours:
+        ts = h.get("time", "")  # "YYYY-MM-DD HH:MM"
+        if len(ts) >= 13 and ts[11:13].isdigit() and int(ts[11:13]) == hour:
+            return h
+    return hours[0]
+
+
+def _as_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 # ── DynamoDB: encontrar vuelos activos (Query GSI FlightsByDate) ──────────────
@@ -151,7 +181,8 @@ def _active_flights() -> list[dict]:
     así que NO devuelve asientos ni PNRs — sin necesidad de filtrar #SEAT#. La
     FilterExpression deja solo los estados activos (EN_HORARIO / DEMORADO); como la
     partición ya es "los vuelos de esa fecha", el filtro recorre pocos ítems: es un
-    Query acotado, no un Scan de tabla.
+    Query acotado, no un Scan de tabla. La projection INCLUDE trae estado_vuelo,
+    vuelo_numero, fecha y hora_salida (esta última la usa el forecast).
     """
     today = date.today()
     horizon = today + timedelta(hours=LOOKAHEAD_HOURS)
@@ -184,6 +215,14 @@ def _origin_airport(item: dict) -> str:
     return parts[1] if len(parts) >= 2 else ""
 
 
+def _departure_hour(item: dict) -> int | None:
+    """Hora (0-23) a partir de hora_salida 'HH:MM'. None si falta o es inválida."""
+    hs = item.get("hora_salida", "")
+    if len(hs) >= 2 and hs[:2].isdigit():
+        return int(hs[:2])
+    return None
+
+
 # ── DynamoDB: cancelación idempotente ─────────────────────────────────────────
 def _cancel_flight(item: dict, reason: str) -> bool:
     """UpdateItem condicional e idempotente. Devuelve True si efectivamente
@@ -213,11 +252,7 @@ def _cancel_flight(item: dict, reason: str) -> bool:
         raise
 
 
-def _cancel_reason(weather: dict | None) -> str:
-    if FORCE_CANCEL:
-        return "weather (FORCE_CANCEL demo flag)"
-    if not weather:
-        return "weather"
+def _cancel_reason(weather: dict) -> str:
     bits = []
     if weather.get("wind_kmh") is not None:
         bits.append(f"wind={weather['wind_kmh']}km/h(>{WIND_THRESHOLD_KMH})")
@@ -241,75 +276,61 @@ def _should_cancel(weather: dict | None) -> bool:
 # ── Ciclo principal ───────────────────────────────────────────────────────────
 def run_cycle() -> None:
     flights = _active_flights()
-    log.info(
-        "cycle start — active_flights=%d force_cancel=%s",
-        len(flights),
-        FORCE_CANCEL,
-    )
+    log.info("cycle start — active_flights=%d", len(flights))
 
     if not flights:
         log.info("cycle end — no active flights in the next %dh", LOOKAHEAD_HOURS)
         return
 
-    # FORCE_CANCEL: cancelar UN solo vuelo elegible por ciclo (el primero) para
-    # un demo determinístico, sin tocar climAPI.
-    if FORCE_CANCEL:
-        target = flights[0]
-        reason = _cancel_reason(None)
-        did = _cancel_flight(target, reason)
-        if did:
-            log.info(
-                "CANCELLED flight=%s airport=%s fecha=%s reason=%s",
-                target.get("vuelo_numero"),
-                _origin_airport(target),
-                target.get("fecha"),
-                reason,
-            )
-        else:
-            log.info(
-                "skip flight=%s — already CANCELADO", target.get("vuelo_numero")
-            )
-        return
-
-    # Modo normal: 1 llamada a climAPI por aeropuerto de origen (cache por ciclo).
-    origins = {_origin_airport(f) for f in flights if _origin_airport(f)}
-    weather_by_airport = {ap: _fetch_weather(ap) for ap in origins}
-
+    # Cache de forecast por (aeropuerto, fecha, hora): dos vuelos del mismo origen
+    # a la misma hora comparten una sola llamada a la API.
+    forecast_cache: dict = {}
     cancelled = 0
     for flight in flights:
         airport = _origin_airport(flight)
-        weather = weather_by_airport.get(airport)
+        fecha = flight.get("fecha")
+        hour = _departure_hour(flight)
+        if not airport or not fecha or hour is None:
+            log.warning(
+                "flight=%s sin airport/fecha/hora_salida — skip",
+                flight.get("vuelo_numero"),
+            )
+            continue
+
+        cache_key = (airport, fecha, hour)
+        if cache_key not in forecast_cache:
+            forecast_cache[cache_key] = _fetch_forecast(airport, fecha, hour)
+        weather = forecast_cache[cache_key]
+
         if not _should_cancel(weather):
             continue
         reason = _cancel_reason(weather)
         if _cancel_flight(flight, reason):
             cancelled += 1
             log.info(
-                "CANCELLED flight=%s airport=%s fecha=%s reason=%s",
+                "CANCELLED flight=%s airport=%s fecha=%s hora=%s reason=%s",
                 flight.get("vuelo_numero"),
                 airport,
-                flight.get("fecha"),
+                fecha,
+                flight.get("hora_salida"),
                 reason,
             )
         else:
-            log.info(
-                "skip flight=%s — already CANCELADO", flight.get("vuelo_numero")
-            )
+            log.info("skip flight=%s — already CANCELADO", flight.get("vuelo_numero"))
 
-    log.info("cycle end — cancelled=%d", cancelled)
+    log.info("cycle end — cancelled=%d forecast_calls=%d", cancelled, len(forecast_cache))
 
 
 def main() -> None:
     log.info(
         "weather-poller starting — table=%s region=%s interval=%ds "
-        "clima_api_base=%s wind_threshold=%s visibility_min=%s force_cancel=%s",
+        "base=%s wind_threshold=%s visibility_min=%s",
         BUSINESS_TABLE_NAME,
         REGION,
         POLL_INTERVAL_SECONDS,
         CLIMA_API_BASE,
         WIND_THRESHOLD_KMH,
         VISIBILITY_MIN_M,
-        FORCE_CANCEL,
     )
     while True:
         try:
