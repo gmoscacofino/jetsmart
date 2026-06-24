@@ -13,7 +13,7 @@
 
 resource "aws_wafv2_web_acl" "chat" {
   name        = "${local.name_prefix}-chat-waf"
-  description = "WAF del ALB del chat-handler: managed rules (XSS/SQLi/bad inputs) + rate limit por IP."
+  description = "WAF del ALB del chat-handler: managed rules XSS/SQLi/bad inputs + rate limit por IP"
   scope       = "REGIONAL"
 
   default_action {
