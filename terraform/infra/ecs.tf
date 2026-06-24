@@ -148,9 +148,11 @@ resource "aws_ecs_task_definition" "weather_poller" {
         { name = "BUSINESS_TABLE_NAME", value = aws_dynamodb_table.business.name },
         { name = "WEATHER_SECRET_ARN", value = aws_secretsmanager_secret.weather_key.arn },
         { name = "CLIMA_API_BASE", value = var.clima_api_base },
-        { name = "POLL_INTERVAL_SECONDS", value = tostring(var.weather_poll_interval_seconds) },
+        { name = "FORECAST_INTERVAL_SECONDS", value = tostring(var.weather_poll_interval_seconds) }, # planning: 30 min
+        { name = "CURRENT_INTERVAL_SECONDS", value = "300" },                                        # go/no-go: 5 min
         { name = "ACTIVE_FLIGHT_STATES", value = "EN_HORARIO,DEMORADO" },
-        { name = "LOOKAHEAD_HOURS", value = "48" },
+        { name = "LOOKAHEAD_HOURS", value = "48" },     # ventana del forecast
+        { name = "CURRENT_WINDOW_HOURS", value = "2" }, # ventana near-departure del current
       ]
       logConfiguration = {
         logDriver = "awslogs"

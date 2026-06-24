@@ -53,9 +53,16 @@ Ver explicación completa en [01 — Cómo funciona un chatbot](./01-como-funcio
 
 ### `weather-poller` — task Fargate de operaciones
 
-Task Fargate `desired_count=1` (sin ALB), también en subnet privada. Loop continuo: por cada vuelo activo de la ventana de 48h (Query a la GSI `FlightsByDate`), consulta el **pronóstico de WeatherAPI.com** (`GET /forecast.json?q=iata:<IATA>&dt=<fecha>&hour=<hora_salida>`) para el aeropuerto de origen a la hora de salida del vuelo. Si el viento (`wind_kph > 90`) o la visibilidad (`vis_km*1000 < 550 m`) superan los umbrales, escribe la transición a `estado_vuelo=CANCELADO` en el master row del vuelo en `business`. Sale por NAT a WeatherAPI. A partir de ahí el flujo proactivo se dispara por DynamoDB Stream (ver `stream-emitter` más abajo).
+Task Fargate `desired_count=1` (sin ALB), también en subnet privada. Un solo proceso con **dos pasadas** en distintas cadencias, ambas contra WeatherAPI.com (egress por NAT):
 
-> La cancelación es **idempotente** (`UpdateItem` con `ConditionExpression estado_vuelo <> CANCELADO`). No usa pronóstico fuera del horizonte del plan free de WeatherAPI (3 días), que cubre de sobra la ventana de 48h.
+| Pasada | Cadencia | Ventana | Endpoint | Para qué |
+|---|---|---|---|---|
+| **FORECAST** (planning) | 30 min | vuelos de las próximas 48h | `GET /forecast.json?q=iata:<IATA>&dt=<fecha>&hour=<hora_salida>` | Cancelar con horas de anticipación → dar tiempo al pasajero. Es predicción: no ve un deterioro súbito no modelado. |
+| **CURRENT** (go/no-go final) | 5 min | vuelos que salen en ≤2h | `GET /current.json?q=iata:<IATA>` | Clima observado actual → atrapa el deterioro súbito que el pronóstico no predijo, cerca de la salida. |
+
+Ambas aplican los mismos umbrales (viento `wind_kph > 90` o visibilidad `vis_km*1000 < 550 m`) y escriben la misma transición `estado_vuelo=CANCELADO` en el master row del vuelo en `business`. A partir de ahí el flujo proactivo se dispara por DynamoDB Stream (ver `stream-emitter` más abajo).
+
+> **Por qué las dos conviven sin coordinarse:** el write es **idempotente** (`UpdateItem` con `ConditionExpression estado_vuelo <> CANCELADO`). Si una pasada ya canceló el vuelo, la otra es no-op. Forecast cubre la anticipación; current cubre el deterioro súbito — cada una su failure mode. La pasada current sólo mira vuelos near-departure (no las 48h) porque el clima *actual* es irrelevante para un vuelo lejano. Limitación tz asumida: `hora_salida` es hora local del aeropuerto y el contenedor corre en UTC.
 
 ---
 

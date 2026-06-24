@@ -68,7 +68,7 @@ variable "clima_api_base" {
 }
 
 variable "weather_poll_interval_seconds" {
-  description = "Intervalo del loop del weather-poller en segundos"
+  description = "Cadencia de la pasada FORECAST del weather-poller en segundos (la pasada CURRENT corre cada 5 min)"
   type        = number
   default     = 1800
 }
